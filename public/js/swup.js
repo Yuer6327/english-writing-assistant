@@ -1,0 +1,187 @@
+// ============================================================
+// swup.js — 轻量 SPA 切页引擎（自研，零外部依赖）
+// 基于 Swup 4 的设计模式，但不用 Swup 库本身（中国大陆网络 / 体积 / 可控性考虑）
+//
+// 实现：
+//   - 拦截同源 SPA 导航链接（<a data-spa> 或当前页在 SPA 页面集合内）
+//   - fetch 目标页 → 交换 <main id="main"> 内容 → 执行目标页 init()
+//   - 导航栏 #site-nav 持久化（不闪烁、theme 按钮状态保持），切页后按 URL 高亮
+//   - 离开页面的 module 若导出了 cleanup()，切换前调用，清理轮询/全局副作用
+//   - 支持浏览器前进/后退（popstate）
+//   - 非 SPA 页面（index/login/register，无 <main>）→ 直接完整跳转，保持现状
+//
+// 页面约定（被 swup 管理的页面）：
+//   - <body> 内直接放 <nav id="site-nav">…</nav> 和 <main id="main" data-page-module="/js/xx.js">
+//   - 其余内容都在 <main> 内
+//   - module 默认导出 { init, cleanup }，init 中通过 navigate() 做站内跳转
+//   - api.js 的 401/硬跳转不受 swup 影响（完整页面刷新，可接受）
+// ============================================================
+
+// ── 被 swup 管理的页面集合（其余页面走完整刷新）──
+// '/' 与 '/index.html' 同为作文列表页（Workers Assets 根路径即 index.html）
+const SPA_PAGES = ['/', '/index.html', '/essay.html', '/settings.html'];
+
+// ── 已加载的 module 缓存 ──
+const moduleCache = new Map();
+
+// ── 当前页面状态 ──
+let currentPath = location.pathname + location.search;
+let currentCleanup = null;   // 当前页 module 导出的 cleanup()
+let navigating = false;
+let ready = false;           // bootstrap 完成前，点击导航走完整刷新避免竞态
+
+// ── 载入 <main> 对应的页面 module，执行 init() ──
+async function loadCurrentPage() {
+  const main = document.getElementById('main');
+  const src = main && main.dataset.pageModule;
+  if (!src) return; // 非 SPA 页，无需处理
+
+  let mod = moduleCache.get(src);
+  if (!mod) {
+    mod = await import(src);
+    moduleCache.set(src, mod);
+  }
+
+  // cleanup 用具名导出：即使 init 仍在异步进行中（用户已切走），也能立即调用使其中止
+  currentCleanup = mod.cleanup || null;
+  if (mod.init) await mod.init();
+}
+
+// ── 切页：离开页 cleanup → 交换 DOM → 进入页 init ──
+async function performTransition(toPath) {
+  navigating = true;
+  try {
+    // 1. 先拉取目标页 HTML（旧页保持可见，网络延迟不产生空白）；根路径显式取 /index.html
+    const fetchPath = toPath === '/' ? '/index.html' : toPath;
+    const resp = await fetch(fetchPath, { credentials: 'include', headers: { Accept: 'text/html' } });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const html = await resp.text();
+
+    // 2. 解析新文档，取 <main> 与 <title>
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const newMain = doc.getElementById('main');
+    if (!newMain) throw new Error(`目标页没有 <main>`);
+
+    // 3. 清理离开页的副作用（轮询/抽屉/全局监听等）
+    if (currentCleanup) {
+      try { await currentCleanup(); } catch (e) { console.error('[swup] cleanup error:', e); }
+    }
+    currentCleanup = null;
+
+    // 4. 淡出 → 交换 → 更新 URL/标题 → 淡入
+    const main = document.getElementById('main');
+    main.classList.add('page-leaving');
+    await new Promise(r => setTimeout(r, 180));
+
+    main.innerHTML = newMain.innerHTML;
+    // 关键：data-page-module 是 <main> 自身的属性，innerHTML 只替换子节点、不会复制它，
+    //       必须显式从新文档带上，否则 loadCurrentPage 会按旧模块初始化 → 元素为空 → 报错
+    main.dataset.pageModule = newMain.dataset.pageModule;
+    main.classList.remove('page-leaving');
+    main.classList.add('page-entering');
+    void main.offsetWidth; // 强制 reflow，让 opacity 过渡真正播放
+    requestAnimationFrame(() => main.classList.remove('page-entering')); // 立即淡入，init 并行执行
+
+    if (toPath !== location.pathname + location.search) {
+      history.pushState({ path: toPath }, '', toPath);
+    }
+    currentPath = toPath;
+    document.title = doc.title;
+    window.scrollTo(0, 0);
+
+    // 5. 高亮导航栏当前项
+    highlightNav(toPath);
+
+    // 6. 初始化新页面
+    await loadCurrentPage();
+  } catch (err) {
+    console.error('[swup] transition failed, full reload:', err);
+    location.href = toPath;
+  } finally {
+    navigating = false;
+  }
+}
+
+// ── 高亮导航栏当前项 ──
+function highlightNav(path) {
+  // Workers Assets 会把 /xxx.html 重定向为 /xxx，因此比较时两种形式都归一
+  const norm = (p) => { const n = p.replace(/\.html$/, '') || '/'; return n === '/index' ? '/' : n; };
+  const cur = norm(path.split('?')[0]);
+  document.querySelectorAll('#site-nav a[data-nav]').forEach(a => {
+    const href = a.getAttribute('href') || '';
+    const target = norm(href);
+    // 作文工作台 (/essay) 与列表页 (/) 同属"我的作文"导航
+    const active = target === '/'
+      ? (cur === '/' || cur === '/essay')
+      : cur === target;
+    a.classList.toggle('active', active);
+  });
+}
+
+// ── 退出登录：跳统一认证平台登出（全站会话失效），回到本站首页 ──
+function setupLogout() {
+  const btn = document.getElementById('logout-btn');
+  if (!btn) return;
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    location.href = 'https://auth.yuer6327.top/logout?next=' + encodeURIComponent(location.origin + '/');
+  });
+}
+
+// ── 拦截站内导航链接 ──
+function shouldIntercept(href) {
+  // 页内锚点 / 外链 / 协议链接不拦截
+  if (!href || href.startsWith('#') || href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//')) return false;
+  let full;
+  try {
+    full = new URL(href, location.href); // 相对 href 以当前完整 URL（含 query）为基准解析
+  } catch {
+    return false;
+  }
+  const path = full.pathname;
+  const withSearch = path + full.search;
+  if (withSearch === currentPath) return false;          // 同页（含 query）不切换
+  if (path === currentPath) return false;                // 仅 query 不同也跳过
+  return SPA_PAGES.includes(path);
+}
+
+document.addEventListener('click', async (e) => {
+  if (!ready || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || navigating) return;
+  const anchor = e.target.closest('a[href]');
+  if (!anchor) return;
+  const href = anchor.getAttribute('href');
+  if (!shouldIntercept(href)) return;
+  e.preventDefault();
+  await performTransition(href);
+});
+
+// 供各页面 module 调用的导航（页面内生成的跳转，如"创建成功 → 阅读页"）
+function navigate(path) {
+  if (!ready || navigating) return;
+  if (shouldIntercept(path)) performTransition(path);
+  else location.href = path;
+}
+window.swupNavigate = navigate;
+
+// ── 浏览器前进/后退 ──
+window.addEventListener('popstate', async () => {
+  if (!ready) { location.href = location.pathname + location.search; return; }
+  if (navigating) return; // 已有切页在进行，忽略避免竞态
+  const toPath = location.pathname + location.search;
+  if (toPath === currentPath) return;
+  // 目标页不在 SPA 集合 → 交由浏览器完整加载
+  if (!SPA_PAGES.includes(location.pathname)) { location.href = toPath; return; }
+  await performTransition(toPath);
+});
+
+// ── 初始化 ──
+(async function bootstrap() {
+  try {
+    await loadCurrentPage();
+  } catch (err) {
+    console.error('[swup] init failed:', err);
+  }
+  highlightNav(currentPath);
+  setupLogout();
+  ready = true;
+})();

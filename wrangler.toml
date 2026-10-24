@@ -1,0 +1,53 @@
+name = "english-writing-assistant"
+compatibility_date = "2024-09-23"
+main = "src/index.ts"
+
+# ── 正式域名路由（zone 内 Workers 路由；DNS 记录由 dns-guard 统一管理优选线路）──
+routes = [
+  { pattern = "writing.yuer6327.top/*", zone_name = "yuer6327.top" }
+]
+
+# ── 静态前端资源（Workers Assets）──
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# ── D1 数据库绑定 ──
+[[d1_databases]]
+binding = "DB"
+database_name = "writing-assistant-db"
+database_id = "d764c512-70a2-406a-abce-4f6e5c0a041e"
+
+# ── 统一认证平台库（auth.yuer6327.top 的 auth-db，只读直查 sessions）──
+[[d1_databases]]
+binding = "AUTH_DB"
+database_name = "auth-db"
+database_id = "85b7d1cc-fbb4-4ffe-8f1e-b6690c193a1f"
+
+# ── 本地开发端口（避开阅读助手 8787）──
+[dev]
+port = 8788
+
+# ── 可观测性（Workers Observability，各部署保持一致）──
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
+
+# ── 环境变量（非敏感，敏感的用 wrangler secret put）──
+[vars]
+FRONTEND_ORIGIN = "*"
+
+# ENCRYPTION_KEY    → wrangler secret put ENCRYPTION_KEY（加密 BYOK Key；本地 JWT 已由统一认证取代）
+# AGNES_API_KEY     → wrangler secret put AGNES_API_KEY（公用免费 API：中国大陆 https://apihub.agnes-ai.cn/v1 优先，国际 https://apihub.agnes-ai.com/v1 备用，模型 agnes-3.0-flash，支持图像 URL 输入）
+# BAIDU_OCR_AK / BAIDU_OCR_SK → wrangler secret put BAIDU_OCR_AK / BAIDU_OCR_SK（百度云文字识别免费额度：https://aip.baidubce.com/rest/2.0/ocr/v1/general）

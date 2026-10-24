@@ -1,0 +1,34 @@
+# ── 依赖 ──
+node_modules/
+
+# ── 构建 / 打包产物 ──
+dist/
+build/
+*.tsbuildinfo
+
+# ── 本地开发缓存（wrangler）──
+.wrangler/
+
+# ── 本地补丁/备份快照 ──
+patch/
+
+# ── 环境变量与密钥（绝不上传）──
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# ── 日志 ──
+*.log
+npm-debug.log*
+
+# ── 系统文件 ──
+.DS_Store
+Thumbs.db
+
+# ── Claude 本地配置（含 worktree 嵌套仓库，不入库）──
+.claude/
+
+# ── ZCode 本地会话文件（不入库）──
+.zcode/
+.tmp-f.json
