@@ -50,7 +50,7 @@ function modelSelectHtml(id, remembered) {
 }
 
 /** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
-const PAID_HINT = '按用量计积分，通常约 0.02~0.1 积分/次，实结多退少补';
+const PAID_HINT = '按用量计积分，通常约 0.05~0.5 积分/次，实结多退少补';
 
 function bindPaidHint(selectEl, hintEl) {
   if (!selectEl || !hintEl) return;
@@ -566,7 +566,7 @@ function openDraftModal(mode, prefill) {
         <label style="font-size:13px;display:block">
           <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR（手写体→高精度→标准版自动降级，省模型额度）
         </label>
-        <div class="muted" style="font-size:12px;margin-top:6px">百度 OCR 每日 5 次免费，超出 0.01 积分/次；大模型识别按用量计积分</div>
+        <div class="muted" style="font-size:12px;margin-top:6px">百度 OCR 每日 5 次免费（暂不收费）；大模型识别按用量计积分</div>
       </div>
       <button class="btn btn-primary" id="btn-ocr">开始识别</button>
       <span id="ocr-status" style="font-size:13px;color:var(--text-soft);margin-left:10px"></span>
