@@ -21,66 +21,88 @@
 // '/' 与 '/index.html' 同为作文列表页（Workers Assets 根路径即 index.html）
 const SPA_PAGES = ['/', '/index.html', '/essay.html', '/settings.html', '/admin.html'];
 
-// ── 已加载的 module 缓存 ──
+// ── module 加载 Promise 缓存：退场动画期间即可并行预载 ──
 const moduleCache = new Map();
+function preloadModule(src) {
+  if (!src) return Promise.resolve(null);
+  if (!moduleCache.has(src)) {
+    moduleCache.set(src, import(src).catch(err => {
+      moduleCache.delete(src);
+      throw err;
+    }));
+  }
+  return moduleCache.get(src);
+}
 
 // ── 当前页面状态 ──
 let currentPath = location.pathname + location.search;
 let currentCleanup = null;   // 当前页 module 导出的 cleanup()
 let navigating = false;
+let pendingPath = null;      // 切页期间只保留最后一次导航意图
 let ready = false;           // bootstrap 完成前，点击导航走完整刷新避免竞态
 
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+function waitForLeave(el, duration = 180) {
+  if (reducedMotion.matches) return Promise.resolve();
+  return new Promise(resolve => {
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      el.removeEventListener('transitionend', onEnd);
+      resolve();
+    };
+    const onEnd = e => { if (e.target === el && e.propertyName === 'opacity') done(); };
+    el.addEventListener('transitionend', onEnd);
+    timer = setTimeout(done, duration + 60); // CSS 未运行/后台标签页时兜底
+  });
+}
+
 // ── 载入 <main> 对应的页面 module，执行 init() ──
-async function loadCurrentPage() {
+async function loadCurrentPage(preloaded = null) {
   const main = document.getElementById('main');
   const src = main && main.dataset.pageModule;
   if (!src) return; // 非 SPA 页，无需处理
-
-  let mod = moduleCache.get(src);
-  if (!mod) {
-    mod = await import(src);
-    moduleCache.set(src, mod);
-  }
+  const mod = await (preloaded || preloadModule(src));
 
   // cleanup 用具名导出：即使 init 仍在异步进行中（用户已切走），也能立即调用使其中止
   currentCleanup = mod.cleanup || null;
   if (mod.init) await mod.init();
 }
 
-// ── 切页：离开页 cleanup → 交换 DOM → 进入页 init ──
+// ── 切页：立即反馈；HTML/模块预载与视觉过渡并行，数据成功后才交换 DOM ──
 async function performTransition(toPath) {
+  if (navigating) { pendingPath = toPath; return; }
   navigating = true;
+  const main = document.getElementById('main');
+  main.setAttribute('aria-busy', 'true');
+  main.classList.add('page-pending');
   try {
-    // 1. 先拉取目标页 HTML（旧页保持可见，网络延迟不产生空白）；根路径显式取 /index.html
+    // 网络期间旧页保持可见，仅降低不透明度，避免慢请求造成空白页
     const fetchPath = toPath === '/' ? '/index.html' : toPath;
     const resp = await fetch(fetchPath, { credentials: 'include', headers: { Accept: 'text/html' } });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const html = await resp.text();
-
-    // 2. 解析新文档，取 <main> 与 <title>
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const newMain = doc.getElementById('main');
-    if (!newMain) throw new Error(`目标页没有 <main>`);
+    if (!newMain) throw new Error('目标页没有 <main>');
+    const modulePromise = preloadModule(newMain.dataset.pageModule);
 
-    // 3. 清理离开页的副作用（轮询/抽屉/全局监听等）
     if (currentCleanup) {
       try { await currentCleanup(); } catch (e) { console.error('[swup] cleanup error:', e); }
     }
     currentCleanup = null;
 
-    // 4. 淡出 → 交换 → 更新 URL/标题 → 淡入
-    const main = document.getElementById('main');
+    main.classList.remove('page-pending');
     main.classList.add('page-leaving');
-    await new Promise(r => setTimeout(r, 180));
+    await waitForLeave(main);
 
     main.innerHTML = newMain.innerHTML;
-    // 关键：data-page-module 是 <main> 自身的属性，innerHTML 只替换子节点、不会复制它，
-    //       必须显式从新文档带上，否则 loadCurrentPage 会按旧模块初始化 → 元素为空 → 报错
+    // innerHTML 不复制 <main> 自身属性
     main.dataset.pageModule = newMain.dataset.pageModule;
     main.classList.remove('page-leaving');
     main.classList.add('page-entering');
-    void main.offsetWidth; // 强制 reflow，让 opacity 过渡真正播放
-    requestAnimationFrame(() => main.classList.remove('page-entering')); // 立即淡入，init 并行执行
+    void main.offsetWidth;
+    requestAnimationFrame(() => main.classList.remove('page-entering'));
 
     if (toPath !== location.pathname + location.search) {
       history.pushState({ path: toPath }, '', toPath);
@@ -88,17 +110,24 @@ async function performTransition(toPath) {
     currentPath = toPath;
     document.title = doc.title;
     window.scrollTo(0, 0);
-
-    // 5. 高亮导航栏当前项
     highlightNav(toPath);
+    // 键盘/读屏：切页后把焦点交回主区域，避免焦点残留在旧页已移除的元素上
+    try { main.focus({ preventScroll: true }); } catch { /* 老浏览器忽略 */ }
 
-    // 6. 初始化新页面
-    await loadCurrentPage();
+    // 入场、模块预载、页面数据初始化并行；不用数据等待拖住导航锁
+    loadCurrentPage(modulePromise).catch(err => console.error('[swup] page init failed:', err));
   } catch (err) {
     console.error('[swup] transition failed, full reload:', err);
     location.href = toPath;
   } finally {
+    main.classList.remove('page-pending', 'page-leaving');
+    main.removeAttribute('aria-busy');
     navigating = false;
+    if (pendingPath) {
+      const next = pendingPath;
+      pendingPath = null;
+      if (next !== currentPath) performTransition(next);
+    }
   }
 }
 
@@ -115,6 +144,9 @@ function highlightNav(path) {
       ? (cur === '/' || cur === '/essay')
       : cur === target;
     a.classList.toggle('active', active);
+    // 读屏软件靠 aria-current 识别"当前所在页"，单靠颜色不够
+    if (active) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
   });
 }
 
@@ -146,18 +178,18 @@ function shouldIntercept(href) {
 }
 
 document.addEventListener('click', async (e) => {
-  if (!ready || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || navigating) return;
+  if (!ready || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
   const anchor = e.target.closest('a[href]');
   if (!anchor) return;
   const href = anchor.getAttribute('href');
   if (!shouldIntercept(href)) return;
-  e.preventDefault();
+  e.preventDefault(); // 即使正在切页，也不能退化成不可控的整页跳转
   await performTransition(href);
 });
 
 // 供各页面 module 调用的导航（页面内生成的跳转，如"创建成功 → 阅读页"）
 function navigate(path) {
-  if (!ready || navigating) return;
+  if (!ready) { location.href = path; return; }
   if (shouldIntercept(path)) performTransition(path);
   else location.href = path;
 }
@@ -166,16 +198,15 @@ window.swupNavigate = navigate;
 // ── 浏览器前进/后退 ──
 window.addEventListener('popstate', async () => {
   if (!ready) { location.href = location.pathname + location.search; return; }
-  if (navigating) return; // 已有切页在进行，忽略避免竞态
   const toPath = location.pathname + location.search;
-  if (toPath === currentPath) return;
+  if (toPath === currentPath && !navigating) return;
   // 目标页不在 SPA 集合 → 交由浏览器完整加载
   if (!SPA_PAGES.includes(location.pathname)) { location.href = toPath; return; }
-  await performTransition(toPath);
+  await performTransition(toPath); // 切页期间保留最新前进/后退意图，避免 URL 与内容脱节
 });
 
 // ── 初始化 ──
-import { api } from './api.js?v=20261026';
+import { api } from './api.js?v=20261026b';
 
 // ── 导航栏余额 pill + 管理链接（navbar 持久化，查重防重复追加；本模块全站常驻）──
 const PILL_ID = 'nav-balance-pill';

@@ -20,6 +20,8 @@ export interface Env {
   /** 百度云 OCR 应用密钥（AK/SK），wrangler secret put BAIDU_OCR_AK / BAIDU_OCR_SK */
   BAIDU_OCR_AK?: string;
   BAIDU_OCR_SK?: string;
+  /** 仅本地开发：置 '1' 才开放 /api/auth/dev-session 测试会话（生产绝不配置） */
+  ENABLE_DEV_SESSION?: string;
 }
 
 /** Hono 上下文变量（userId 为统一认证平台的用户 id，UUID 字符串） */

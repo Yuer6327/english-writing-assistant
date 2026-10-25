@@ -18,13 +18,24 @@ async function request(path, options = {}) {
     credentials: 'include',
   });
 
-  // 401 → 跳统一认证登录（带 next 回跳）
+  // 401 → 跳统一认证登录（带 next 回跳）；必须中断调用方的成功路径
   if (resp.status === 401) {
+    const err = new Error('登录状态已失效，正在跳转登录');
+    err.code = 'auth_required';
+    err.status = 401;
     gotoAuth('login');
-    return;
+    throw err;
   }
 
-  const data = await resp.json().catch(() => ({ error: 'Network error' }));
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    const err = new Error(resp.ok ? '服务器响应格式错误，请稍后重试' : `网络错误（HTTP ${resp.status}）`);
+    err.code = 'invalid_response';
+    err.status = resp.status;
+    throw err;
+  }
   if (!resp.ok) {
     // 附带后端 details（如 AI 校验失败原因），帮助用户定位问题；截断避免 toast 过长
     const detail = data.details ? `：${String(data.details).slice(0, 300)}` : '';
@@ -99,6 +110,13 @@ export const api = {
 // 成功/信息：3 秒自动消失（现状不变）。
 // 报错：持久保留，需点击右上角 × 手动关闭（避免一闪而过错过失败原因）；
 //      最多同时保留 3 条报错，超出移除最早的。
+function dismissToast(el) {
+  if (!el || el.classList.contains('toast-leaving')) return;
+  el.classList.add('toast-leaving');
+  const delay = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 180;
+  setTimeout(() => el.remove(), delay);
+}
+
 export function toast(message, type = 'info') {
   let stack = document.getElementById('toast-stack');
   if (!stack) {
@@ -109,6 +127,7 @@ export function toast(message, type = 'info') {
 
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
 
   if (type === 'error') {
     el.classList.add('toast-persist');
@@ -120,7 +139,7 @@ export function toast(message, type = 'info') {
     close.className = 'toast-close';
     close.textContent = '×';
     close.setAttribute('aria-label', '关闭');
-    close.addEventListener('click', () => el.remove());
+    close.addEventListener('click', () => dismissToast(el));
     el.append(text, close);
 
     const errors = stack.querySelectorAll('.toast-error');
@@ -131,17 +150,17 @@ export function toast(message, type = 'info') {
 
   el.textContent = message;
   stack.appendChild(el);
-  setTimeout(() => el.remove(), 3000);
+  setTimeout(() => dismissToast(el), 3000);
   return el;
 }
 
 // ── Auth guard ──
 export async function requireAuth() {
   try {
-    const user = await api.me();
-    return user ?? null;
-  } catch {
-    gotoAuth('login');
+    return await api.me();
+  } catch (err) {
+    if (err.status === 401) return null; // request() 已负责登录跳转
+    toast(`无法验证登录状态：${err.message}`, 'error');
     return null;
   }
 }
@@ -187,20 +206,27 @@ export function gradeFor(score) {
   return { grade: 'D', label: '待提高' };
 }
 
-// ── 按需加载外部脚本（幂等：已加载则跳过）──
-const loadedScripts = new Set();
+// ── 按需加载外部脚本（并发共享同一个加载 Promise）──
+const scriptPromises = new Map();
 export function loadScript(src) {
-  if (loadedScripts.has(src)) return Promise.resolve();
-  if (document.querySelector(`script[src="${src}"]`)) return Promise.resolve();
-  loadedScripts.add(src);
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = src;
-    s.async = true;
-    s.onload = () => resolve();
-    s.onerror = () => { loadedScripts.delete(src); reject(new Error(`脚本加载失败: ${src}`)); };
-    document.head.appendChild(s);
+  if (scriptPromises.has(src)) return scriptPromises.get(src);
+  const existing = document.querySelector(`script[src="${src}"]`);
+  if (existing?.dataset.loaded === 'true') return Promise.resolve();
+  const promise = new Promise((resolve, reject) => {
+    const s = existing || document.createElement('script');
+    s.addEventListener('load', () => { s.dataset.loaded = 'true'; resolve(); }, { once: true });
+    s.addEventListener('error', () => {
+      scriptPromises.delete(src);
+      reject(new Error(`脚本加载失败: ${src}`));
+    }, { once: true });
+    if (!existing) {
+      s.src = src;
+      s.async = true;
+      document.head.appendChild(s);
+    }
   });
+  scriptPromises.set(src, promise);
+  return promise;
 }
 
 // ── 图片压缩（拍照稿/题目图片上传通用）──
@@ -210,7 +236,7 @@ export async function compressImageFile(file) {
   const img = await new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const image = new Image();
-    image.onload = () => resolve(image);
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
     image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('无法读取该图片')); };
     image.src = url;
   });

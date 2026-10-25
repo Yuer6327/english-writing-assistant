@@ -4,28 +4,33 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>注册 — 英语作文批改助手</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="https://blog.yuer6327.top/favicon/gravatar.png" type="image/x-icon">
-  <link rel="stylesheet" href="/css/style.css?v=20261026">
+  <link rel="stylesheet" href="/css/style.css?v=20261026b">
   <script>(function(){var t=localStorage.getItem('theme')||'auto';var d=t==='dark'||(t==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);if(d)document.documentElement.setAttribute('data-theme','dark');})();</script>
 </head>
 <body>
-  <nav class="navbar">
-    <div class="navbar-brand">✍️ <a href="/">英语作文批改助手</a></div>
+  <nav class="navbar" aria-label="站点导航">
+    <div class="navbar-brand">✍️ <a href="/"><span class="brand-text">英语作文批改助手</span></a></div>
     <div class="navbar-right">
-      <button class="theme-toggle" id="theme-toggle" title="明暗切换">🌙</button>
+      <button type="button" class="theme-toggle" id="theme-toggle" title="明暗切换" aria-label="切换深色/浅色主题">🌙</button>
     </div>
   </nav>
 
-  <div class="container" style="max-width:400px;margin-top:60px">
-    <div class="card" style="text-align:center;padding:32px">
-      <p id="register-page">正在跳转统一注册…</p>
-      <p style="margin-top:12px;font-size:13px;color:var(--text-soft)">
-        没有跳转？<a href="https://auth.yuer6327.top/register">手动前往注册</a>
-      </p>
+  <main id="main" tabindex="-1">
+    <div class="container" style="max-width:400px;margin-top:60px">
+      <div class="card" style="text-align:center;padding:32px">
+        <p id="register-page" role="status">正在跳转统一注册…</p>
+        <p style="margin-top:12px;font-size:13px;color:var(--text-soft)">
+          没有跳转？<a href="https://auth.yuer6327.top/register">手动前往注册</a>
+        </p>
+      </div>
     </div>
-  </div>
+  </main>
 
-  <script src="/js/theme.js?v=20261026"></script>
-  <script type="module" src="/js/auth.js?v=20261026"></script>
+  <script src="/js/theme.js?v=20261026b"></script>
+  <script type="module" src="/js/auth.js?v=20261026b"></script>
 </body>
 </html>

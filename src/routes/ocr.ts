@@ -25,7 +25,9 @@ const ocr = new Hono<{ Bindings: Env; Variables: Vars }>();
 const MAX_IMAGES = 3;
 const MAX_IMAGE_CHARS = 400_000;   // data URL 长度上限（约 300KB 二进制）
 
-function parseDataUrl(dataUrl: string): { ok: true; base64: string } | { ok: false; error: string } {
+function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: false; error: string } {
+  // 类型必须先判：非字符串直接 .match 会抛 TypeError → 500，暴露出栈信息
+  if (typeof dataUrl !== 'string') return { ok: false, error: '图片数据格式无效，需为 data URL' };
   const m = dataUrl.match(/^data:([a-z0-9+/.\-]+);base64,/);
   if (!m) return { ok: false, error: '图片数据格式无效，需为 data URL' };
   const base64 = dataUrl.slice(m[0].length);
@@ -113,7 +115,9 @@ ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
       if (holdInfo.mode === 'hold' && !settled) {
         await billing.releaseQuietly(c.env, holdInfo.holdId);
       }
-      return c.json({ error: 'OCR 识别失败', details: err?.message ?? String(err) }, 500);
+      console.error('[ocr:baidu] 识别失败:', err?.message ?? String(err));
+      // 不透传上游原始报文（可能含端点/账号线索），统一走中文友好文案
+      return c.json({ error: 'OCR 识别失败，请稍后重试或改用大模型识别' }, 502);
     }
   }
 

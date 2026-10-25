@@ -9,6 +9,9 @@
     "db:migrate": "node scripts/migrate.js",
     "db:migrate:remote": "node scripts/migrate.js --remote",
     "typecheck": "tsc --noEmit",
+    "csp:check": "node scripts/csp-hash.js",
+    "csp:hash": "node scripts/csp-hash.js --print",
+    "check": "npm run typecheck && npm run csp:check",
     "secret:key": "wrangler secret put ENCRYPTION_KEY"
   },
   "dependencies": {

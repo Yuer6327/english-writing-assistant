@@ -4,24 +4,35 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>我的作文 — 英语作文批改助手</title>
-  <link rel="canonical" href="https://yuer6327.top" />
+  <meta name="description" content="拍照上传英语手写作文，按上海高考大作文评分标准（内容 10 + 语言 10 + 结构 5）智能批改，支持二稿迭代、片段精修、全文润色与报告导出。">
+  <link rel="canonical" href="https://writing.yuer6327.top/" />
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="英语作文批改助手">
+  <meta property="og:title" content="我的作文 — 英语作文批改助手">
+  <meta property="og:description" content="拍照上传英语手写作文，按上海高考大作文评分标准智能批改，支持二稿迭代、片段精修、全文润色与报告导出。">
+  <meta property="og:url" content="https://writing.yuer6327.top/">
+  <meta name="twitter:card" content="summary">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="https://blog.yuer6327.top/favicon/gravatar.png" type="image/x-icon">
-  <link rel="stylesheet" href="/css/style.css?v=20261026">
+  <link rel="stylesheet" href="/css/style.css?v=20261026b">
   <script>(function(){var t=localStorage.getItem('theme')||'auto';var d=t==='dark'||(t==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);if(d)document.documentElement.setAttribute('data-theme','dark');})();</script>
 </head>
 <body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
   <!-- 导航栏（swup 持久化） -->
-  <nav id="site-nav" class="navbar">
-    <div class="navbar-brand">✍️ <a href="/">英语作文批改助手</a></div>
+  <nav id="site-nav" class="navbar" aria-label="站点导航">
+    <div class="navbar-brand">✍️ <a href="/"><span class="brand-text">英语作文批改助手</span></a></div>
     <div class="navbar-right">
-      <button class="theme-toggle" id="theme-toggle" title="明暗切换">🌙</button>
+      <button type="button" class="theme-toggle" id="theme-toggle" title="明暗切换" aria-label="切换深色/浅色主题">🌙</button>
       <a href="/" data-nav>我的作文</a>
       <a href="/settings.html" data-nav>设置</a>
-      <a href="https://auth.yuer6327.top/logout" id="logout-btn">退出</a>
+      <a href="https://auth.yuer6327.top/logout" id="logout-btn" rel="nofollow">退出</a>
     </div>
   </nav>
 
-  <main id="main" data-page-module="/js/index.js?v=20261026">
+  <main id="main" tabindex="-1" data-page-module="/js/index.js?v=20261026b">
     <div class="container" style="max-width:820px">
       <h1 style="font-size:24px;margin-bottom:20px">我的作文</h1>
 
@@ -30,22 +41,22 @@
         <h3 style="margin-bottom:14px">新建作文</h3>
         <form id="create-essay-form">
           <div class="form-group">
-            <label class="form-label">标题 <span style="font-weight:400;color:var(--text-light)">（如：2026 春考摸底 · 图画作文）</span></label>
+            <label class="form-label" for="new-title">标题 <span style="font-weight:400;color:var(--text-light)">（如：2026 春考摸底 · 图画作文）</span></label>
             <input type="text" class="form-input" id="new-title" required maxlength="200" placeholder="给这篇作文起个名字">
           </div>
           <div class="form-group">
-            <label class="form-label">题型</label>
+            <label class="form-label" for="new-genre">题型</label>
             <select class="form-input" id="new-genre">
               <option value="sh-gaokao-essay">上海高考大作文（25 分 · 200-500 词）</option>
             </select>
           </div>
           <div class="form-group">
-            <label class="form-label">题目 <span style="font-weight:400;color:var(--text-light)">（粘贴作文题目/写作要求）</span></label>
+            <label class="form-label" for="new-topic">题目 <span style="font-weight:400;color:var(--text-light)">（粘贴作文题目/写作要求）</span></label>
             <textarea class="form-input" id="new-topic" rows="4" required maxlength="8000"
               placeholder="Directions: Write an English composition in 200-500 words on the topic ..."></textarea>
           </div>
           <div class="form-group">
-            <label class="form-label">题目图片 <span style="font-weight:400;color:var(--text-light)">（可选，图画/图表作文时上传）</span></label>
+            <label class="form-label" for="new-topic-images">题目图片 <span style="font-weight:400;color:var(--text-light)">（可选，图画/图表作文时上传，最多 3 张）</span></label>
             <input type="file" id="new-topic-images" accept="image/*" multiple>
             <div class="img-thumbs" id="new-topic-thumbs"></div>
           </div>
@@ -54,7 +65,7 @@
       </div>
 
       <!-- 作文列表 -->
-      <div id="essay-list"></div>
+      <div id="essay-list" aria-busy="true"></div>
     </div>
   </main>
 
@@ -63,7 +74,7 @@
     Project lead by <a href="https://www.yuer6327.top" target="_blank" rel="noopener noreferrer">Yuer6327</a> · <a href="https://github.com/Yuer6327/english-writing-assistant" target="_blank" rel="noopener noreferrer">GitHub</a>
   </footer>
 
-  <script src="/js/theme.js?v=20261026"></script>
-  <script type="module" src="/js/swup.js?v=20261026"></script>
+  <script src="/js/theme.js?v=20261026b"></script>
+  <script type="module" src="/js/swup.js?v=20261026b"></script>
 </body>
 </html>

@@ -58,8 +58,20 @@ BAIDU_OCR_SK=<同上>
 已上线 https://writing.yuer6327.top/ ，日常更新只需：
 
 ```bash
-npm run typecheck && npm run db:migrate:remote && npm run deploy
+npm run check && npm run db:migrate:remote && npm run deploy
 ```
+
+`npm run check` = 类型检查 + CSP 内联脚本哈希校验（改了 `public/*.html` 里的内联脚本要先 `npm run csp:hash` 更新哈希）。
+
+## 安全实践
+
+- **CSP**：内联脚本用 sha256 白名单而非 `unsafe-inline`；`script-src` 只放自身源 + 导出用的 CDN
+- **同源校验**：写操作校验 Origin/Referer，配合 SameSite Cookie 双重防 CSRF
+- **CORS 白名单**：只反射自身源（`FRONTEND_ORIGIN` 逗号分隔可加白名单），不再对任意 Origin 开口
+- **响应头**：`X-Frame-Options: DENY`、`nosniff`、`Referrer-Policy`、`Permissions-Policy`、HSTS
+- **静态资源必须过 Worker**（`assets.run_worker_first`），否则 HTML 拿不到上述响应头
+- **计费安全**：预扣费前先做完所有入参校验，避免失败早退留下未释放的冻结额度
+- BYOK 端点只允许 `https`（本地环回除外），密钥由计费平台 AES-GCM 加密托管
 
 首次部署（已完成）备忘：`wrangler d1 create writing-assistant-db`（真实 database_id 已写入 wrangler.toml）、secrets（ENCRYPTION_KEY / AGNES_API_KEY）、路由 `writing.yuer6327.top/*` 由 wrangler.toml `routes` 维护；DNS 灰云 CNAME 由 dns-guard 管理（RECORDS 已收录本子域）。
 

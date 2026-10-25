@@ -5,18 +5,18 @@
 // 兑换码为一次性明码展示，刷新即丢，请立即复制保存。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026b';
 
-let disposed = false;
+let generation = 0;
 
 export function cleanup() {
-  disposed = true;
+  generation++;
 }
 
 export async function init() {
-  disposed = false;
+  const gen = ++generation;
   const user = await requireAuth();
-  if (!user || disposed) return;
+  if (!user || gen !== generation) return;
 
   const root = document.getElementById('admin-root');
   if (!root) return;
@@ -86,7 +86,7 @@ export async function init() {
         </div>
         <button type="submit" class="btn btn-primary" style="margin-bottom:8px">生成</button>
       </form>
-      <div class="muted" style="font-size:12px">明码仅本次展示，刷新即丢，请立即复制保存。</div>
+      <div class="chip-row" style="margin-top:8px"><span class="chip">仅本次可见</span><span class="chip">刷新即丢</span></div>
       <div id="code-result" style="margin-top:10px"></div>
     </div>
 
@@ -121,14 +121,14 @@ export async function init() {
     </div>
   `;
 
-  bindAdmin(root);
+  bindAdmin(root, gen);
 }
 
 function fmtPoints(cents) {
   return (cents / 100).toFixed(2);
 }
 
-function bindAdmin(root) {
+function bindAdmin(root, gen) {
   // ── 送积分 ──
   root.querySelector('#f-gift').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -140,12 +140,13 @@ function bindAdmin(root) {
         parseFloat(root.querySelector('#gift-yuan').value),
         root.querySelector('#gift-note').value.trim() || undefined,
       );
+      if (gen !== generation) return;
       toast(`已赠送，当前余额 ${fmtPoints(res.balance)} 积分`, 'success');
       root.querySelector('#gift-yuan').value = '';
     } catch (err) {
-      toast(err.message, 'error');
+      if (gen === generation) toast(err.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = '赠送';
+      if (gen === generation) { btn.disabled = false; btn.textContent = '赠送'; }
     }
   });
 
@@ -167,7 +168,7 @@ function bindAdmin(root) {
         <input type="text" class="form-input" id="tag-input" placeholder="标签组 key（如 vip）" style="width:180px">
         <button type="button" class="btn btn-sm" data-tag-add style="padding:5px 12px;font-size:13px">贴标签</button>
         <button type="button" class="btn btn-sm" data-tag-remove style="padding:5px 12px;font-size:13px">撕掉该标签</button>
-        <span class="muted" style="font-size:12px">首次使用新标签组会自动创建；额度规则按标签组配置在计费平台。</span>
+        <span class="chip">新标签组自动创建</span>
       </form>
       ${ledgerRows ? `<table style="width:100%;border-collapse:collapse;font-size:12px">
         <thead><tr style="color:var(--text-light);text-align:left">
@@ -182,7 +183,7 @@ function bindAdmin(root) {
     box.innerHTML = '<span class="spinner"></span> 查询中...';
     try {
       const data = await api.billing.admin.user(username);
-      if (disposed) return;
+      if (gen !== generation) return;
       box.innerHTML = renderUser(data, username);
 
       const tagInput = box.querySelector('#tag-input');
@@ -190,21 +191,22 @@ function bindAdmin(root) {
       const tagRemove = box.querySelector('[data-tag-remove]');
       const refresh = async () => {
         const fresh = await api.billing.admin.user(username);
-        if (!disposed) box.innerHTML = renderUser(fresh, username);
+        if (gen === generation) box.innerHTML = renderUser(fresh, username);
       };
       const doTag = async (mode) => {
         const key = tagInput.value.trim();
         if (!key) { toast('请输入标签组 key', 'error'); return; }
         try {
           await api.billing.admin.tags(username, mode === 'add' ? [key] : [], mode === 'remove' ? [key] : []);
+          if (gen !== generation) return;
           toast(mode === 'add' ? '已贴标签' : '已撕掉标签', 'success');
           await refresh();
-        } catch (err) { toast(err.message, 'error'); }
+        } catch (err) { if (gen === generation) toast(err.message, 'error'); }
       };
       tagAdd.addEventListener('click', () => doTag('add'));
       tagRemove.addEventListener('click', () => doTag('remove'));
     } catch (err) {
-      if (!disposed) box.innerHTML = `<div class="muted" style="font-size:13px;color:#d64545">${escapeHtml(err.message)}</div>`;
+      if (gen === generation) box.innerHTML = `<div class="muted" style="font-size:13px;color:#d64545">${escapeHtml(err.message)}</div>`;
     }
   });
 
@@ -218,7 +220,7 @@ function bindAdmin(root) {
       const yuan = root.querySelector('#code-yuan').value;
       const count = parseInt(root.querySelector('#code-count').value, 10) || 1;
       const res = await api.billing.admin.codes(parseFloat(yuan), count);
-      if (disposed) return;
+      if (gen !== generation) return;
       const codesText = res.codes.join('\n');
       box.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -231,9 +233,9 @@ function bindAdmin(root) {
         navigator.clipboard?.writeText(codesText).then(() => toast('已复制', 'success'));
       });
     } catch (err) {
-      toast(err.message, 'error');
+      if (gen === generation) toast(err.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = '生成';
+      if (gen === generation) { btn.disabled = false; btn.textContent = '生成'; }
     }
   });
 
@@ -248,11 +250,12 @@ function bindAdmin(root) {
         parseFloat(root.querySelector('#manual-yuan').value),
         root.querySelector('#manual-note').value.trim() || undefined,
       );
+      if (gen !== generation) return;
       toast(`补单成功：${res.orderId}`, 'success');
     } catch (err) {
-      toast(err.message, 'error');
+      if (gen === generation) toast(err.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = '补单';
+      if (gen === generation) { btn.disabled = false; btn.textContent = '补单'; }
     }
   });
 
@@ -263,7 +266,7 @@ function bindAdmin(root) {
     const box = root.querySelector('#orders-result');
     try {
       const res = await api.billing.admin.orders(50);
-      if (disposed) return;
+      if (gen !== generation) return;
       box.innerHTML = res.orders.length ? `
         <div style="overflow-x:auto">
         <table style="width:100%;border-collapse:collapse;font-size:12px">
@@ -286,9 +289,9 @@ function bindAdmin(root) {
             </tr>`).join('')}</tbody>
         </table></div>` : '<div class="muted" style="font-size:13px">暂无订单</div>';
     } catch (err) {
-      toast(err.message, 'error');
+      if (gen === generation) toast(err.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = '加载最近 50 笔订单';
+      if (gen === generation) { btn.disabled = false; btn.textContent = '加载最近 50 笔订单'; }
     }
   });
 
@@ -299,12 +302,13 @@ function bindAdmin(root) {
     btn.disabled = true; btn.textContent = '迁移中...';
     try {
       const res = await api.billing.admin.migrateByok();
+      if (gen !== generation) return;
       const ok = res.migrated + res.skipped + (res.failed || 0) === res.source_rows;
       toast(`源 ${res.source_rows} 行 · 迁移 ${res.migrated} · 跳过 ${res.skipped}${res.failed ? ` · 失败 ${res.failed}` : ''}${ok ? '' : '（数字不一致，请检查）'}`, ok ? 'success' : 'error');
     } catch (err) {
-      toast(err.message, 'error');
+      if (gen === generation) toast(err.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = 'BYOK 一次性迁移';
+      if (gen === generation) { btn.disabled = false; btn.textContent = 'BYOK 一次性迁移'; }
     }
   });
 }

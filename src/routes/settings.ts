@@ -23,11 +23,41 @@ interface SaveBody {
   vision_model_name?: string;
 }
 
+/** API 端点校验：仅 https，本地环回允许 http；返回错误文案或 null（通过/留空） */
+function normalizeBaseUrl(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (v.length > 300) return 'API 地址过长';
+  let u: URL;
+  try { u = new URL(v); } catch { return 'API 地址格式不正确（需完整 URL）'; }
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
+    return 'API 地址必须使用 https（本地环回地址除外）';
+  }
+  if (u.username || u.password) return 'API 地址不能包含凭据';
+  return null;
+}
+
+/** 模型名校验：非空长度上限（防超长串写库/打计费） */
+function checkModelName(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (v.length > 120) return '模型名称过长';
+  if (!/^[\w.:/@-]+$/.test(v)) return '模型名称含非法字符';
+  return null;
+}
+
 // ── 保存 / 更新 API 配置 ──
 settings.post('/api-keys', authMiddleware, async (c) => {
   const userId = c.get('userId');
   const body = await c.req.json<SaveBody>().catch(() => ({}) as SaveBody);
   const p = body.provider === 'agnes' ? 'agnes' : 'byok';
+
+  // ── 端点/模型名校验：https（本地环回可用 http），并封顶长度 ──
+  const baseUrlErr = normalizeBaseUrl(body.api_base_url) ?? normalizeBaseUrl(body.vision_api_base_url) ?? '';
+  const modelErr = checkModelName(body.model_name) ?? checkModelName(body.vision_model_name) ?? '';
+  const bad = baseUrlErr || modelErr;
+  if (bad) return c.json({ error: bad }, 400);
 
   try {
     if (p === 'agnes') {
@@ -40,6 +70,7 @@ settings.post('/api-keys', authMiddleware, async (c) => {
     const key = body.api_key?.trim();
     const st = await billing.byokStatus(c.env, userId);
     if (!key && !st.configured) return c.json({ error: 'API Key 不能为空' }, 400);
+    if (key && key.length > 400) return c.json({ error: 'API Key 过长' }, 400);
 
     const baseUrl = body.api_base_url?.trim() || st.baseUrl || 'https://api.openai.com/v1';
     const model = body.model_name?.trim() || st.model || 'gpt-4o-mini';

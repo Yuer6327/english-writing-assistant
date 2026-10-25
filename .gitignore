@@ -32,3 +32,6 @@ Thumbs.db
 # ── ZCode 本地会话文件（不入库）──
 .zcode/
 .tmp-f.json
+
+# ── WorkBuddy / AI 助手本地工作区（记忆、快照等，不入库）──
+.workbuddy/

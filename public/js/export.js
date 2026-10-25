@@ -6,7 +6,7 @@
 // 由 essay.js 调用 openExportModal({ mode:'report', getData })。
 // ============================================================
 
-import { loadScript, toast, gradeFor } from './api.js?v=20261026';
+import { loadScript, toast, gradeFor } from './api.js?v=20261026b';
 
 // ── CDN 资源（jsdmirror 镜像）──
 const DOCX_CDN = 'https://cdn.jsdmirror.com/npm/docx@8.5.0/build/index.umd.js';
@@ -52,26 +52,40 @@ function ensureNotoFont() {
 
 let modalEl = null;
 let modalResolve = null;
+let modalReturnFocus = null;
 
-function onModalKeydown(e) { if (e.key === 'Escape') closeModal(false); }
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function onModalKeydown(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(false); return; }
+  if (e.key !== 'Tab' || !modalEl) return;
+  // 焦点陷阱：Tab 在对话框内循环
+  const nodes = [...modalEl.querySelectorAll(FOCUSABLE)].filter(n => n.offsetParent !== null);
+  if (!nodes.length) return;
+  const first = nodes[0];
+  const last = nodes[nodes.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
 
 /** 打开导出配置模态框。opts: { mode:'report', getData: async () => payload } */
 export function openExportModal(opts) {
-  closeModal(false);
+  closeModal(false, null, true);
   modalResolve = null;
+  modalReturnFocus = document.activeElement;
 
   modalEl = document.createElement('div');
   modalEl.className = 'modal-overlay';
   modalEl.id = 'export-modal';
   modalEl.innerHTML = `
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="导出批改报告">
       <div class="modal-header">
         <span class="modal-title">导出批改报告</span>
-        <button class="modal-close" data-export-close title="关闭">×</button>
+        <button type="button" class="modal-close" data-export-close title="关闭" aria-label="关闭对话框">×</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label class="form-label">格式</label>
+        <fieldset style="border:0;padding:0;margin:0 0 16px">
+          <legend class="form-label">格式</legend>
           <div class="export-options">
             <label class="export-option">
               <input type="radio" name="export-format" value="docx" checked>
@@ -84,9 +98,9 @@ export function openExportModal(opts) {
               <span class="opt-desc">适合打印/发送</span>
             </label>
           </div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">包含稿件</label>
+        </fieldset>
+        <fieldset style="border:0;padding:0;margin:0 0 16px">
+          <legend class="form-label">包含稿件</legend>
           <div class="export-options">
             <label class="export-option">
               <input type="radio" name="export-scope" value="all" checked>
@@ -99,22 +113,28 @@ export function openExportModal(opts) {
               <span class="opt-desc">只导最新一稿及其批改</span>
             </label>
           </div>
-        </div>
+        </fieldset>
         <button type="button" class="btn btn-primary btn-block" data-export-confirm>导出</button>
       </div>
     </div>`;
   document.body.appendChild(modalEl);
-  requestAnimationFrame(() => modalEl.classList.add('open'));
+  requestAnimationFrame(() => modalEl?.classList.add('open'));
 
   modalEl.querySelectorAll('[data-export-close]').forEach(b => b.addEventListener('click', () => closeModal(false)));
   modalEl.addEventListener('mousedown', e => { if (e.target === modalEl) closeModal(false); });
   document.addEventListener('keydown', onModalKeydown);
 
-  modalEl.querySelector('[data-export-confirm]').addEventListener('click', async (e) => {
+  const confirmBtn = modalEl.querySelector('[data-export-confirm]');
+  if (confirmBtn) {
+    try { confirmBtn.focus({ preventScroll: true }); } catch { /* 忽略 */ }
+  }
+
+  confirmBtn.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
-    const format = modalEl.querySelector('input[name="export-format"]:checked').value;
-    const scope = modalEl.querySelector('input[name="export-scope"]:checked').value;
-    btn.disabled = true; btn.textContent = '生成中...（首次导出需下载字体/组件）';
+    const modal = modalEl;
+    const format = modal.querySelector('input[name="export-format"]:checked').value;
+    const scope = modal.querySelector('input[name="export-scope"]:checked').value;
+    btn.disabled = true; btn.textContent = '生成中...';
 
     try {
       const payload = await opts.getData();
@@ -128,18 +148,37 @@ export function openExportModal(opts) {
       a.download = sanitizeFilename(`${data.title}-批改报告.${ext}`);
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      closeModal(true);
+      closeModal(true, modal);
     } catch (err) {
-      toast(err.message || '导出失败', 'error');
-      btn.disabled = false; btn.textContent = '导出';
+      if (modal === modalEl) {
+        toast(err.message || '导出失败', 'error');
+        btn.disabled = false; btn.textContent = '导出';
+      }
     }
   });
 }
 
-function closeModal(ok) {
+function closeModal(ok, expected = null, immediate = false) {
+  if (expected && expected !== modalEl) return; // 旧导出任务不能误关新模态框
   document.removeEventListener('keydown', onModalKeydown);
-  if (modalEl) { modalEl.remove(); modalEl = null; }
+  const el = modalEl;
+  modalEl = null;
   if (modalResolve) { modalResolve(ok); modalResolve = null; }
+  // 焦点归还触发按钮
+  const back = modalReturnFocus;
+  modalReturnFocus = null;
+  if (back && typeof back.focus === 'function' && back.isConnected) {
+    try { back.focus({ preventScroll: true }); } catch { /* 忽略 */ }
+  }
+  if (!el) return;
+  if (immediate || matchMedia('(prefers-reduced-motion: reduce)').matches) { el.remove(); return; }
+  el.classList.remove('open');
+  el.classList.add('closing');
+  setTimeout(() => el.remove(), 180);
+}
+
+export function closeExportModal() {
+  closeModal(false, null, true);
 }
 
 function sanitizeFilename(name) {

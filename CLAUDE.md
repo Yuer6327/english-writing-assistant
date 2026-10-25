@@ -37,12 +37,18 @@
 ## 目录结构
 
 ```
-├── wrangler.toml              # 端口 8788（避开阅读助手 8787）；D1: writing-assistant-db
+├── wrangler.toml              # 端口 8788（避开阅读助手 8787）；D1: writing-assistant-db；
+│                              # assets.run_worker_first=true（静态资源必须过 Worker，否则安全头对 HTML 失效）
 ├── migrations/0001_init.sql   # 全部业务表
+├── scripts/
+│   ├── migrate.js             # 顺序执行 D1 迁移
+│   └── csp-hash.js            # 校验 public/*.html 内联脚本的 CSP sha256 是否与 Worker 常量一致
 ├── src/
-│   ├── index.ts               # Hono 入口：CORS + 路由挂载 + ASSETS fallback
+│   ├── index.ts               # Hono 入口：安全头 → CORS/同源校验 → 路由 → ASSETS fallback
 │   ├── types.ts               # Env / Vars / ReviewResult 等业务类型
-│   ├── middleware/auth.ts     # JWT 校验中间件（c.set('userId')）
+│   ├── middleware/
+│   │   ├── auth.ts            # 统一认证会话校验（直查 auth-db sessions）
+│   │   └── security.ts        # ★ 安全响应头 + CSP + CORS 白名单 + 写操作同源校验
 │   ├── routes/
 │   │   ├── auth.ts            # 注册（含 seed）/登录/me/logout
 │   │   ├── essays.ts          # ★ 核心：作文+稿件 CRUD / 批改 / 精修 / 全文润色（挂 /api）
@@ -96,24 +102,51 @@
 - `data-page-module` 在 `<main>` 自身属性上，swup 切页时显式复制（innerHTML 不带属性）。
 - quote 高亮定位：先原文 `indexOf`，失败再 `buildNormMap` 空白归一映射回原文下标（`essay.js`）。
 
+## 安全约定（改代码前必读）
+
+| 面 | 机制 | 注意 |
+|---|---|---|
+| 响应头 | `middleware/security.ts` 统一注入 CSP / X-Frame-Options / nosniff / Referrer-Policy / Permissions-Policy / HSTS | **CSP 内联脚本走 sha256，不用 `unsafe-inline`**；改 `public/*.html` 里的 `<script>` 后必须 `npm run csp:hash` 看新哈希并更新 `INLINE_SCRIPT_HASHES`，否则 `npm run csp:check`（CI 已接）会挂 |
+| 静态资源 | `[assets] run_worker_first = true` | 关掉的话静态文件由边缘直接返回、**绕过 Worker，安全头对 HTML 全部失效**（本地 `wrangler dev` 同样如此，别只看配置文件就以为生效） |
+| CORS | 白名单反射（自身源 + `FRONTEND_ORIGIN` 逗号列表） | `FRONTEND_ORIGIN="*"` 现在表示"仅同源"，不再反射任意 Origin；响应带 `Vary: Origin` |
+| CSRF | 非 GET 请求校验 Origin/Referer 同源 | 无 Origin 的请求（curl/服务端）放行，认证仍靠 Cookie |
+| 调试后门 | `GET /api/auth/dev-session` | 需 `.dev.vars` 里 `ENABLE_DEV_SESSION=1` **且** 本地 auth-db 有测试会话行才发 Cookie；生产不配置该变量 → 恒 404。**不要用 Host 判断**：`wrangler dev` 会把请求 URL/Host 重写成 `routes` 里的生产域名 |
+| 计费 | `hold → settle/release` | **入参校验必须放在 `hold` 之前**，否则 400 早退会留下未释放的冻结额度（要等 cron 过期才对账） |
+| 入参 | 自增 id 统一走 `parseId()`；文本长度封顶 | 新增/修改稿件同为 `MAX_ESSAY_CHARS`；BYOK 端点只允许 https（本地环回除外） |
+
+## 前端 UI 约定
+
+- **用视觉提示代替文字说明**：状态用徽章/进度条/颜色+下划线，说明性长句压成 `.chip` 标签或塞进 `title`，不要在前端堆大段文案。
+- 交互元素必须是真控件：列表项用 `<a>`（可 Tab/新窗口），图标按钮带 `aria-label`，弹窗带 `role="dialog"` + 焦点陷阱 + 关闭后归还焦点。
+- 焦点环靠全局 `:focus-visible`；`--text-light` 已按 WCAG AA（≥4.5:1）调过，别再调浅。
+- 未在 HTML/JS 中出现的类不要留在 `style.css`（历史遗留已清理一次，约 450 行）。
+
 ## 常用命令
 
 ```bash
 npm run dev            # wrangler dev → http://localhost:8788
 npm run typecheck      # tsc --noEmit
+npm run csp:check      # 校验 CSP 内联脚本哈希（CI 必跑）
+npm run csp:hash       # 打印当前 HTML 内联脚本哈希（改完 HTML 用）
+npm run check          # typecheck + csp:check（部署前一条命令）
 npm run db:migrate     # 本地 D1 迁移（db:migrate:remote 为生产）
 npm run deploy         # 部署（自动维护 writing.yuer6327.top/* 路由）
 ```
 
-`.dev.vars`（gitignored）：ENCRYPTION_KEY（本地随机即可）、AGNES_API_KEY（真实共享密钥）、BAIDU_OCR_AK/SK（可选）。
+`.dev.vars`（gitignored）：ENCRYPTION_KEY（本地随机即可）、AGNES_API_KEY（真实共享密钥）、BAIDU_OCR_AK/SK（可选）、ENABLE_DEV_SESSION=1（本地测试会话开关，生产不配）。
 
-**本地联调统一认证**：AUTH_DB 走本地 sqlite（与生产隔离），需先造最小表+测试会话：
+**本地联调统一认证**：AUTH_DB 走本地 sqlite（与生产隔离），需先造最小表+测试会话；配好 `ENABLE_DEV_SESSION=1` 后浏览器直接访问 `/api/auth/dev-session` 即可拿到 cookie 值 `test-cookie-1`：
 
 ```bash
-# 本地 auth-db 造 users/sessions 表并插入测试会话（cookie 值 testsession）
+# 本地 auth-db 造 users/sessions 表并插入测试会话（cookie 值 test-cookie-1，
+# token_hash = sha256('test-cookie-1') = 95496838ab4f1634...）
 npx wrangler d1 execute auth-db --local --command "CREATE TABLE ...; INSERT ..."
-# 之后 curl -H "Cookie: s=testsession" http://127.0.0.1:8788/api/essays
+# 之后 curl -H "Cookie: s=test-cookie-1" http://127.0.0.1:8788/api/essays
 ```
+
+> ⚠️ `wrangler dev` 会把请求的 Host/Origin 重写成 `routes` 里的生产域名（`http://writing.yuer6327.top`），
+> 所以本地按 Host 判断"是不是本地请求"一定失败；需要区分环境请用环境变量开关。
+> 另：`XDG_CONFIG_HOME` 指向项目内可写目录，可避免沙箱内 wrangler 写日志目录 EPERM。
 
 **生产 secrets**（wrangler secret put）：ENCRYPTION_KEY、AGNES_API_KEY、BAIDU_OCR_AK / BAIDU_OCR_SK（复用 english-reading-assistant 的百度应用，AppID 8096172，均已配置）。
 

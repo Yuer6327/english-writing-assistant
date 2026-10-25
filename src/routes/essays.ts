@@ -68,6 +68,13 @@ function parseJsonField<T>(v: unknown, fallback: T): T {
   try { return JSON.parse(v) as T; } catch { return fallback; }
 }
 
+/** 路径/请求体里的自增 id：必须是正整数，否则直接当"不存在"（避免 NaN 绑定与无谓查库） */
+function parseId(raw: unknown): number | null {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 // ============================================================
 // 作文 CRUD
 // ============================================================
@@ -144,7 +151,8 @@ api.get('/essays', authMiddleware, async (c) => {
 // ── 作文详情（题目 + 全部稿件及其批改 + 最近精修记录）──
 api.get('/essays/:id', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const essayId = parseInt(c.req.param('id'));
+  const essayId = parseId(c.req.param('id'));
+  if (essayId === null) return c.json({ error: '作文不存在' }, 404);
 
   const essay = await c.env.DB.prepare(
     'SELECT * FROM essays WHERE id = ? AND user_id = ?',
@@ -201,7 +209,8 @@ api.get('/essays/:id', authMiddleware, async (c) => {
 // ── 更新作文（标题/题目/自定义提示词）──
 api.put('/essays/:id', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const essayId = parseInt(c.req.param('id'));
+  const essayId = parseId(c.req.param('id'));
+  if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   const body = await c.req.json<{
     title?: string; topic_text?: string; topic_images?: string[]; custom_prompt?: string | null;
   }>().catch(() => ({}) as any);
@@ -243,7 +252,8 @@ api.put('/essays/:id', authMiddleware, async (c) => {
 // ── 删除作文（级联删稿件/批改/精修）──
 api.delete('/essays/:id', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const essayId = parseInt(c.req.param('id'));
+  const essayId = parseId(c.req.param('id'));
+  if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   const r = await c.env.DB.prepare('DELETE FROM essays WHERE id = ? AND user_id = ?').bind(essayId, userId).run();
   if (!r.meta.changes) return c.json({ error: '作文不存在' }, 404);
   return c.json({ ok: true });
@@ -256,7 +266,8 @@ api.delete('/essays/:id', authMiddleware, async (c) => {
 // ── 新增稿件（一稿/二稿/…；来源：photo/text/polish）──
 api.post('/essays/:id/drafts', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const essayId = parseInt(c.req.param('id'));
+  const essayId = parseId(c.req.param('id'));
+  if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   const body = await c.req.json<{
     text?: string; source?: string; handwriting_score?: number; ocr_images?: string[];
   }>().catch(() => ({}) as any);
@@ -298,11 +309,14 @@ api.post('/essays/:id/drafts', authMiddleware, async (c) => {
 // ── 修改稿件文本（保存后可重新批改）──
 api.put('/drafts/:id', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const draftId = parseInt(c.req.param('id'));
+  const draftId = parseId(c.req.param('id'));
+  if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const body = await c.req.json<{ text?: string }>().catch(() => ({}) as any);
 
   const text = (body.text || '').replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
+  // 与新建稿件同一条上限，避免绕过前端直接写超长文本撑爆 D1 行体积
+  if (text.length > MAX_ESSAY_CHARS) return c.json({ error: '稿件内容过长' }, 400);
 
   const draft = await c.env.DB.prepare(
     'SELECT id, essay_id FROM drafts WHERE id = ? AND user_id = ?',
@@ -318,7 +332,8 @@ api.put('/drafts/:id', authMiddleware, async (c) => {
 // ── 删除稿件（连带其批改记录）──
 api.delete('/drafts/:id', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const draftId = parseInt(c.req.param('id'));
+  const draftId = parseId(c.req.param('id'));
+  if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const r = await c.env.DB.prepare('DELETE FROM drafts WHERE id = ? AND user_id = ?').bind(draftId, userId).run();
   if (!r.meta.changes) return c.json({ error: '稿件不存在' }, 404);
   return c.json({ ok: true });
@@ -331,7 +346,8 @@ api.delete('/drafts/:id', authMiddleware, async (c) => {
 // ── 对稿件执行批改 ──
 api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
-  const draftId = parseInt(c.req.param('id'));
+  const draftId = parseId(c.req.param('id'));
+  if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const body = await c.req.json<{ model_id?: string }>().catch(() => ({}) as any);
 
   const draft = await c.env.DB.prepare(
@@ -503,10 +519,22 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
 
 api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
-  const essayId = parseInt(c.req.param('id'));
+  const essayId = parseId(c.req.param('id'));
+  if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   const body = await c.req.json<{
     mode?: string; fragment?: string; instruction?: string; draft_id?: number; model_id?: string;
   }>().catch(() => ({}) as any);
+
+  // ── 入参校验一律前置到预扣费之前 ──
+  // 旧实现把片段长度校验放在 hold 之后，早退时既没 settle 也没 release，
+  // 冻结的积分要等 cron 过期才回滚（用户会看到"没批改却扣了额度"）。
+  const isFragment = body.mode === 'fragment';
+  const fragment = (body.fragment || '').trim();
+  const instruction = (body.instruction || '').trim().slice(0, 1000) || '无特别要求，按常规标准精修';
+  if (isFragment) {
+    if (fragment.length < 3) return c.json({ error: '选中的片段过短' }, 400);
+    if (fragment.length > 3000) return c.json({ error: '选中的片段过长（≤3000 字符）' }, 400);
+  }
 
   const essay = await c.env.DB.prepare(
     'SELECT * FROM essays WHERE id = ? AND user_id = ?',
@@ -518,10 +546,11 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
   // 精修/润色的上下文稿件：指定 draft_id，否则最新稿
   let contextDraftId: number | null = null;
   let contextText = '';
-  if (body.draft_id) {
+  const bodyDraftId = parseId(body.draft_id);
+  if (bodyDraftId !== null) {
     const d = await c.env.DB.prepare(
       'SELECT id, text FROM drafts WHERE id = ? AND essay_id = ? AND user_id = ?',
-    ).bind(body.draft_id, essayId, userId).first<{ id: number; text: string }>();
+    ).bind(bodyDraftId, essayId, userId).first<{ id: number; text: string }>();
     if (d) { contextDraftId = d.id; contextText = d.text; }
   }
   if (!contextText) {
@@ -529,6 +558,11 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
       'SELECT id, text FROM drafts WHERE essay_id = ? AND user_id = ? ORDER BY version DESC LIMIT 1',
     ).bind(essayId, userId).first<{ id: number; text: string }>();
     if (d) { contextDraftId = d.id; contextText = d.text; }
+  }
+
+  // 全文润色必须有稿件；放在扣费前判断，避免"扣了冻结额度才发现没得润色"
+  if (!isFragment && !contextText) {
+    return c.json({ error: '该作文还没有稿件，无法润色' }, 400);
   }
 
   const lane = await laneFromBody(c.env, userId, body.model_id);
@@ -540,14 +574,13 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
     return c.json(fail.body, fail.status);
   }
 
-  const isFragment = body.mode === 'fragment';
   const maxOutput = maxOutputFor(lane, isFragment ? 3000 : 4096);
 
   // ── 预扣费（片段 / 全文输出上限）──
   let holdInfo: billing.HoldInfo;
   try {
     const estBase = isFragment
-      ? Math.ceil((essay.topic_text.length + (contextText || '').length + (body.fragment || '').length) / 3)
+      ? Math.ceil((essay.topic_text.length + (contextText || '').length + fragment.length) / 3)
       : Math.ceil((essay.topic_text.length + (contextText || '').length) / 3);
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       estInputTokens: estBase,
@@ -568,12 +601,7 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
   let charged = 0;
   try {
     if (isFragment) {
-      // ── 片段精修 ──
-      const fragment = (body.fragment || '').trim();
-      if (fragment.length < 3) return c.json({ error: '选中的片段过短' }, 400);
-      if (fragment.length > 3000) return c.json({ error: '选中的片段过长（≤3000 字符）' }, 400);
-      const instruction = (body.instruction || '').trim().slice(0, 1000) || '无特别要求，按常规标准精修';
-
+      // ── 片段精修（fragment / instruction 已在扣费前校验）──
       const filled = fillTemplate(FRAGMENT_POLISH_PROMPT, {
         topic: essay.topic_text.slice(0, 2000),
         essay: contextText.slice(0, 8000),

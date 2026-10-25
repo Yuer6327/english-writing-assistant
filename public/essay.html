@@ -4,24 +4,35 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>作文工作台 — 英语作文批改助手</title>
-  <link rel="canonical" href="https://yuer6327.top" />
+  <meta name="description" content="作文工作台：查看题目、管理多稿、拍照识别、批改结果与原文高亮标注、片段精修、全文润色、报告导出。">
+  <link rel="canonical" href="https://writing.yuer6327.top/essay" />
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="英语作文批改助手">
+  <meta property="og:title" content="作文工作台 — 英语作文批改助手">
+  <meta property="og:description" content="多稿迭代、批改结果与原文高亮标注、片段精修、全文润色、报告导出。">
+  <meta property="og:url" content="https://writing.yuer6327.top/essay">
+  <meta name="twitter:card" content="summary">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="https://blog.yuer6327.top/favicon/gravatar.png" type="image/x-icon">
-  <link rel="stylesheet" href="/css/style.css?v=20261026">
+  <link rel="stylesheet" href="/css/style.css?v=20261026b">
   <script>(function(){var t=localStorage.getItem('theme')||'auto';var d=t==='dark'||(t==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);if(d)document.documentElement.setAttribute('data-theme','dark');})();</script>
 </head>
 <body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
   <!-- 导航栏（swup 持久化） -->
-  <nav id="site-nav" class="navbar">
-    <div class="navbar-brand">✍️ <a href="/">英语作文批改助手</a></div>
+  <nav id="site-nav" class="navbar" aria-label="站点导航">
+    <div class="navbar-brand">✍️ <a href="/"><span class="brand-text">英语作文批改助手</span></a></div>
     <div class="navbar-right">
-      <button class="theme-toggle" id="theme-toggle" title="明暗切换">🌙</button>
+      <button type="button" class="theme-toggle" id="theme-toggle" title="明暗切换" aria-label="切换深色/浅色主题">🌙</button>
       <a href="/" data-nav>我的作文</a>
       <a href="/settings.html" data-nav>设置</a>
-      <a href="https://auth.yuer6327.top/logout" id="logout-btn">退出</a>
+      <a href="https://auth.yuer6327.top/logout" id="logout-btn" rel="nofollow">退出</a>
     </div>
   </nav>
 
-  <main id="main" data-page-module="/js/essay.js?v=20261026">
+  <main id="main" tabindex="-1" data-page-module="/js/essay.js?v=20261026b">
     <div class="container" style="max-width:900px">
       <div id="wb-header"></div>
       <div id="wb-topic"></div>
@@ -36,7 +47,7 @@
     Project lead by <a href="https://www.yuer6327.top" target="_blank" rel="noopener noreferrer">Yuer6327</a> · <a href="https://github.com/Yuer6327/english-writing-assistant" target="_blank" rel="noopener noreferrer">GitHub</a>
   </footer>
 
-  <script src="/js/theme.js?v=20261026"></script>
-  <script type="module" src="/js/swup.js?v=20261026"></script>
+  <script src="/js/theme.js?v=20261026b"></script>
+  <script type="module" src="/js/swup.js?v=20261026b"></script>
 </body>
 </html>

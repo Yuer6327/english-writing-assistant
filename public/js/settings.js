@@ -3,23 +3,34 @@
 // swup 管理：导出 init/cleanup。表单元素随 main 每次切页重建，均在 init 中绑定。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026b';
 
-let disposed = false;
+let generation = 0;
+let reloadTimer = null;
 
 export function cleanup() {
-  disposed = true;
+  generation++;
+  if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null; }
+}
+
+function scheduleReload(gen) {
+  if (reloadTimer) clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(() => {
+    if (gen === generation) location.reload();
+  }, 600);
 }
 
 export async function init() {
-  disposed = false;
+  const gen = ++generation;
   const user = await requireAuth();
-  if (!user || disposed) return;
+  if (!user || gen !== generation) return;
 
-  await initApiSection();
-  if (disposed) return;
-  initBillingSection();
-  await initPromptSection();
+  // 三个区域的数据与 DOM 相互独立，并行加载、各自处理失败
+  await Promise.all([
+    initApiSection(gen),
+    initBillingSection(gen),
+    initPromptSection(gen),
+  ]);
 }
 
 // ============================================================
@@ -32,7 +43,7 @@ const SERVICE_LABELS = {
   'byok': '自备 Key',
 };
 
-export async function initBillingSection() {
+export async function initBillingSection(gen = generation) {
   const balanceEl = document.getElementById('billing-balance');
   const quotaEl = document.getElementById('billing-quota');
   const tbody = document.getElementById('billing-usage-body');
@@ -42,12 +53,13 @@ export async function initBillingSection() {
   try {
     me = await api.billing.me();
   } catch (err) {
-    if (disposed) return;
+    if (gen !== generation) return;
     balanceEl.textContent = '—';
-    quotaEl.innerHTML = `<span style="color:var(--text-light);font-size:12px">计费信息加载失败：${escapeHtml(err.message)}</span>`;
+    // 具体原因由 toast 展示，这里只留一眼可读的状态，避免重复长文案
+    quotaEl.innerHTML = '<span class="muted" style="font-size:12px">计费信息暂不可用</span>';
     return;
   }
-  if (disposed) return;
+  if (gen !== generation) return;
 
   balanceEl.textContent = (me.balance / 100).toFixed(2);
 
@@ -85,12 +97,14 @@ export async function initBillingSection() {
       btn.disabled = true; btn.textContent = '兑换中...';
       try {
         const res = await api.billing.redeem(code);
+        if (gen !== generation) return;
         toast(`兑换成功，到账 ${(res.points / 100).toFixed(2)} 积分`, 'success');
         input.value = '';
-        await initBillingSection();
+        await initBillingSection(gen);
       } catch (err) {
-        toast(err.message, 'error');
-        btn.disabled = false; btn.textContent = '兑换';
+        if (gen === generation) toast(err.message, 'error');
+      } finally {
+        if (gen === generation && btn.isConnected) { btn.disabled = false; btn.textContent = '兑换'; }
       }
     });
   }
@@ -101,21 +115,27 @@ export async function initBillingSection() {
 // ============================================================
 // AI 服务配置
 // ============================================================
-async function initApiSection() {
-  let status;
+async function initApiSection(gen = generation) {
+  let status = null;
+  let degraded = false;
   try {
     status = await api.getApiKeyStatus();
   } catch (err) {
-    if (disposed) return;
+    if (gen !== generation) return;
+    // 配置状态查不到（计费服务抖动）时也要把表单渲染出来，
+    // 否则整张卡变成空白，用户既看不到选项也不知道发生了什么
+    degraded = true;
+    status = { configured: false, provider: 'agnes' };
     toast(err.message, 'error');
-    return;
   }
-  if (disposed) return;
-  const configured = status.configured;
+  if (gen !== generation) return;
+  const configured = !!status.configured;
 
-  document.getElementById('status-badge').innerHTML = configured
-    ? '<span class="badge badge-completed">已配置</span>'
-    : '<span class="badge badge-failed">未配置（默认使用免费通道）</span>';
+  document.getElementById('status-badge').innerHTML = degraded
+    ? '<span class="badge badge-pending">状态未知</span>'
+    : configured
+      ? '<span class="badge badge-completed">已配置</span>'
+      : '<span class="badge badge-failed">未配置（默认使用免费通道）</span>';
 
   const currentConfig = document.getElementById('current-config');
   if (configured) {
@@ -167,9 +187,11 @@ async function initApiSection() {
     btn.disabled = true; btn.textContent = '保存中...';
     try {
       await api.saveApiKey({ provider: 'agnes' });
+      if (gen !== generation) return;
       toast('已启用 Agnes 公用免费 API', 'success');
-      setTimeout(() => location.reload(), 800);
+      scheduleReload(gen);
     } catch (err) {
+      if (gen !== generation) return;
       toast(err.message, 'error');
       btn.disabled = false; btn.textContent = '启用 Agnes 免费 API';
     }
@@ -192,9 +214,11 @@ async function initApiSection() {
     btn.disabled = true; btn.textContent = '保存中...';
     try {
       await api.saveApiKey(payload);
+      if (gen !== generation) return;
       toast('配置已保存', 'success');
-      setTimeout(() => location.reload(), 800);
+      scheduleReload(gen);
     } catch (err) {
+      if (gen !== generation) return;
       toast(err.message, 'error');
       btn.disabled = false; btn.textContent = '保存';
     }
@@ -204,7 +228,7 @@ async function initApiSection() {
 // ============================================================
 // 批改提示词模板
 // ============================================================
-async function initPromptSection() {
+async function initPromptSection(gen = generation) {
   const listEl = document.getElementById('prompt-list');
   listEl.innerHTML = '<span class="spinner"></span> 加载中...';
 
@@ -212,11 +236,11 @@ async function initPromptSection() {
   try {
     data = await api.getPrompts();
   } catch (err) {
-    if (disposed) return;
+    if (gen !== generation) return;
     listEl.innerHTML = `<div style="color:var(--text-soft);font-size:13px">加载失败：${escapeHtml(err.message)}</div>`;
     return;
   }
-  if (disposed) return;
+  if (gen !== generation) return;
 
   listEl.innerHTML = '';
   for (const p of data.prompts) {
@@ -251,9 +275,11 @@ async function initPromptSection() {
       btn.disabled = true; btn.textContent = '保存中...';
       try {
         await api.savePrompt(p.genre, content);
+        if (gen !== generation) return;
         toast('模板已保存', 'success');
-        setTimeout(() => location.reload(), 800);
+        scheduleReload(gen);
       } catch (err) {
+        if (gen !== generation) return;
         toast(err.message, 'error');
         btn.disabled = false; btn.textContent = '保存修改';
       }
@@ -264,9 +290,11 @@ async function initPromptSection() {
       btn.disabled = true;
       try {
         await api.savePrompt(p.genre, '');
+        if (gen !== generation) return;
         toast('已恢复内置默认', 'success');
-        setTimeout(() => location.reload(), 800);
+        scheduleReload(gen);
       } catch (err) {
+        if (gen !== generation) return;
         toast(err.message, 'error');
         btn.disabled = false; btn.textContent = '恢复默认';
       }

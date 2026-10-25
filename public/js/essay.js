@@ -4,15 +4,42 @@
 // 批改渲染（分数卡+原文高亮+问题卡）/ 片段精修 / 全文润色 / 导出
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261026';
-import { openExportModal } from './export.js?v=20261026';
+import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261026b';
+import { openExportModal, closeExportModal } from './export.js?v=20261026b';
 
-let disposed = false;
+let generation = 0;
 let state = null;            // { essay, drafts, polishes }
 let activeDraftId = null;
 let editingDraft = false;    // 稿件编辑模式
 let selBtn = null;           // 选中片段的浮动精修按钮
 let delegatedBound = false;  // document 级委托只绑一次（swup 重复进页不叠加）
+const pendingOps = new Set(); // 跨重新渲染保持的写操作锁（防重复计费/提交）
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+function busyButton(btn, label, hint = '') {
+  btn.dataset.idleHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add('btn-busy');
+  btn.setAttribute('aria-label', hint ? `${label}，${hint}` : label);
+  btn.title = hint;
+  btn.innerHTML = `<span class="spinner spinner-sm"></span><span>${label}</span>${hint ? `<span class="busy-time">${hint}</span>` : ''}`;
+}
+
+function idleButton(btn) {
+  btn.disabled = false;
+  btn.classList.remove('btn-busy');
+  btn.removeAttribute('title');
+  btn.removeAttribute('aria-label');
+  if (btn.dataset.idleHtml) btn.innerHTML = btn.dataset.idleHtml;
+  delete btn.dataset.idleHtml;
+}
+
+/** 写操作在飞时锁住同一面板其它操作，避免切换 Tab 前的重复扣费/提交 */
+function setPanelControlsLocked(anchor, locked) {
+  anchor.closest('.card')?.querySelectorAll('button, select, input, textarea').forEach(el => {
+    if (el !== anchor) el.disabled = locked;
+  });
+}
 
 // ── 模型车道（free / deepseek / byok）：可用选项由 billing 决定 ──
 const laneInfo = { paidEnabled: false, byokConfigured: false, loaded: false };
@@ -46,11 +73,11 @@ function modelSelectHtml(id, remembered) {
     laneInfo.byokConfigured
       ? `<option value="byok"${value === 'byok' ? ' selected' : ''}>我的 Key（自备）</option>` : '',
   ].join('');
-  return `<select class="form-input" id="${id}" style="width:auto;padding:4px 8px;font-size:13px">${opts}</select>`;
+  return `<select class="form-input" id="${id}" aria-label="选择模型通道" style="width:auto;padding:4px 8px;font-size:13px">${opts}</select>`;
 }
 
 /** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
-const PAID_HINT = '按用量计积分，通常约 0.05~0.5 积分/次，实结多退少补';
+const PAID_HINT = '约 0.05~0.5 积分/次 · 多退少补';
 
 function bindPaidHint(selectEl, hintEl) {
   if (!selectEl || !hintEl) return;
@@ -64,19 +91,20 @@ function showInsufficientBalance() {
   wbModal(`
     <div style="text-align:center;padding:8px 0">
       <div style="font-size:34px;margin-bottom:10px">😔</div>
-      <div style="font-weight:600;font-size:16px;margin-bottom:8px">积分余额不足</div>
-      <div style="font-size:13px;color:var(--text-soft);line-height:1.8">
-        本次请求需要积分余额。当前可用充值方式为兑换码。<br>
-        也可在「设置 → AI 服务配置」绑定自备 API Key，或在免费额度内使用。
+      <div style="font-weight:600;font-size:16px;margin-bottom:14px">积分余额不足</div>
+      <div class="chip-row" style="justify-content:center;margin-bottom:18px">
+        <span class="chip">兑换码充值</span>
+        <span class="chip">自备 Key</span>
+        <span class="chip">免费额度</span>
       </div>
-      <div style="margin-top:16px;display:flex;gap:10px;justify-content:center">
+      <div style="display:flex;gap:10px;justify-content:center">
         <a class="btn btn-primary" href="/settings.html#billing" style="text-decoration:none">去充值</a>
-        <button class="btn" id="btn-402-close">知道了</button>
+        <button type="button" class="btn" id="btn-402-close">知道了</button>
       </div>
     </div>
   `, { title: '余额不足' });
   const closeBtn = document.getElementById('btn-402-close');
-  if (closeBtn) closeBtn.addEventListener('click', closeWbModal);
+  if (closeBtn) closeBtn.addEventListener('click', () => closeWbModal());
 }
 
 /** 统一错误分流：402 → 余额不足弹窗；返回 true 表示已处理 */
@@ -91,39 +119,49 @@ function handleBillingError(err) {
 const cnNum = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
 export function cleanup() {
-  disposed = true;
+  generation++;
   removeSelBtn();
-  closeWbModal();
+  closeWbModal(null, true);
+  closeExportModal();
+  if (delegatedBound) {
+    document.removeEventListener('mouseup', onMouseUp);
+    document.removeEventListener('touchend', onMouseUp);
+    delegatedBound = false;
+  }
 }
 
 export async function init() {
-  disposed = false;
+  const gen = ++generation;
   const user = await requireAuth();
-  if (!user || disposed) return;
+  if (!user || gen !== generation) return;
 
   const id = new URLSearchParams(location.search).get('id');
   if (!id) { window.swupNavigate('/'); return; }
 
-  await loadLaneInfo();   // 先确定可用车道（我的 Key / 积分档），再渲染面板
-  await reload(id);
+  // 车道信息与作文数据相互独立：并行拉取，统一确认后再渲染
+  await reload(id, gen, loadLaneInfo());
   bindDelegated();
 }
 
 // ============================================================
 // 数据加载与整体渲染
 // ============================================================
-async function reload(essayId) {
+async function reload(essayId, gen = generation, beforeRender = null) {
+  if (gen !== generation) return;
   const headerEl = document.getElementById('wb-header');
-  headerEl.innerHTML = '<div class="card"><span class="spinner"></span> 加载中...</div>';
+  if (headerEl) headerEl.innerHTML = '<div class="card"><span class="spinner"></span> 加载中...</div>';
 
+  let data;
   try {
-    state = await api.getEssay(essayId);
+    // 可传入并行任务；两者都成功/自行兜底后才渲染，避免车道信息闪烁
+    [data] = await Promise.all([api.getEssay(essayId), beforeRender]);
   } catch (err) {
-    if (disposed) return;
+    if (gen !== generation || !headerEl) return;
     headerEl.innerHTML = `<div class="card">加载失败：${escapeHtml(err.message)} <a href="/">返回列表</a></div>`;
     return;
   }
-  if (disposed) return;
+  if (gen !== generation) return;
+  state = data;
 
   if (!activeDraftId || !state.drafts.find(d => d.id === activeDraftId)) {
     activeDraftId = state.drafts.length ? state.drafts[state.drafts.length - 1].id : null;
@@ -169,21 +207,35 @@ function renderHeader() {
   document.getElementById('btn-export').addEventListener('click', () => {
     openExportModal({ mode: 'report', getData: () => buildReportPayload() });
   });
-  document.getElementById('btn-delete-essay').addEventListener('click', async () => {
+  document.getElementById('btn-delete-essay').addEventListener('click', async (ev) => {
     if (!confirm(`确定删除作文「${state.essay.title}」及其全部稿件、批改记录？`)) return;
+    const gen = generation;
+    const essayId = state.essay.id;
+    const key = `delete-essay:${essayId}`;
+    if (pendingOps.has(key)) return;
+    pendingOps.add(key);
+    busyButton(ev.currentTarget, '删除中');
     try {
-      await api.deleteEssay(state.essay.id);
+      await api.deleteEssay(essayId);
+      if (gen !== generation) return;
       toast('已删除', 'success');
       window.swupNavigate('/');
-    } catch (err) { toast(err.message, 'error'); }
+    } catch (err) {
+      if (gen === generation) {
+        toast(err.message, 'error');
+        idleButton(ev.currentTarget);
+      }
+    } finally {
+      pendingOps.delete(key);
+    }
   });
 }
 
 // ── 题目区（可折叠）──
 function renderTopic() {
   const e = state.essay;
-  const imgs = (e.topic_images || []).map(u => `
-    <img src="${u}" alt="题目图片" style="max-width:100%;max-height:280px;border:1px solid var(--border);border-radius:var(--radius);margin-top:8px">`).join('');
+  const imgs = (e.topic_images || []).map((u, i) => `
+    <img src="${escapeHtml(u)}" alt="题目图片 ${i + 1}" style="max-width:100%;max-height:280px;border:1px solid var(--border);border-radius:var(--radius);margin-top:8px">`).join('');
   document.getElementById('wb-topic').innerHTML = `
     <details class="card" style="margin-bottom:16px" ${state.drafts.length ? '' : 'open'}>
       <summary style="cursor:pointer;font-weight:600;font-size:14px">题目</summary>
@@ -195,14 +247,18 @@ function renderTopic() {
 // ── 稿件 Tabs ──
 function renderTabs() {
   const el = document.getElementById('wb-draft-tabs');
-  if (!state.drafts.length) { el.innerHTML = ''; return; }
+  if (!state.drafts.length) { el.innerHTML = ''; el.removeAttribute('role'); return; }
+  el.setAttribute('role', 'tablist');
+  el.setAttribute('aria-label', '稿件版本');
   el.innerHTML = state.drafts.map(d => {
     const rv = latestReview(d);
     const g = rv ? gradeFor(rv.result.score) : null;
-    return `<button class="draft-tab ${d.id === activeDraftId ? 'active' : ''}" data-tab="${d.id}">
+    const active = d.id === activeDraftId;
+    return `<button type="button" class="draft-tab ${active ? 'active' : ''}" data-tab="${d.id}"
+      role="tab" aria-selected="${active ? 'true' : 'false'}" aria-controls="wb-draft-panel">
       ${cnNum[d.version - 1] || d.version}稿${rv ? `<span class="tab-score">${rv.result.score}${g ? ` · ${g.grade}` : ''}</span>` : ''}
     </button>`;
-  }).join('') + '<button class="draft-tab draft-tab-add" id="tab-add">＋ 新稿件</button>';
+  }).join('') + '<button type="button" class="draft-tab draft-tab-add" id="tab-add">＋ 新稿件</button>';
 
   el.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => {
     activeDraftId = +b.dataset.tab;
@@ -232,6 +288,9 @@ function renderDraftPanel() {
 
   const rv = latestReview(d);
   const stale = rv && rv.reviewed_text && rv.reviewed_text !== d.text;
+  const reviewPending = pendingOps.has(`review:${d.id}`);
+  const rewritePending = pendingOps.has(`rewrite:${d.id}`);
+  const deletePending = pendingOps.has(`delete-draft:${d.id}`);
   const sourceLabel = { photo: '拍照识别', text: '直接输入', polish: '精修/润色采纳' }[d.source] || d.source;
   const hwScore = d.handwriting_score !== null && d.handwriting_score !== undefined
     ? ` · 书写质量 ${(d.handwriting_score * 100).toFixed(0)}%` : '';
@@ -248,11 +307,11 @@ function renderDraftPanel() {
             ? `<button class="btn btn-primary" id="btn-save-draft" style="padding:5px 12px;font-size:13px">保存稿件</button>
                <button class="btn" id="btn-cancel-edit" style="padding:5px 12px;font-size:13px">取消</button>`
             : `${modelSelectHtml('review-model-select', reviewLane)}
-               <button class="btn btn-primary" id="btn-review" style="padding:5px 12px;font-size:13px">${rv ? '重新批改' : '开始批改'}</button>
-               <button class="btn" id="btn-edit-draft" style="padding:5px 12px;font-size:13px">编辑稿件</button>
-               <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px">✍️ 写${cnNum[d.version] || d.version + 1}稿</button>
-               <button class="btn" id="btn-rewrite" style="padding:5px 12px;font-size:13px">全文润色</button>
-               <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px">删除</button>
+               <button class="btn btn-primary ${reviewPending ? 'btn-busy' : ''}" id="btn-review" style="padding:5px 12px;font-size:13px" ${reviewPending ? 'disabled title="预计约 1 分钟"' : ''}>${reviewPending ? '<span class="spinner spinner-sm"></span><span>批改中</span><span class="busy-time">约 1 分钟</span>' : (rv ? '重新批改' : '开始批改')}</button>
+               <button class="btn" id="btn-edit-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''}>编辑稿件</button>
+               <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''}>✍️ 写${cnNum[d.version] || d.version + 1}稿</button>
+               <button class="btn ${rewritePending ? 'btn-busy' : ''}" id="btn-rewrite" style="padding:5px 12px;font-size:13px" ${rewritePending ? 'disabled title="预计约 1 分钟"' : reviewPending || deletePending ? 'disabled' : ''}>${rewritePending ? '<span class="spinner spinner-sm"></span><span>润色中</span><span class="busy-time">约 1 分钟</span>' : '全文润色'}</button>
+               <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px" ${deletePending ? 'disabled' : ''}>${deletePending ? '删除中...' : '删除'}</button>
                <span id="review-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>`}
         </div>
       </div>
@@ -261,7 +320,7 @@ function renderDraftPanel() {
         ? `<textarea class="form-input" id="draft-editor" rows="14" style="font-size:15px;line-height:1.9">${escapeHtml(d.text)}</textarea>
            <div class="wordcount-hint" id="draft-wc" style="margin-top:6px"></div>`
         : `<div class="essay-annotated" id="draft-text-view">${renderAnnotated(d)}</div>
-           <div style="font-size:12px;color:var(--text-light);margin-top:10px">提示：在正文中选中任意句子，可进行片段精修</div>`}
+           <div style="margin-top:10px"><span class="chip">✨ 选中句子可精修</span></div>`}
     </div>`;
 
   if (editingDraft) {
@@ -278,12 +337,20 @@ function renderDraftPanel() {
       const btn = e.currentTarget;
       const text = ta.value.trim();
       if (text.length < 10) { toast('稿件内容过短', 'error'); return; }
-      btn.disabled = true; btn.textContent = '保存中...';
+      const gen = generation;
+      const essayId = state.essay.id;
+      busyButton(btn, '保存中');
       try {
         await api.updateDraft(d.id, text);
+        if (gen !== generation) return;
         toast('稿件已保存', 'success');
-        await reload(state.essay.id);
-      } catch (err) { toast(err.message, 'error'); btn.disabled = false; btn.textContent = '保存稿件'; }
+        await reload(essayId, gen);
+      } catch (err) {
+        if (gen === generation) {
+          toast(err.message, 'error');
+          idleButton(btn);
+        }
+      }
     });
     el.querySelector('#btn-cancel-edit').addEventListener('click', () => {
       editingDraft = false; renderDraftPanel();
@@ -294,14 +361,31 @@ function renderDraftPanel() {
     el.querySelector('#btn-edit-draft').addEventListener('click', () => { editingDraft = true; renderDraftPanel(); });
     el.querySelector('#btn-new-draft').addEventListener('click', () => openDraftModal('text', d.text));
     el.querySelector('#btn-rewrite').addEventListener('click', runFullRewrite);
-    el.querySelector('#btn-del-draft').addEventListener('click', async () => {
+    el.querySelector('#btn-del-draft').addEventListener('click', async (ev) => {
       if (!confirm(`确定删除${cnNum[d.version - 1] || d.version}稿及其批改记录？`)) return;
+      const gen = generation;
+      const essayId = state.essay.id;
+      const key = `delete-draft:${d.id}`;
+      if (pendingOps.has(key)) return;
+      pendingOps.add(key);
+      busyButton(ev.currentTarget, '删除中');
+      setPanelControlsLocked(ev.currentTarget, true);
       try {
         await api.deleteDraft(d.id);
+        if (gen !== generation) return;
         toast('已删除', 'success');
         activeDraftId = null;
-        await reload(state.essay.id);
-      } catch (err) { toast(err.message, 'error'); }
+        await reload(essayId, gen);
+      } catch (err) {
+        if (gen === generation) {
+          toast(err.message, 'error');
+          idleButton(ev.currentTarget);
+          setPanelControlsLocked(ev.currentTarget, false);
+        }
+      } finally {
+        pendingOps.delete(key);
+        if (gen === generation && !state.drafts.some(x => x.id === d.id)) return;
+      }
     });
     bindIssueMarks(el);
   }
@@ -360,8 +444,10 @@ function renderAnnotated(draft) {
   let html = '';
   let pos = 0;
   for (const s of merged) {
+    const issue = rv.result.issues[s.issueIndex] || {};
+    const label = `第 ${s.issueIndex + 1} 处问题${issue.type ? `（${issue.type}）` : ''}，查看详解`;
     html += escapeHtml(text.slice(pos, s.start));
-    html += `<span class="issue-mark" data-issue="${s.issueIndex}">${escapeHtml(text.slice(s.start, s.end))}</span>`;
+    html += `<span class="issue-mark" data-issue="${s.issueIndex}" role="button" tabindex="0" aria-label="${escapeHtml(label)}">${escapeHtml(text.slice(s.start, s.end))}</span>`;
     pos = s.end;
   }
   html += escapeHtml(text.slice(pos));
@@ -369,16 +455,24 @@ function renderAnnotated(draft) {
 }
 
 function bindIssueMarks(el) {
+  const jumpTo = (mark) => {
+    const idx = +mark.dataset.issue;
+    document.querySelectorAll('.issue-mark').forEach(m => m.classList.remove('active'));
+    mark.classList.add('active');
+    const card = document.querySelector(`[data-issue-card="${idx}"]`);
+    if (card) {
+      card.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth', block: 'center' });
+      card.style.outline = '2px solid var(--primary)';
+      setTimeout(() => { card.style.outline = ''; }, 1600);
+    }
+  };
   el.querySelectorAll('.issue-mark').forEach(mark => {
-    mark.addEventListener('click', () => {
-      const idx = +mark.dataset.issue;
-      document.querySelectorAll('.issue-mark').forEach(m => m.classList.remove('active'));
-      mark.classList.add('active');
-      const card = document.querySelector(`[data-issue-card="${idx}"]`);
-      if (card) {
-        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        card.style.outline = '2px solid var(--primary)';
-        setTimeout(() => { card.style.outline = ''; }, 1600);
+    mark.addEventListener('click', () => jumpTo(mark));
+    // 键盘等价路径：Enter / 空格
+    mark.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        jumpTo(mark);
       }
     });
   });
@@ -391,24 +485,37 @@ async function runReview(e) {
   const btn = e.currentTarget;
   const d = activeDraft();
   if (!d) return;
+  const key = `review:${d.id}`;
+  if (pendingOps.has(key)) return;
+  pendingOps.add(key);
+  const gen = generation;
+  const essayId = state.essay.id;
+  setPanelControlsLocked(btn, true);
   const selectEl = document.getElementById('review-model-select');
   const lane = selectEl ? selectEl.value : defaultLane();
   reviewLane = lane;   // 记忆本次选择（内存）
-  btn.disabled = true; btn.textContent = '批改中（约 10-30 秒）...';
+  busyButton(btn, '批改中', '约 1 分钟');
   try {
     const res = await api.reviewDraft(d.id, lane);
+    if (gen !== generation) return;
     lastCharge = {
       reviewId: res.review_id,
       points: res.points_charged ?? 0,
       lane: res.lane || (lane === 'deepseek' ? 'paid' : lane),
     };
     toast('批改完成', 'success');
-    await reload(state.essay.id);
+    await reload(essayId, gen);
     const reviewEl = document.getElementById('wb-review');
-    if (reviewEl) reviewEl.scrollIntoView({ behavior: 'smooth' });
+    if (reviewEl) reviewEl.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   } catch (err) {
+    if (gen !== generation) return;
     if (!handleBillingError(err)) toast(err.message, 'error');
-    btn.disabled = false; btn.textContent = '开始批改';
+    idleButton(btn);
+    setPanelControlsLocked(btn, false);
+  } finally {
+    pendingOps.delete(key);
+    // 用户切 Tab 触发过重新渲染时，恢复新按钮；旧按钮已由 catch/reload 处理
+    if (gen === generation && !btn.isConnected && activeDraftId === d.id) renderDraftPanel();
   }
 }
 
@@ -417,12 +524,16 @@ function renderReview() {
   const d = activeDraft();
   const rv = latestReview(d);
   if (!rv) { el.innerHTML = ''; return; }
-  const r = rv.result;
+  const r = rv.result || {};
+  // 旧记录 / 残缺数据兜底：字段缺失时按 0 渲染，避免整块批改结果渲染失败
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const sub = r.subscores || {};
+  const total = num(state.essay.genre_total) || 25;
 
   const bars = [
-    { name: '内容', val: r.subscores.content, max: 10 },
-    { name: '语言', val: r.subscores.language, max: 10 },
-    { name: '结构', val: r.subscores.organization, max: 5 },
+    { name: '内容', val: num(sub.content), max: 10 },
+    { name: '语言', val: num(sub.language), max: 10 },
+    { name: '结构', val: num(sub.organization), max: 5 },
   ];
   const gradeInfo = gradeFor(r.score);
   // 本次批改的积分消耗（仅最新一次响应有值；0 = 免费/自备 Key）
@@ -439,7 +550,7 @@ function renderReview() {
         <div class="label">等第 · ${gradeInfo.label}</div>
       </div>` : ''}
       <div class="score-main">
-        <div class="score-num">${r.score}<small>/${state.essay.genre_total}</small></div>
+        <div class="score-num">${num(r.score)}<small>/${total}</small></div>
         <div class="label">总分</div>
       </div>
       <div class="score-bars">
@@ -468,7 +579,7 @@ function renderReview() {
   }
 
   if (r.issues && r.issues.length) {
-    html += `<div class="section-title">问题清单 <span class="muted">点击正文中下划线标注可跳转（共 ${r.issues.length} 处）</span></div>`;
+    html += `<div class="section-title">问题清单 <span class="muted">共 ${r.issues.length} 处 · 点标注跳转</span></div>`;
     html += r.issues.map((iss, i) => `
       <div class="issue-card" data-issue-card="${i}">
         <div class="issue-head">
@@ -494,7 +605,7 @@ function renderReview() {
   if (r.practice && r.practice.items && r.practice.items.length) {
     const p = r.practice;
     html += `
-      <div class="section-title">巩固练习 <span class="muted">针对本次批改的问题出题，先自己翻译再看答案</span></div>
+      <div class="section-title">巩固练习 <span class="muted">先译再看答案</span></div>
       ${p.intro ? `<div class="practice-intro">${escapeHtml(p.intro)}</div>` : ''}
       ${p.items.map((it, i) => `
         <div class="practice-card">
@@ -503,7 +614,7 @@ function renderReview() {
             <div class="practice-zh">${escapeHtml(it.chinese)}</div>
           </div>
           ${it.target ? `<div class="practice-target">考点：${escapeHtml(it.target)}</div>` : ''}
-          <button class="practice-toggle" data-index="${i}">显示参考答案</button>
+          <button type="button" class="practice-toggle" data-index="${i}" aria-expanded="false">显示参考答案</button>
           <div class="practice-answer" data-index="${i}" hidden>${escapeHtml(it.answer)}</div>
         </div>`).join('')}`;
   }
@@ -535,6 +646,7 @@ function renderReview() {
       const show = ans.hasAttribute('hidden');
       if (show) ans.removeAttribute('hidden'); else ans.setAttribute('hidden', '');
       btn.textContent = show ? '收起参考答案' : '显示参考答案';
+      btn.setAttribute('aria-expanded', show ? 'true' : 'false');
     });
   });
 }
@@ -554,19 +666,22 @@ function openDraftModal(mode, prefill) {
     </div>
     <div data-panel="photo" style="display:${mode === 'photo' ? 'block' : 'none'}">
       <div class="form-group">
-        <label class="form-label">手写稿照片（可多张，按顺序，最多 3 张）</label>
+        <label class="form-label">手写稿照片 <span style="font-weight:400;color:var(--text-light)">按顺序 · 最多 3 张</span></label>
         <input type="file" id="draft-img-input" accept="image/*" multiple capture="environment">
         <div class="img-thumbs" id="draft-img-thumbs"></div>
       </div>
       <div class="form-group">
         <label class="form-label">识别引擎</label>
-        <label style="font-size:13px;display:block;margin-bottom:4px">
-          <input type="radio" name="ocr-engine" value="vlm" checked> 大模型视觉（推荐：逐字转写 + 书写质量评分）
+        <label style="font-size:13px;display:block;margin-bottom:6px" title="逐字转写 + 书写质量评分，保留原始错误">
+          <input type="radio" name="ocr-engine" value="vlm" checked> 大模型视觉 <span class="chip">推荐</span>
         </label>
-        <label style="font-size:13px;display:block">
-          <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR（手写体→高精度→标准版自动降级，省模型额度）
+        <label style="font-size:13px;display:block" title="手写体 → 高精度 → 标准版自动降级，无书写质量分">
+          <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR <span class="chip">省额度</span>
         </label>
-        <div class="muted" style="font-size:12px;margin-top:6px">百度 OCR 每日 5 次免费（暂不收费）；大模型识别按用量计积分</div>
+        <div class="chip-row" style="margin-top:8px">
+          <span class="chip">百度 5 次/日免费</span>
+          <span class="chip">大模型按量计积分</span>
+        </div>
       </div>
       <button class="btn btn-primary" id="btn-ocr">开始识别</button>
       <span id="ocr-status" style="font-size:13px;color:var(--text-soft);margin-left:10px"></span>
@@ -580,11 +695,16 @@ function openDraftModal(mode, prefill) {
       </div>
       <button class="btn btn-primary" id="btn-save-new-draft">保存${nextName}</button>
     </div>
-  `);
+  `, { title: '新建稿件' });
 
   let handwritingScore = null;
   let ocrImages = [];
   let lastSource = prefill ? 'text' : 'text';
+  let ocrPending = false;
+  let textRevision = 0;
+  const setOcrLocked = locked => {
+    modal.querySelectorAll('[data-mode], #draft-img-input, #draft-img-thumbs .rm').forEach(el => { el.disabled = locked; });
+  };
 
   const photoPanel = modal.querySelector('[data-panel="photo"]');
   const textPanel = modal.querySelector('[data-panel="text"]');
@@ -600,52 +720,81 @@ function openDraftModal(mode, prefill) {
   const thumbs = modal.querySelector('#draft-img-thumbs');
   const renderImgs = () => {
     thumbs.innerHTML = images.map((url, i) => `
-      <div class="thumb"><img src="${url}" alt="手写稿 ${i + 1}"><button type="button" class="rm" data-rm="${i}">×</button></div>`).join('');
+      <div class="thumb"><img src="${escapeHtml(url)}" alt="手写稿 ${i + 1}"><button type="button" class="rm" data-rm="${i}" title="移除这张图片" aria-label="移除手写稿图片 ${i + 1}">×</button></div>`).join('');
     thumbs.querySelectorAll('.rm').forEach(b => b.addEventListener('click', () => {
       images.splice(+b.dataset.rm, 1);
       renderImgs();
     }));
   };
   modal.querySelector('#draft-img-input').addEventListener('change', async (e) => {
-    const files = [...e.target.files].slice(0, 3 - images.length);
+    const available = 3 - images.length;
+    const selected = [...e.target.files];
+    const files = selected.slice(0, available);
     e.target.value = '';
-    for (const f of files) {
-      if (images.length >= 3) { toast('最多 3 张', 'error'); break; }
-      try { images.push(await compressImageFile(f)); } catch (err) { toast(err.message, 'error'); }
+    if (!files.length) { toast('最多 3 张', 'error'); return; }
+    if (selected.length > files.length) toast('最多 3 张，超出部分已忽略', 'error');
+    const gen = generation;
+    const input = e.target;
+    input.disabled = true;
+    const results = await Promise.allSettled(files.map(f => compressImageFile(f)));
+    if (gen !== generation || modal !== wbModalEl) return;
+    for (const result of results) {
+      if (result.status === 'fulfilled') images.push(result.value);
+      else toast(result.reason?.message || '图片处理失败', 'error');
     }
+    input.disabled = false;
     renderImgs();
   });
 
   // OCR
   modal.querySelector('#btn-ocr').addEventListener('click', async (e) => {
     if (!images.length) { toast('请先上传照片', 'error'); return; }
+    if (ocrPending) return;
     const btn = e.currentTarget;
     const status = modal.querySelector('#ocr-status');
     const engine = modal.querySelector('input[name="ocr-engine"]:checked').value;
-    btn.disabled = true;
-    status.innerHTML = '<span class="spinner"></span> 识别中（约 10-30 秒），请稍候...';
+    const gen = generation;
+    const requestImages = images.slice(); // 快照：完成后不能把新加图片误记为本轮 OCR 来源
+    const startRevision = textRevision;
+    ocrPending = true;
+    setOcrLocked(true);
+    busyButton(btn, '识别中', '约 1 分钟');
+    status.innerHTML = '<span class="spinner spinner-sm"></span><span class="busy-time">约 1 分钟</span>';
     try {
-      const res = await api.ocr(images, engine);
+      const res = await api.ocr(requestImages, engine);
+      if (gen !== generation || modal !== wbModalEl) return;
       const ta = modal.querySelector('#draft-text');
+      if (textRevision !== startRevision &&
+          !confirm('识别已完成，但你已修改文本。要用识别结果覆盖当前文本吗？')) {
+        status.innerHTML = '<span class="badge badge-pending">已保留当前文本</span>';
+        return;
+      }
       ta.value = res.text;
+      textRevision++;
       handwritingScore = res.handwriting_score;
-      ocrImages = images.slice();
+      ocrImages = requestImages;
       lastSource = 'photo';
       modal.querySelector('#ocr-meta').innerHTML =
         (res.handwriting_score !== null && res.handwriting_score !== undefined
-          ? `书写质量：${(res.handwriting_score * 100).toFixed(0)}%（仅供参考，不计入批改）` : `已识别（${res.endpoint || '百度 OCR'}）`)
+          ? `书写质量：${(res.handwriting_score * 100).toFixed(0)}%` : `已识别（${res.endpoint || '百度 OCR'}）`)
         + (res.notes ? ` · ${escapeHtml(res.notes)}` : '');
-      status.textContent = '识别完成，请校对下方文本后保存（识别结果已尽量保留原文拼写）';
+      status.innerHTML = '<span class="badge badge-completed">识别完成</span>';
       modal.querySelectorAll('[data-mode]').forEach(x => x.classList.remove('active'));
       modal.querySelector('[data-mode="text"]').classList.add('active');
       photoPanel.style.display = 'none';
       textPanel.style.display = 'block';
       updateWc();
     } catch (err) {
-      status.textContent = '';
-      if (!handleBillingError(err)) toast(err.message, 'error');
+      if (gen === generation && modal === wbModalEl) {
+        status.textContent = '';
+        if (!handleBillingError(err)) toast(err.message, 'error');
+      }
     } finally {
-      btn.disabled = false;
+      ocrPending = false;
+      if (gen === generation && modal === wbModalEl) {
+        setOcrLocked(false);
+        idleButton(btn);
+      }
     }
   });
 
@@ -657,7 +806,7 @@ function openDraftModal(mode, prefill) {
     wcEl.textContent = `${n} 词（要求 200-500 词）`;
     wcEl.className = 'wordcount-hint ' + (n >= 200 && n <= 500 ? 'ok' : n >= 160 ? 'bad' : '');
   };
-  ta.addEventListener('input', updateWc);
+  ta.addEventListener('input', () => { textRevision++; updateWc(); });
   updateWc();
 
   // 保存
@@ -665,21 +814,26 @@ function openDraftModal(mode, prefill) {
     const text = ta.value.trim();
     if (text.length < 10) { toast('稿件内容过短', 'error'); return; }
     const btn = e.currentTarget;
-    btn.disabled = true; btn.textContent = '保存中...';
+    const gen = generation;
+    const essayId = state.essay.id;
+    busyButton(btn, '保存中');
     try {
-      const res = await api.createDraft(state.essay.id, {
+      const res = await api.createDraft(essayId, {
         text,
         source: lastSource,
         handwriting_score: lastSource === 'photo' ? handwritingScore : undefined,
         ocr_images: lastSource === 'photo' ? ocrImages : [],
       });
+      if (gen !== generation) return;
       toast(`已保存为${nextName}`, 'success');
-      closeWbModal();
+      closeWbModal(modal);
       activeDraftId = res.draft_id;
-      await reload(state.essay.id);
+      await reload(essayId, gen);
     } catch (err) {
-      toast(err.message, 'error');
-      btn.disabled = false; btn.textContent = `保存${nextName}`;
+      if (gen === generation && modal === wbModalEl) {
+        toast(err.message, 'error');
+        idleButton(btn);
+      }
     }
   });
 }
@@ -695,8 +849,9 @@ function bindDelegated() {
 }
 
 function onMouseUp() {
+  const gen = generation;
   setTimeout(() => {
-    if (disposed) return;
+    if (gen !== generation) return;
     const view = document.getElementById('draft-text-view');
     if (!view || editingDraft) { removeSelBtn(); return; }
     const sel = window.getSelection();
@@ -754,7 +909,7 @@ function openPolishModal(fragment) {
     </div>
     <button class="btn btn-primary" id="btn-run-polish">开始精修</button>
     <div id="polish-result" style="margin-top:16px"></div>
-  `);
+  `, { title: '片段精修' });
 
   bindPaidHint(modal.querySelector('#polish-model-select'), modal.querySelector('#polish-paid-hint'));
 
@@ -765,7 +920,8 @@ function openPolishModal(fragment) {
     const selectEl = modal.querySelector('#polish-model-select');
     const lane = selectEl ? selectEl.value : defaultLane();
     polishLane = lane;
-    btn.disabled = true; btn.textContent = '精修中（约 10-30 秒）...';
+    const gen = generation;
+    busyButton(btn, '精修中', '约 1 分钟');
     try {
       const res = await api.polish(state.essay.id, {
         mode: 'fragment',
@@ -774,14 +930,16 @@ function openPolishModal(fragment) {
         draft_id: d.id,
         model_id: lane,
       });
+      if (gen !== generation || modal !== wbModalEl) return;
       const chargeNote = res.points_charged > 0
         ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 100).toFixed(2)} 积分</div>` : '';
       renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
+      idleButton(btn);
       btn.textContent = '重新精修';
     } catch (err) {
-      if (!handleBillingError(err)) toast(err.message, 'error');
+      if (gen === generation && modal === wbModalEl && !handleBillingError(err)) toast(err.message, 'error');
     } finally {
-      btn.disabled = false;
+      if (gen === generation && modal === wbModalEl && btn.disabled) idleButton(btn);
     }
   });
 }
@@ -824,16 +982,24 @@ function renderPolishResult(container, result, fragment, prefixHtml = '') {
       // 片段定位失败兜底：拼接到当前稿之后
       if (!confirm('片段在稿件中定位失败，是否将精修结果追加到稿件末尾？')) return;
     }
-    btn.disabled = true; btn.textContent = '创建中...';
+    const gen = generation;
+    const essayId = state.essay.id;
+    const modal = container.closest('.modal-overlay');
+    busyButton(btn, '创建中');
+    container.querySelectorAll('[data-adopt], [data-copy]').forEach(x => { if (x !== btn) x.disabled = true; });
     try {
-      const res = await api.createDraft(state.essay.id, { text: newText, source: 'polish' });
+      const res = await api.createDraft(essayId, { text: newText, source: 'polish' });
+      if (gen !== generation) return;
       toast('已采纳为新稿件', 'success');
-      closeWbModal();
+      closeWbModal(modal);
       activeDraftId = res.draft_id;
-      await reload(state.essay.id);
+      await reload(essayId, gen);
     } catch (err) {
-      toast(err.message, 'error');
-      btn.disabled = false; btn.textContent = '采纳为新稿件';
+      if (gen === generation && (!modal || modal === wbModalEl)) {
+        toast(err.message, 'error');
+        idleButton(btn);
+        container.querySelectorAll('[data-adopt], [data-copy]').forEach(x => { x.disabled = false; });
+      }
     }
   }));
 }
@@ -843,20 +1009,36 @@ function renderPolishResult(container, result, fragment, prefixHtml = '') {
 // ============================================================
 async function runFullRewrite(e) {
   const btn = e.currentTarget;
+  const d = activeDraft();
+  if (!d) return;
+  const key = `rewrite:${d.id}`;
+  if (pendingOps.has(key)) return;
+  pendingOps.add(key);
+  const gen = generation;
+  const essayId = state.essay.id;
+  setPanelControlsLocked(btn, true);
   // 与批改共用面板上的模型选择器（同一按钮行）
   const selectEl = document.getElementById('review-model-select');
   const lane = selectEl ? selectEl.value : defaultLane();
   reviewLane = lane;
-  btn.disabled = true; btn.textContent = '润色中（约 10-30 秒）...';
+  busyButton(btn, '润色中', '约 1 分钟');
   let res;
   try {
-    res = await api.polish(state.essay.id, { mode: 'full', draft_id: activeDraft().id, model_id: lane });
+    res = await api.polish(essayId, { mode: 'full', draft_id: d.id, model_id: lane });
   } catch (err) {
-    if (!handleBillingError(err)) toast(err.message, 'error');
-    btn.disabled = false; btn.textContent = '全文润色';
+    if (gen === generation) {
+      if (!handleBillingError(err)) toast(err.message, 'error');
+      idleButton(btn);
+      setPanelControlsLocked(btn, false);
+    }
     return;
+  } finally {
+    pendingOps.delete(key);
+    if (gen === generation && !btn.isConnected && activeDraftId === d.id) renderDraftPanel();
   }
-  btn.disabled = false; btn.textContent = '全文润色';
+  if (gen !== generation) return;
+  idleButton(btn);
+  setPanelControlsLocked(btn, false);
 
   const r = res.result;
   const chargeNote = res.points_charged > 0
@@ -876,25 +1058,29 @@ async function runFullRewrite(e) {
       <button class="btn btn-primary" id="btn-adopt-rewrite">采纳润色稿为新稿件</button>
       <button class="btn" id="btn-copy-rewrite">复制全文</button>
     </div>
-  `, { wide: true });
+  `, { wide: true, title: '全文润色' });
 
   modal.querySelector('#btn-copy-rewrite').addEventListener('click', () => {
     navigator.clipboard?.writeText(r.rewritten.replace(/\*\*/g, '')).then(() => toast('已复制', 'success'));
   });
   modal.querySelector('#btn-adopt-rewrite').addEventListener('click', async (ev) => {
     const btn2 = ev.currentTarget;
-    btn2.disabled = true; btn2.textContent = '创建中...';
+    const essayId = state.essay.id;
+    busyButton(btn2, '创建中');
     try {
-      const created = await api.createDraft(state.essay.id, {
+      const created = await api.createDraft(essayId, {
         text: r.rewritten.replace(/\*\*/g, ''), source: 'polish',
       });
+      if (gen !== generation) return;
       toast('已保存为新稿件', 'success');
-      closeWbModal();
+      closeWbModal(modal);
       activeDraftId = created.draft_id;
-      await reload(state.essay.id);
+      await reload(essayId, gen);
     } catch (err) {
-      toast(err.message, 'error');
-      btn2.disabled = false; btn2.textContent = '采纳润色稿为新稿件';
+      if (gen === generation && modal === wbModalEl) {
+        toast(err.message, 'error');
+        idleButton(btn2);
+      }
     }
   });
 }
@@ -902,54 +1088,88 @@ async function runFullRewrite(e) {
 // ============================================================
 // 批改提示词（本作文覆盖）
 // ============================================================
-async function openPromptModal() {
+function openPromptModal() {
   const e = state.essay;
-  let defaultPrompt = '';
-  try {
-    const data = await api.getPrompts();
-    defaultPrompt = data.prompts.find(p => p.genre === e.genre)?.content || '';
-  } catch { /* ignore */ }
-
+  const gen = generation;
+  const needsTemplate = !e.custom_prompt;
   const modal = wbModal(`
-    <p style="font-size:13px;color:var(--text-soft);margin-bottom:12px">
-      本作文批改使用的系统提示词。留空 = 使用「设置」里的全局模板（或内置默认）。
-      必须保留 <code>{essay}</code>；可用占位符：<code>{topic}</code> <code>{essay}</code> <code>{word_count}</code> <code>{previous_feedback}</code>
-    </p>
-    <textarea class="form-input" id="essay-prompt" rows="12" style="font-family:var(--font-mono);font-size:12px;line-height:1.6">${escapeHtml(e.custom_prompt || defaultPrompt)}</textarea>
+    <p style="font-size:13px;color:var(--text-light);margin-bottom:10px">留空 = 使用「设置」里的全局模板（或内置默认）</p>
+    <div class="chip-row" style="margin-bottom:12px">
+      <span class="chip accent"><code>{essay}</code> 必填</span>
+      <span class="chip"><code>{topic}</code></span>
+      <span class="chip"><code>{word_count}</code></span>
+      <span class="chip"><code>{previous_feedback}</code></span>
+    </div>
+    <div id="prompt-load-status" class="loading-line" ${needsTemplate ? '' : 'hidden'}><span class="spinner spinner-sm"></span>载入模板</div>
+    <textarea class="form-input" id="essay-prompt" rows="12" style="font-family:var(--font-mono);font-size:12px;line-height:1.6" ${needsTemplate ? 'disabled' : ''}>${escapeHtml(e.custom_prompt || '')}</textarea>
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn btn-primary" id="btn-save-prompt">保存（仅本作文）</button>
+      <button class="btn btn-primary" id="btn-save-prompt" ${needsTemplate ? 'disabled' : ''}>保存（仅本作文）</button>
       ${e.custom_prompt ? '<button class="btn" id="btn-clear-prompt">清除自定义</button>' : ''}
     </div>
-  `, { wide: true });
+  `, { wide: true, title: '批改提示词' });
+  const textarea = modal.querySelector('#essay-prompt');
+  const saveBtn = modal.querySelector('#btn-save-prompt');
 
-  modal.querySelector('#btn-save-prompt').addEventListener('click', async (ev) => {
+  saveBtn.addEventListener('click', async (ev) => {
     const btn = ev.currentTarget;
-    const content = modal.querySelector('#essay-prompt').value;
+    const content = textarea.value;
     if (content.trim() && !content.includes('{essay}')) {
       toast('提示词必须包含 {essay} 占位符', 'error');
       return;
     }
-    btn.disabled = true; btn.textContent = '保存中...';
+    busyButton(btn, '保存中');
     try {
       await api.updateEssay(e.id, { custom_prompt: content.trim() });
+      if (gen !== generation) return;
       toast('提示词已保存', 'success');
-      closeWbModal();
-      await reload(e.id);
+      closeWbModal(modal);
+      await reload(e.id, gen);
     } catch (err) {
-      toast(err.message, 'error');
-      btn.disabled = false; btn.textContent = '保存（仅本作文）';
+      if (gen === generation && modal === wbModalEl) {
+        toast(err.message, 'error');
+        idleButton(btn);
+      }
     }
   });
 
   const clearBtn = modal.querySelector('#btn-clear-prompt');
-  if (clearBtn) clearBtn.addEventListener('click', async () => {
+  if (clearBtn) clearBtn.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    busyButton(btn, '清除中');
     try {
       await api.updateEssay(e.id, { custom_prompt: null });
+      if (gen !== generation) return;
       toast('已清除，回落全局模板', 'success');
-      closeWbModal();
-      await reload(e.id);
-    } catch (err) { toast(err.message, 'error'); }
+      closeWbModal(modal);
+      await reload(e.id, gen);
+    } catch (err) {
+      if (gen === generation && modal === wbModalEl) {
+        toast(err.message, 'error');
+        idleButton(btn);
+      }
+    }
   });
+
+  if (needsTemplate) {
+    (async () => {
+      const status = modal.querySelector('#prompt-load-status');
+      try {
+        const data = await api.getPrompts();
+        if (gen !== generation || modal !== wbModalEl) return;
+        textarea.value = data.prompts.find(p => p.genre === e.genre)?.content || '';
+        status.hidden = true;
+      } catch (err) {
+        if (gen !== generation || modal !== wbModalEl) return;
+        status.innerHTML = `<span class="badge badge-failed">模板载入失败</span>`;
+        toast(err.message, 'error');
+      } finally {
+        if (gen === generation && modal === wbModalEl) {
+          textarea.disabled = false;
+          saveBtn.disabled = false;
+        }
+      }
+    })();
+  }
 }
 
 // ============================================================
@@ -957,29 +1177,69 @@ async function openPromptModal() {
 // ============================================================
 let wbModalEl = null;
 let wbModalKeydown = null;
+let wbModalReturnFocus = null;
+
+/** 可聚焦元素选择器（Tab 循环与初始焦点用） */
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 function wbModal(innerHtml, opts = {}) {
-  closeWbModal();
+  closeWbModal(null, true);
+  const title = opts.title || '对话框';
+  wbModalReturnFocus = document.activeElement;
   wbModalEl = document.createElement('div');
-  wbModalEl.className = 'modal-overlay open';
-  wbModalEl.innerHTML = `<div class="modal" style="${opts.wide ? 'max-width:860px' : ''};max-height:85vh;overflow-y:auto">
+  wbModalEl.className = 'modal-overlay';
+  wbModalEl.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}" style="${opts.wide ? 'max-width:860px' : ''};max-height:85vh;overflow-y:auto">
     <div class="modal-header">
-      <span class="modal-title">${opts.title || ''}</span>
-      <button class="modal-close" id="wb-modal-close" title="关闭">×</button>
+      <span class="modal-title">${escapeHtml(opts.title || '')}</span>
+      <button type="button" class="modal-close" id="wb-modal-close" title="关闭" aria-label="关闭对话框">×</button>
     </div>
     <div class="modal-body">${innerHtml}</div>
   </div>`;
   document.body.appendChild(wbModalEl);
-  wbModalEl.querySelector('#wb-modal-close').addEventListener('click', closeWbModal);
-  wbModalEl.addEventListener('mousedown', ev => { if (ev.target === wbModalEl) closeWbModal(); });
-  wbModalKeydown = ev => { if (ev.key === 'Escape') closeWbModal(); };
+  requestAnimationFrame(() => wbModalEl?.classList.add('open'));
+  wbModalEl.querySelector('#wb-modal-close').addEventListener('click', () => closeWbModal(wbModalEl));
+  wbModalEl.addEventListener('mousedown', ev => { if (ev.target === wbModalEl) closeWbModal(wbModalEl); });
+
+  wbModalKeydown = ev => {
+    const el = wbModalEl;
+    if (!el) return;
+    if (ev.key === 'Escape') { ev.preventDefault(); closeWbModal(el); return; }
+    if (ev.key !== 'Tab') return;
+    // 焦点陷阱：Tab 在对话框内循环，不逃到背景页
+    const nodes = [...el.querySelectorAll(FOCUSABLE)].filter(n => n.offsetParent !== null);
+    if (!nodes.length) return;
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+    else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+  };
   document.addEventListener('keydown', wbModalKeydown);
+
+  // 初始焦点：正文里第一个可操作控件，没有则落在关闭按钮，保证键盘可用
+  const initial = wbModalEl.querySelector('.modal-body ' + FOCUSABLE.split(',').join(', .modal-body '))
+    || wbModalEl.querySelector('#wb-modal-close');
+  if (initial) {
+    try { initial.focus({ preventScroll: true }); } catch { /* 忽略 */ }
+  }
   return wbModalEl;
 }
 
-function closeWbModal() {
+function closeWbModal(expected = null, immediate = false) {
+  if (expected && expected !== wbModalEl) return; // 旧异步任务不能误关新模态框
   if (wbModalKeydown) { document.removeEventListener('keydown', wbModalKeydown); wbModalKeydown = null; }
-  if (wbModalEl) { wbModalEl.remove(); wbModalEl = null; }
+  const el = wbModalEl;
+  wbModalEl = null;
+  // 焦点归还触发元素（元素已随重渲染移除时跳过）
+  const back = wbModalReturnFocus;
+  wbModalReturnFocus = null;
+  if (back && typeof back.focus === 'function' && back.isConnected) {
+    try { back.focus({ preventScroll: true }); } catch { /* 忽略 */ }
+  }
+  if (!el) return;
+  if (immediate || reducedMotion.matches) { el.remove(); return; }
+  el.classList.remove('open');
+  el.classList.add('closing');
+  setTimeout(() => el.remove(), 180);
 }
 
 // ── 导出报告数据（export.js 消费）──

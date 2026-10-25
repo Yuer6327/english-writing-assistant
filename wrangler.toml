@@ -8,9 +8,14 @@ routes = [
 ]
 
 # ── 静态前端资源（Workers Assets）──
+# run_worker_first：静态资源默认由边缘直接返回、绕过 Worker，
+# 这样安全响应头（CSP / X-Frame-Options 等）与同源校验对 HTML 完全失效。
+# 置 true 让所有请求先过 Worker（再由 ASSETS.fetch 回源静态文件），
+# 保证 HTML/CSS/JS 与 API 共享同一套安全头。
 [assets]
 directory = "./public"
 binding = "ASSETS"
+run_worker_first = true
 
 # ── D1 数据库绑定 ──
 [[d1_databases]]
@@ -45,8 +50,11 @@ persist = true
 head_sampling_rate = 1
 
 # ── 环境变量（非敏感，敏感的用 wrangler secret put）──
+# FRONTEND_ORIGIN：允许携带 Cookie 跨域访问 API 的来源白名单（逗号分隔）。
+# 本 Worker 自带静态资源、前后端同源，正常无需跨域 → 只放自身源。
+# 注意：`*` 视为"仅同源"（不再反射任意 Origin），见 src/middleware/security.ts。
 [vars]
-FRONTEND_ORIGIN = "*"
+FRONTEND_ORIGIN = "https://writing.yuer6327.top"
 
 # ENCRYPTION_KEY    → wrangler secret put ENCRYPTION_KEY（加密 BYOK Key；本地 JWT 已由统一认证取代）
 # AGNES_API_KEY     → deprecated：已上收 billing（yuer-billing）持有，BYOK 迁移完成后从本 Worker 删除

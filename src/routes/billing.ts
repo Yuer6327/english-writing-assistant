@@ -20,7 +20,14 @@ const billingRoutes = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 billingRoutes.get('/me', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const overview = await billing.overview(c.env, userId, 'writing');
+  let overview: billing.BillingOverview;
+  try {
+    overview = await billing.overview(c.env, userId, 'writing');
+  } catch (err) {
+    // billing 不可用时不再抛未捕获异常（那样前端拿到 500 无从判断），统一 503
+    console.error('[billing/me] 概览查询失败:', err instanceof Error ? err.message : err);
+    return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
+  }
   let byok = { configured: false };
   try {
     byok = await billing.byokStatus(c.env, userId);
@@ -33,6 +40,8 @@ billingRoutes.post('/redeem', authMiddleware, async (c) => {
   const body = await c.req.json<{ code?: string }>().catch(() => ({}) as any);
   const code = (body.code || '').trim();
   if (!code) return c.json({ error: '请输入兑换码' }, 400);
+  // 兑换码格式固定，限制长度避免超长串打到计费服务
+  if (code.length > 64) return c.json({ error: '兑换码格式不正确' }, 400);
 
   // 强限流：5 次/分 + 20 次/日（按北京日期计）
   if (rateLimitHit(`redeem:m:${userId}`, 5, 60_000)) {
@@ -90,7 +99,7 @@ admin.post('/gift', async (c) => {
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
 
   try {
-    const r = await billing.adminGift(c.env, userId, points, body.note?.trim());
+    const r = await billing.adminGift(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined);
     return c.json(r);
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
@@ -115,7 +124,11 @@ admin.post('/tags', async (c) => {
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
   try {
-    return c.json(await billing.adminTags(c.env, userId, body.add ?? [], body.remove ?? []));
+    const clean = (arr: unknown): string[] => (Array.isArray(arr) ? arr : [])
+      .filter(x => typeof x === 'string' && x.trim())
+      .slice(0, 10)
+      .map(x => (x as string).trim().slice(0, 50));
+    return c.json(await billing.adminTags(c.env, userId, clean(body.add), clean(body.remove)));
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
     return c.json({ error: '计费服务暂不可用' }, 503);
@@ -128,7 +141,7 @@ admin.post('/codes', async (c) => {
   if (!Number.isFinite(points) || points <= 0) return c.json({ error: '面额需为正数（元）' }, 400);
   const count = Math.max(1, Math.min(200, Number(body.count) || 1));
   try {
-    return c.json(await billing.adminCodes(c.env, points, count, body.batch?.trim()));
+    return c.json(await billing.adminCodes(c.env, points, count, body.batch?.trim().slice(0, 60) || undefined));
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
     return c.json({ error: '计费服务暂不可用' }, 503);
@@ -143,7 +156,7 @@ admin.post('/orders/manual', async (c) => {
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
   try {
-    return c.json(await billing.adminManualOrder(c.env, userId, points, body.note?.trim()));
+    return c.json(await billing.adminManualOrder(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined));
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
     return c.json({ error: '计费服务暂不可用' }, 503);

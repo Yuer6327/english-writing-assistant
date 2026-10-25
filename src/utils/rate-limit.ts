@@ -11,15 +11,19 @@ import { BillingError } from './billing';
 
 interface Bucket {
   timestamps: number[]; // 窗口内的请求时间戳（ms）
+  last: number;         // 最后一次命中时间（回收判定用）
 }
 
 const buckets = new Map<string, Bucket>();
 
-/** 内存占用兜底：条目过多时清理空桶 */
-function gc() {
-  if (buckets.size < 2000) return;
+/** 最大回收窗口：兑换码日限流用 26h，超过这个时长的桶一定已经失效 */
+const MAX_TTL_MS = 26 * 3600_000;
+
+/** 内存占用兜底：条目过多时回收"窗口已过"的桶（旧实现只删空数组，带时间戳的桶永不释放） */
+function gc(now: number) {
+  if (buckets.size < 500) return;
   for (const [k, b] of buckets) {
-    if (b.timestamps.length === 0) buckets.delete(k);
+    if (b.timestamps.length === 0 || now - b.last > MAX_TTL_MS) buckets.delete(k);
   }
 }
 
@@ -31,17 +35,18 @@ export function rateLimitHit(key: string, limit: number, windowMs: number): bool
   const now = Date.now();
   let b = buckets.get(key);
   if (!b) {
-    b = { timestamps: [] };
+    b = { timestamps: [], last: now };
     buckets.set(key, b);
   }
   // 丢弃窗口外的旧时间戳
   b.timestamps = b.timestamps.filter(t => now - t < windowMs);
+  b.last = now;
   if (b.timestamps.length >= limit) {
-    gc();
+    gc(now);
     return true;
   }
   b.timestamps.push(now);
-  gc();
+  gc(now);
   return false;
 }
 
