@@ -4,8 +4,8 @@
 // 批改渲染（分数卡+原文高亮+问题卡）/ 片段精修 / 全文润色 / 导出
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261025';
-import { openExportModal } from './export.js?v=20261025';
+import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261026';
+import { openExportModal } from './export.js?v=20261026';
 
 let disposed = false;
 let state = null;            // { essay, drafts, polishes }

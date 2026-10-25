@@ -2,7 +2,7 @@
 // index.js — 作文列表 + 新建作文（swup 管理：导出 init/cleanup）
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime, compressImageFile, gradeFor } from './api.js?v=20261025';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime, compressImageFile, gradeFor } from './api.js?v=20261026';
 
 let disposed = false;
 /** 新建表单暂存的题目图片（data URL） */

@@ -96,12 +96,43 @@ export const api = {
 };
 
 // ── Toast ──
+// 成功/信息：3 秒自动消失（现状不变）。
+// 报错：持久保留，需点击右上角 × 手动关闭（避免一闪而过错过失败原因）；
+//      最多同时保留 3 条报错，超出移除最早的。
 export function toast(message, type = 'info') {
+  let stack = document.getElementById('toast-stack');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'toast-stack';
+    document.body.appendChild(stack);
+  }
+
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
+
+  if (type === 'error') {
+    el.classList.add('toast-persist');
+    const text = document.createElement('span');
+    text.className = 'toast-text';
+    text.textContent = message;
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'toast-close';
+    close.textContent = '×';
+    close.setAttribute('aria-label', '关闭');
+    close.addEventListener('click', () => el.remove());
+    el.append(text, close);
+
+    const errors = stack.querySelectorAll('.toast-error');
+    if (errors.length >= 3) errors[0].remove();
+    stack.appendChild(el);
+    return el;
+  }
+
   el.textContent = message;
-  document.body.appendChild(el);
+  stack.appendChild(el);
   setTimeout(() => el.remove(), 3000);
+  return el;
 }
 
 // ── Auth guard ──

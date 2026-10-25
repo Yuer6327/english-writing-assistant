@@ -175,7 +175,7 @@ window.addEventListener('popstate', async () => {
 });
 
 // ── 初始化 ──
-import { api } from './api.js?v=20261025';
+import { api } from './api.js?v=20261026';
 
 // ── 导航栏余额 pill + 管理链接（navbar 持久化，查重防重复追加；本模块全站常驻）──
 const PILL_ID = 'nav-balance-pill';
