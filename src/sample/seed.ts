@@ -22,7 +22,7 @@ const REVIEW_1: ReviewResult = {
   },
   subscores: { content: 6, language: 6, organization: 3 },
   score: 15,
-  overall_comment: '文章结构完整、叙事清楚，能看到习惯带来的改变，是不错的起点。最需要突破的是语言层面：词汇升级和句式多样化，以及纠正几处反复出现的语法硬伤。',
+  overall_comment: '主要问题在语言层：词汇停留在初中层（important/good 反复出现），句式以简单句为主，且 used to / suggest / progress / succeed 等多处语法硬伤在阅卷中会直接压档；内容上论据只有"学习"一个维度。先清零语法硬伤，再升级词汇与句式。',
   word_count_assessment: '约 127 词，符合 120-150 词要求。',
   issues: [
     {
@@ -73,6 +73,31 @@ Two years ago, I **used to stay up late scrolling on my phone**, which **left me
     '内容展开：除学习外，再从健康或自律角度补充一句例证，让"习惯的力量"更有说服力。',
     '消灭硬伤：used to do / succeed（动词）/ In conclusion 三个考点要整理进错题本。',
   ],
+  practice: {
+    intro: '针对一稿暴露的语法与搭配硬伤，先把这几个考点练稳。',
+    items: [
+      {
+        chinese: '两年前我常常熬夜玩手机，上课总是很疲惫。',
+        answer: 'Two years ago, I used to stay up late playing with my phone, and I was always tired in class.',
+        target: 'used to do（过去常常）与 be used to doing（习惯于）的区别，对应原文 "was used to staying up late" 的错误。',
+      },
+      {
+        chinese: '老师建议我制定一份学习计划。',
+        answer: 'My teacher advised me to make a study plan. / My teacher suggested that I (should) make a study plan.',
+        target: 'suggest 不接 sb to do，应用 suggest that sb (should) do 或改用 advise sb to do。',
+      },
+      {
+        chinese: '经过一个学期的努力，我在学习上取得了很大进步。',
+        answer: 'After a term of hard work, I have made great progress in my studies.',
+        target: 'progress 不可数，不能用 a 修饰；"在学习上"用 in my studies。',
+      },
+      {
+        chinese: '总之，只要我们坚持做小事，终有一天会成功。',
+        answer: 'In conclusion, as long as we keep doing small things, we will succeed one day.',
+        target: 'In conclusion（介词短语）与 succeed（动词）的用法，对应原文 "In conclude / will success"。',
+      },
+    ],
+  },
 };
 
 const DRAFT_2 = `Good habits play a significant role in shaping our lives, and my own experience is a good case in point.
@@ -89,7 +114,7 @@ const REVIEW_2: ReviewResult = {
   },
   subscores: { content: 8, language: 7, organization: 4 },
   score: 19,
-  overall_comment: '二稿进步显著：语法硬伤全部清除，倒装与非谓语等加分句式落地自然，叙事链条更完整。向第五档（21-25）冲刺的关键是内容的多维展开与个别措辞的精准度。',
+  overall_comment: '语法硬伤已基本清零，当前最大短板是内容：论据仍局限于学习单一维度，缺少第二个角度的例证；结尾 if 条件句正确但平淡。补足非学习维度的例证并升级收尾句式，即可向 21 分以上冲刺。',
   word_count_assessment: '约 121 词，符合 120-150 词要求。',
   issues: [
     {
@@ -115,6 +140,26 @@ Two years ago, I **used to stay up late scrolling on my phone**, which left me e
     '结尾句用 As long as ... 收束，比 if 条件句更有力量。',
     '保持已掌握的倒装、非谓语结构，考场上先写对再写难。',
   ],
+  practice: {
+    intro: '二稿语言已较扎实，本组练习聚焦内容多维展开与高级收尾句式。',
+    items: [
+      {
+        chinese: '除了学习，周末跑步的习惯让我保持健康、精力充沛。',
+        answer: 'Beyond academics, the habit of jogging at weekends keeps me healthy and energetic.',
+        target: '非学习维度例证的表达，补足内容维度"论据单一"的问题。',
+      },
+      {
+        chinese: '只有坚持每天练习，我们才能最终尝到成功的滋味。',
+        answer: 'Only by practicing every day can we eventually taste the sweetness of success.',
+        target: 'Only + 状语置于句首引起部分倒装（can we），高分收尾句式。',
+      },
+      {
+        chinese: '正是这些微小的日常习惯为我们日后的成功铺平了道路。',
+        answer: 'It is these small daily habits that pave the way to our future success.',
+        target: '强调句 It is ... that ...，替换平淡陈述，强化结尾。',
+      },
+    ],
+  },
   improvement: {
     score_delta: 4,
     fixed: [

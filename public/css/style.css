@@ -1135,6 +1135,42 @@ code {
 .score-bar-track { flex: 1; height: 8px; border-radius: 4px; background: var(--bg-hover); overflow: hidden; }
 .score-bar-fill { height: 100%; border-radius: 4px; background: var(--primary); transition: width .5s ease; }
 .score-bar-row .val { width: 52px; text-align: right; color: var(--text-soft); flex-shrink: 0; }
+.score-card .score-main + .score-main { border-left: 1px solid var(--border); padding-left: 20px; }
+
+/* ── 等第徽章（A/B/C/D，由分数推导）── */
+.grade-badge {
+  font-size: 34px; font-weight: 800; line-height: 1.1;
+  width: 56px; height: 56px; border-radius: 14px;
+  display: flex; align-items: center; justify-content: center;
+}
+.grade-badge.grade-sm { font-size: 13px; width: 26px; height: 26px; border-radius: 8px; font-weight: 700; }
+.g-A { background: var(--success-soft); color: var(--success); border: 1px solid rgba(47,107,63,.35); }
+.g-B { background: var(--primary-soft); color: var(--primary); border: 1px solid rgba(48,86,211,.35); }
+.g-C { background: rgba(176,122,42,.12); color: #a06a1c; border: 1px solid rgba(176,122,42,.35); }
+[data-theme="dark"] .g-C { color: #d19a4e; }
+.g-D { background: var(--danger-soft); color: #d64545; border: 1px solid rgba(214,69,69,.35); }
+[data-theme="dark"] .g-D { color: #e08585; }
+
+/* ── 巩固练习卡 ── */
+.practice-intro { font-size: 13px; color: var(--text-soft); margin-bottom: 10px; }
+.practice-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; background: var(--bg); }
+.practice-card .practice-head { display: flex; align-items: flex-start; gap: 10px; }
+.practice-card .practice-num {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%; margin-top: 2px;
+  background: var(--primary-soft); color: var(--primary);
+  font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+}
+.practice-card .practice-zh { font-size: 15px; line-height: 1.8; }
+.practice-card .practice-target { font-size: 12px; color: var(--text-light); margin: 6px 0 0 32px; }
+.practice-toggle {
+  margin: 8px 0 0 32px; padding: 4px 12px; font-size: 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text-soft); cursor: pointer;
+}
+.practice-toggle:hover { border-color: var(--primary); color: var(--primary); }
+.practice-answer {
+  margin: 8px 0 0 32px; padding: 8px 12px; border-radius: var(--radius);
+  background: var(--success-soft); color: var(--success); font-weight: 600; line-height: 1.8;
+}
 
 /* ── 稿件 Tabs ── */
 .draft-tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 14px 0; }

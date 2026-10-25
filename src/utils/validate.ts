@@ -5,7 +5,7 @@
 // ============================================================
 
 import type {
-  ReviewResult, ReviewIssue, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
+  ReviewResult, ReviewIssue, ReviewPractice, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
 } from '../types';
 
 /** 分数收敛到 [min, max] 的整数 */
@@ -48,10 +48,11 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
   const diag = parsed.diagnosis ?? {};
   const sub = parsed.subscores ?? {};
 
-  const content = safeScore(sub.content, 0, 10);
-  const language = safeScore(sub.language, 0, 10);
+  // 评分纪律封顶（与提示词一致）：分项 ≤9/≤9/≤4 → 总分 ≤22；结构另受定档规则约束
+  const content = safeScore(sub.content, 0, 9);
+  const language = safeScore(sub.language, 0, 9);
   // 结构加分规则：内容+语言 <15 → 结构最多 3 分
-  let organization = safeScore(sub.organization, 0, 5);
+  let organization = safeScore(sub.organization, 0, 4);
   if (content + language < 15) organization = Math.min(organization, 3);
 
   const sum = content + language + organization;
@@ -80,6 +81,23 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
     }
   }
 
+  // 巩固练习：条目需中文句 + 参考答案；无有效条目则整段丢弃（旧记录无此字段）
+  let practice: ReviewPractice | undefined;
+  const prac = parsed.practice;
+  if (prac && typeof prac === 'object' && Array.isArray(prac.items)) {
+    const items = prac.items
+      .filter((it: any) => it && typeof it === 'object'
+        && typeof it.chinese === 'string' && it.chinese.trim()
+        && typeof it.answer === 'string' && it.answer.trim())
+      .slice(0, 5)
+      .map((it: any) => ({
+        chinese: str(it.chinese, 600),
+        answer: str(it.answer, 1200),
+        target: str(it.target, 400),
+      }));
+    if (items.length) practice = { intro: str(prac.intro, 300), items };
+  }
+
   const overall = str(parsed.overall_comment, 2000);
   const revised = str(parsed.revised_essay, 20000);
 
@@ -102,6 +120,7 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
     issues,
     revised_essay: revised,
     suggestions: strArray(parsed.suggestions, 8),
+    practice,
   };
 
   if (expectsImprovement || (parsed.improvement && typeof parsed.improvement === 'object')) {
