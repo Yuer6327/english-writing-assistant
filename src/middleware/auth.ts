@@ -35,5 +35,6 @@ export const authMiddleware = createMiddleware<{ Bindings: Env; Variables: Vars 
 
   c.set('userId', row.id);
   c.set('username', row.username || row.name || `user_${row.id.slice(0, 8)}`);
+  c.set('role', row.role || 'user');
   await next();
 });

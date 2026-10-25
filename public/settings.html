@@ -21,7 +21,7 @@
     </div>
   </nav>
 
-  <main id="main" data-page-module="/js/settings.js?v=20261024">
+  <main id="main" data-page-module="/js/settings.js?v=20261025">
     <div class="container" style="max-width:640px">
       <h1 style="font-size:24px;margin-bottom:24px">设置</h1>
 
@@ -97,6 +97,43 @@
         </form>
       </div>
 
+      <!-- 账户与用量（可深链 #billing） -->
+      <div class="card" id="card-billing" style="margin-bottom:24px">
+        <h3 style="margin-bottom:14px">账户与用量</h3>
+
+        <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-bottom:18px">
+          <div>
+            <div style="font-size:12px;color:var(--text-light);margin-bottom:2px">积分余额（1 积分 = 1 元）</div>
+            <div id="billing-balance" style="font-size:30px;font-weight:700;font-variant-numeric:tabular-nums">--</div>
+          </div>
+          <div id="billing-quota" style="flex:1;min-width:200px;font-size:13px;color:var(--text-soft);line-height:2"></div>
+        </div>
+
+        <form id="billing-redeem-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+          <div class="form-group" style="flex:1;min-width:180px;margin-bottom:8px">
+            <label class="form-label" for="billing-code-input">兑换码充值</label>
+            <input type="text" class="form-input" id="billing-code-input" placeholder="WRT-XXXXXXXXXXXXXXXX" autocomplete="off" style="font-family:var(--font-mono)">
+          </div>
+          <button type="submit" class="btn btn-primary" id="billing-redeem-btn" style="margin-top:26px">兑换</button>
+        </form>
+        <div class="muted" style="font-size:12px;margin-bottom:16px">在线支付暂未开放，当前可通过兑换码充值；积分不过期、不可提现。</div>
+
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">近 20 次用量</div>
+        <div style="overflow-x:auto">
+          <table id="billing-usage-table" style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="color:var(--text-light);text-align:left">
+                <th style="padding:6px 8px;border-bottom:1px solid var(--border)">时间</th>
+                <th style="padding:6px 8px;border-bottom:1px solid var(--border)">服务</th>
+                <th style="padding:6px 8px;border-bottom:1px solid var(--border)">消耗</th>
+                <th style="padding:6px 8px;border-bottom:1px solid var(--border)">状态</th>
+              </tr>
+            </thead>
+            <tbody id="billing-usage-body"></tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- 批改提示词模板 -->
       <div class="card">
         <h3 style="margin-bottom:6px">批改提示词模板</h3>
@@ -114,7 +151,7 @@
     Project lead by <a href="https://www.yuer6327.top" target="_blank" rel="noopener noreferrer">Yuer6327</a> · <a href="https://github.com/Yuer6327/english-writing-assistant" target="_blank" rel="noopener noreferrer">GitHub</a>
   </footer>
 
-  <script src="/js/theme.js?v=20260802"></script>
-  <script type="module" src="/js/swup.js?v=20261024"></script>
+  <script src="/js/theme.js?v=20261025"></script>
+  <script type="module" src="/js/swup.js?v=20261025"></script>
 </body>
 </html>

@@ -19,7 +19,7 @@
 
 // ── 被 swup 管理的页面集合（其余页面走完整刷新）──
 // '/' 与 '/index.html' 同为作文列表页（Workers Assets 根路径即 index.html）
-const SPA_PAGES = ['/', '/index.html', '/essay.html', '/settings.html'];
+const SPA_PAGES = ['/', '/index.html', '/essay.html', '/settings.html', '/admin.html'];
 
 // ── 已加载的 module 缓存 ──
 const moduleCache = new Map();
@@ -175,6 +175,42 @@ window.addEventListener('popstate', async () => {
 });
 
 // ── 初始化 ──
+import { api } from './api.js?v=20261025';
+
+// ── 导航栏余额 pill + 管理链接（navbar 持久化，查重防重复追加；本模块全站常驻）──
+const PILL_ID = 'nav-balance-pill';
+const ADMIN_LINK_ID = 'nav-admin-link';
+
+async function injectNavbarBilling() {
+  const right = document.querySelector('.navbar-right');
+  if (!right) return;
+  let me = null;
+  try {
+    me = await api.me();
+  } catch { return; }
+  if (!me) return;
+
+  if (typeof me.wallet?.balance === 'number' && !document.getElementById(PILL_ID)) {
+    const pill = document.createElement('a');
+    pill.id = PILL_ID;
+    pill.className = 'badge badge-completed';
+    pill.href = '/settings.html#billing';
+    pill.style.cssText = 'font-variant-numeric:tabular-nums;text-decoration:none';
+    pill.textContent = `${(me.wallet.balance / 100).toFixed(2)} 积分`;
+    const settingsLink = right.querySelector('a[href="/settings.html"]');
+    right.insertBefore(pill, settingsLink || right.lastElementChild);
+  }
+  if (me.role === 'admin' && !document.getElementById(ADMIN_LINK_ID)) {
+    const a = document.createElement('a');
+    a.id = ADMIN_LINK_ID;
+    a.href = '/admin.html';
+    a.setAttribute('data-nav', '');
+    a.textContent = '管理';
+    const settingsLink = right.querySelector('a[href="/settings.html"]');
+    right.insertBefore(a, settingsLink);
+  }
+}
+
 (async function bootstrap() {
   try {
     await loadCurrentPage();
@@ -183,5 +219,6 @@ window.addEventListener('popstate', async () => {
   }
   highlightNav(currentPath);
   setupLogout();
+  injectNavbarBilling();   // 后台拉取，不阻塞首屏
   ready = true;
 })();

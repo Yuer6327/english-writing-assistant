@@ -4,8 +4,8 @@
 // 批改渲染（分数卡+原文高亮+问题卡）/ 片段精修 / 全文润色 / 导出
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile } from './api.js';
-import { openExportModal } from './export.js';
+import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261025';
+import { openExportModal } from './export.js?v=20261025';
 
 let disposed = false;
 let state = null;            // { essay, drafts, polishes }
@@ -13,6 +13,80 @@ let activeDraftId = null;
 let editingDraft = false;    // 稿件编辑模式
 let selBtn = null;           // 选中片段的浮动精修按钮
 let delegatedBound = false;  // document 级委托只绑一次（swup 重复进页不叠加）
+
+// ── 模型车道（free / deepseek / byok）：可用选项由 billing 决定 ──
+const laneInfo = { paidEnabled: false, byokConfigured: false, loaded: false };
+let reviewLane = null;       // 批改上次选择（内存记忆）
+let polishLane = null;       // 精修上次选择
+let lastCharge = null;       // { reviewId, points, lane } 本次批改消耗（renderReview 展示）
+
+async function loadLaneInfo() {
+  if (laneInfo.loaded) return;
+  try {
+    const me = await api.billing.me();
+    laneInfo.paidEnabled = !!me.paid_enabled;
+    laneInfo.byokConfigured = !!me.byok_configured;
+    laneInfo.loaded = true;
+  } catch { /* billing 不可用时仅显示免费通道 */ }
+}
+
+/** 默认车道：已配置我的 Key → byok，否则免费通道（与服务端默认规则一致） */
+function defaultLane() {
+  return laneInfo.byokConfigured ? 'byok' : 'free';
+}
+
+/** 模型选择 <select> HTML（id 唯一）；value 归一到合法车道 */
+function modelSelectHtml(id, remembered) {
+  const value = ['free', 'deepseek', 'byok'].includes(remembered)
+    ? remembered : defaultLane();
+  const opts = [
+    `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（每日 3 次）</option>`,
+    laneInfo.paidEnabled
+      ? `<option value="deepseek"${value === 'deepseek' ? ' selected' : ''}>DeepSeek（积分）</option>` : '',
+    laneInfo.byokConfigured
+      ? `<option value="byok"${value === 'byok' ? ' selected' : ''}>我的 Key（自备）</option>` : '',
+  ].join('');
+  return `<select class="form-input" id="${id}" style="width:auto;padding:4px 8px;font-size:13px">${opts}</select>`;
+}
+
+/** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
+const PAID_HINT = '按用量计积分，通常约 0.02~0.1 积分/次，实结多退少补';
+
+function bindPaidHint(selectEl, hintEl) {
+  if (!selectEl || !hintEl) return;
+  const sync = () => { hintEl.style.display = selectEl.value === 'deepseek' ? 'inline' : 'none'; };
+  selectEl.addEventListener('change', sync);
+  sync();
+}
+
+/** 402 余额不足弹窗（兑换/充值入口深链设置页） */
+function showInsufficientBalance() {
+  wbModal(`
+    <div style="text-align:center;padding:8px 0">
+      <div style="font-size:34px;margin-bottom:10px">😔</div>
+      <div style="font-weight:600;font-size:16px;margin-bottom:8px">积分余额不足</div>
+      <div style="font-size:13px;color:var(--text-soft);line-height:1.8">
+        本次请求需要积分余额。当前可用充值方式为兑换码。<br>
+        也可在「设置 → AI 服务配置」绑定自备 API Key，或在免费额度内使用。
+      </div>
+      <div style="margin-top:16px;display:flex;gap:10px;justify-content:center">
+        <a class="btn btn-primary" href="/settings.html#billing" style="text-decoration:none">去充值</a>
+        <button class="btn" id="btn-402-close">知道了</button>
+      </div>
+    </div>
+  `, { title: '余额不足' });
+  const closeBtn = document.getElementById('btn-402-close');
+  if (closeBtn) closeBtn.addEventListener('click', closeWbModal);
+}
+
+/** 统一错误分流：402 → 余额不足弹窗；返回 true 表示已处理 */
+function handleBillingError(err) {
+  if (err && err.code === 'insufficient_balance') {
+    showInsufficientBalance();
+    return true;
+  }
+  return false;
+}
 
 const cnNum = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
@@ -30,6 +104,7 @@ export async function init() {
   const id = new URLSearchParams(location.search).get('id');
   if (!id) { window.swupNavigate('/'); return; }
 
+  await loadLaneInfo();   // 先确定可用车道（我的 Key / 积分档），再渲染面板
   await reload(id);
   bindDelegated();
 }
@@ -123,8 +198,9 @@ function renderTabs() {
   if (!state.drafts.length) { el.innerHTML = ''; return; }
   el.innerHTML = state.drafts.map(d => {
     const rv = latestReview(d);
+    const g = rv ? gradeFor(rv.result.score) : null;
     return `<button class="draft-tab ${d.id === activeDraftId ? 'active' : ''}" data-tab="${d.id}">
-      ${cnNum[d.version - 1] || d.version}稿${rv ? `<span class="tab-score">${rv.result.score}</span>` : ''}
+      ${cnNum[d.version - 1] || d.version}稿${rv ? `<span class="tab-score">${rv.result.score}${g ? ` · ${g.grade}` : ''}</span>` : ''}
     </button>`;
   }).join('') + '<button class="draft-tab draft-tab-add" id="tab-add">＋ 新稿件</button>';
 
@@ -167,15 +243,17 @@ function renderDraftPanel() {
           ${cnNum[d.version - 1] || d.version}稿 · ${sourceLabel} · ${d.word_count} 词${hwScore}
           ${rv ? ` · 批改于 ${formatBeijingTime(rv.created_at)}${d.reviews.length > 1 ? `（第 ${d.reviews.length} 次）` : ''}` : ''}
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           ${editingDraft
             ? `<button class="btn btn-primary" id="btn-save-draft" style="padding:5px 12px;font-size:13px">保存稿件</button>
                <button class="btn" id="btn-cancel-edit" style="padding:5px 12px;font-size:13px">取消</button>`
-            : `<button class="btn btn-primary" id="btn-review" style="padding:5px 12px;font-size:13px">${rv ? '重新批改' : '开始批改'}</button>
+            : `${modelSelectHtml('review-model-select', reviewLane)}
+               <button class="btn btn-primary" id="btn-review" style="padding:5px 12px;font-size:13px">${rv ? '重新批改' : '开始批改'}</button>
                <button class="btn" id="btn-edit-draft" style="padding:5px 12px;font-size:13px">编辑稿件</button>
                <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px">✍️ 写${cnNum[d.version] || d.version + 1}稿</button>
                <button class="btn" id="btn-rewrite" style="padding:5px 12px;font-size:13px">全文润色</button>
-               <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px">删除</button>`}
+               <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px">删除</button>
+               <span id="review-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>`}
         </div>
       </div>
       ${stale ? '<div style="font-size:12px;color:#d64545;margin-bottom:8px">⚠ 稿件在上次批改后已修改，建议重新批改</div>' : ''}
@@ -211,6 +289,7 @@ function renderDraftPanel() {
       editingDraft = false; renderDraftPanel();
     });
   } else {
+    bindPaidHint(el.querySelector('#review-model-select'), el.querySelector('#review-paid-hint'));
     el.querySelector('#btn-review').addEventListener('click', runReview);
     el.querySelector('#btn-edit-draft').addEventListener('click', () => { editingDraft = true; renderDraftPanel(); });
     el.querySelector('#btn-new-draft').addEventListener('click', () => openDraftModal('text', d.text));
@@ -312,15 +391,23 @@ async function runReview(e) {
   const btn = e.currentTarget;
   const d = activeDraft();
   if (!d) return;
+  const selectEl = document.getElementById('review-model-select');
+  const lane = selectEl ? selectEl.value : defaultLane();
+  reviewLane = lane;   // 记忆本次选择（内存）
   btn.disabled = true; btn.textContent = '批改中（约 10-30 秒）...';
   try {
-    await api.reviewDraft(d.id);
+    const res = await api.reviewDraft(d.id, lane);
+    lastCharge = {
+      reviewId: res.review_id,
+      points: res.points_charged ?? 0,
+      lane: res.lane || (lane === 'deepseek' ? 'paid' : lane),
+    };
     toast('批改完成', 'success');
     await reload(state.essay.id);
     const reviewEl = document.getElementById('wb-review');
     if (reviewEl) reviewEl.scrollIntoView({ behavior: 'smooth' });
   } catch (err) {
-    toast(err.message, 'error');
+    if (!handleBillingError(err)) toast(err.message, 'error');
     btn.disabled = false; btn.textContent = '开始批改';
   }
 }
@@ -337,10 +424,20 @@ function renderReview() {
     { name: '语言', val: r.subscores.language, max: 10 },
     { name: '结构', val: r.subscores.organization, max: 5 },
   ];
+  const gradeInfo = gradeFor(r.score);
+  // 本次批改的积分消耗（仅最新一次响应有值；0 = 免费/自备 Key）
+  const chargeText = lastCharge && lastCharge.reviewId === rv.id
+    ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 100).toFixed(2)} 积分` : ' · 免费')
+    : '';
 
   let html = `
-    <div class="section-title">批改结果 <span class="muted">${escapeHtml(rv.model || '')}</span></div>
+    <div class="section-title">批改结果 <span class="muted">${escapeHtml(rv.model || '')}${chargeText}</span></div>
     <div class="score-card">
+      ${gradeInfo ? `
+      <div class="score-main">
+        <div class="grade-badge g-${gradeInfo.grade}">${gradeInfo.grade}</div>
+        <div class="label">等第 · ${gradeInfo.label}</div>
+      </div>` : ''}
       <div class="score-main">
         <div class="score-num">${r.score}<small>/${state.essay.genre_total}</small></div>
         <div class="label">总分</div>
@@ -394,6 +491,23 @@ function renderReview() {
       r.suggestions.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul>`;
   }
 
+  if (r.practice && r.practice.items && r.practice.items.length) {
+    const p = r.practice;
+    html += `
+      <div class="section-title">巩固练习 <span class="muted">针对本次批改的问题出题，先自己翻译再看答案</span></div>
+      ${p.intro ? `<div class="practice-intro">${escapeHtml(p.intro)}</div>` : ''}
+      ${p.items.map((it, i) => `
+        <div class="practice-card">
+          <div class="practice-head">
+            <span class="practice-num">${i + 1}</span>
+            <div class="practice-zh">${escapeHtml(it.chinese)}</div>
+          </div>
+          ${it.target ? `<div class="practice-target">考点：${escapeHtml(it.target)}</div>` : ''}
+          <button class="practice-toggle" data-index="${i}">显示参考答案</button>
+          <div class="practice-answer" data-index="${i}" hidden>${escapeHtml(it.answer)}</div>
+        </div>`).join('')}`;
+  }
+
   if (r.improvement) {
     const imp = r.improvement;
     const delta = imp.score_delta ?? 0;
@@ -412,6 +526,17 @@ function renderReview() {
   }
 
   el.innerHTML = html;
+
+  // 巩固练习：展开/收起参考答案
+  el.querySelectorAll('.practice-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ans = el.querySelector(`.practice-answer[data-index="${btn.dataset.index}"]`);
+      if (!ans) return;
+      const show = ans.hasAttribute('hidden');
+      if (show) ans.removeAttribute('hidden'); else ans.setAttribute('hidden', '');
+      btn.textContent = show ? '收起参考答案' : '显示参考答案';
+    });
+  });
 }
 
 // ============================================================
@@ -441,6 +566,7 @@ function openDraftModal(mode, prefill) {
         <label style="font-size:13px;display:block">
           <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR（手写体→高精度→标准版自动降级，省模型额度）
         </label>
+        <div class="muted" style="font-size:12px;margin-top:6px">百度 OCR 每日 5 次免费，超出 0.01 积分/次；大模型识别按用量计积分</div>
       </div>
       <button class="btn btn-primary" id="btn-ocr">开始识别</button>
       <span id="ocr-status" style="font-size:13px;color:var(--text-soft);margin-left:10px"></span>
@@ -517,7 +643,7 @@ function openDraftModal(mode, prefill) {
       updateWc();
     } catch (err) {
       status.textContent = '';
-      toast(err.message, 'error');
+      if (!handleBillingError(err)) toast(err.message, 'error');
     } finally {
       btn.disabled = false;
     }
@@ -621,14 +747,24 @@ function openPolishModal(fragment) {
       <input type="text" class="form-input" id="polish-instruction" maxlength="1000"
         placeholder="如：换更高级的句式 / 更口语化一些 / 补一个例证">
     </div>
+    <div class="form-group" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <label class="form-label" style="margin:0">模型</label>
+      ${modelSelectHtml('polish-model-select', polishLane)}
+      <span id="polish-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>
+    </div>
     <button class="btn btn-primary" id="btn-run-polish">开始精修</button>
     <div id="polish-result" style="margin-top:16px"></div>
   `);
+
+  bindPaidHint(modal.querySelector('#polish-model-select'), modal.querySelector('#polish-paid-hint'));
 
   modal.querySelector('#btn-run-polish').addEventListener('click', async (e) => {
     const btn = e.currentTarget;
     const d = activeDraft();
     if (!d) return;
+    const selectEl = modal.querySelector('#polish-model-select');
+    const lane = selectEl ? selectEl.value : defaultLane();
+    polishLane = lane;
     btn.disabled = true; btn.textContent = '精修中（约 10-30 秒）...';
     try {
       const res = await api.polish(state.essay.id, {
@@ -636,20 +772,24 @@ function openPolishModal(fragment) {
         fragment,
         instruction: modal.querySelector('#polish-instruction').value.trim(),
         draft_id: d.id,
+        model_id: lane,
       });
-      renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment);
+      const chargeNote = res.points_charged > 0
+        ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 100).toFixed(2)} 积分</div>` : '';
+      renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
       btn.textContent = '重新精修';
     } catch (err) {
-      toast(err.message, 'error');
+      if (!handleBillingError(err)) toast(err.message, 'error');
     } finally {
       btn.disabled = false;
     }
   });
 }
 
-function renderPolishResult(container, result, fragment) {
+function renderPolishResult(container, result, fragment, prefixHtml = '') {
   const d = activeDraft();
   container.innerHTML = `
+    ${prefixHtml}
     ${result.versions.map((v, vi) => `
       <div class="polish-version">
         <span class="style-tag">${escapeHtml(v.style)}</span>
@@ -703,21 +843,27 @@ function renderPolishResult(container, result, fragment) {
 // ============================================================
 async function runFullRewrite(e) {
   const btn = e.currentTarget;
+  // 与批改共用面板上的模型选择器（同一按钮行）
+  const selectEl = document.getElementById('review-model-select');
+  const lane = selectEl ? selectEl.value : defaultLane();
+  reviewLane = lane;
   btn.disabled = true; btn.textContent = '润色中（约 10-30 秒）...';
   let res;
   try {
-    res = await api.polish(state.essay.id, { mode: 'full', draft_id: activeDraft().id });
+    res = await api.polish(state.essay.id, { mode: 'full', draft_id: activeDraft().id, model_id: lane });
   } catch (err) {
-    toast(err.message, 'error');
+    if (!handleBillingError(err)) toast(err.message, 'error');
     btn.disabled = false; btn.textContent = '全文润色';
     return;
   }
   btn.disabled = false; btn.textContent = '全文润色';
 
   const r = res.result;
+  const chargeNote = res.points_charged > 0
+    ? ` · 本次消耗 ${(res.points_charged / 100).toFixed(2)} 积分` : '';
   const modal = wbModal(`
     <div class="form-group">
-      <div style="font-size:13px;color:var(--text-soft);line-height:1.8">${escapeHtml(r.summary || '')}</div>
+      <div style="font-size:13px;color:var(--text-soft);line-height:1.8">${escapeHtml(r.summary || '')}${chargeNote ? `<span class="muted" style="font-size:12px">${chargeNote}</span>` : ''}</div>
     </div>
     ${r.paragraph_changes.map(p => `
       <div class="rewrite-pair">
@@ -859,6 +1005,7 @@ function buildReportPayload() {
         issues: latestReview(d).result.issues,
         revised_essay: latestReview(d).result.revised_essay,
         suggestions: latestReview(d).result.suggestions,
+        practice: latestReview(d).result.practice || null,
         improvement: latestReview(d).result.improvement || null,
       } : null,
     })),

@@ -49,5 +49,11 @@ head_sampling_rate = 1
 FRONTEND_ORIGIN = "*"
 
 # ENCRYPTION_KEY    → wrangler secret put ENCRYPTION_KEY（加密 BYOK Key；本地 JWT 已由统一认证取代）
-# AGNES_API_KEY     → wrangler secret put AGNES_API_KEY（公用免费 API：中国大陆 https://apihub.agnes-ai.cn/v1 优先，国际 https://apihub.agnes-ai.com/v1 备用，模型 agnes-3.0-flash，支持图像 URL 输入）
+# AGNES_API_KEY     → deprecated：已上收 billing（yuer-billing）持有，BYOK 迁移完成后从本 Worker 删除
 # BAIDU_OCR_AK / BAIDU_OCR_SK → wrangler secret put BAIDU_OCR_AK / BAIDU_OCR_SK（百度云文字识别免费额度：https://aip.baidubce.com/rest/2.0/ocr/v1/general）
+# INTERNAL_TOKEN    → 可选，与 billing 共享的内部调用口令（X-Internal-Token）
+
+# ── 计费平台 Service Binding（内网调用；billing 无公网路由，部署顺序：先 billing 后本 Worker）──
+[[services]]
+binding = "BILLING"
+service = "yuer-billing"

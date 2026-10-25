@@ -13,6 +13,7 @@ import essayRoutes from './routes/essays';
 import ocrRoutes from './routes/ocr';
 import promptRoutes from './routes/prompts';
 import settingsRoutes from './routes/settings';
+import billingRoutes from './routes/billing';
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -38,6 +39,7 @@ app.route('/api', essayRoutes);      // /api/essays..., /api/drafts...
 app.route('/api/ocr', ocrRoutes);
 app.route('/api/prompts', promptRoutes);
 app.route('/api/settings', settingsRoutes);
+app.route('/api/billing', billingRoutes);
 
 // ── 健康检查 ──
 app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));

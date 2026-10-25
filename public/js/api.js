@@ -28,7 +28,11 @@ async function request(path, options = {}) {
   if (!resp.ok) {
     // 附带后端 details（如 AI 校验失败原因），帮助用户定位问题；截断避免 toast 过长
     const detail = data.details ? `：${String(data.details).slice(0, 300)}` : '';
-    throw new Error(`${data.error || `HTTP ${resp.status}`}${detail}`);
+    const err = new Error(`${data.error || `HTTP ${resp.status}`}${detail}`);
+    // 后端业务错误码（402 insufficient_balance / 409 model_disabled 等），前端据此分流
+    err.code = data.code || null;
+    err.status = resp.status;
+    throw err;
   }
   return data;
 }
@@ -59,9 +63,36 @@ export const api = {
   deleteDraft: (draftId) => request(`/drafts/${draftId}`, { method: 'DELETE' }),
 
   // --- 批改 / 精修 / 润色 / OCR ---
-  reviewDraft: (draftId) => request(`/drafts/${draftId}/review`, { method: 'POST' }),
+  reviewDraft: (draftId, modelId) => request(`/drafts/${draftId}/review`, {
+    method: 'POST',
+    body: JSON.stringify(modelId ? { model_id: modelId } : {}),
+  }),
   polish: (essayId, payload) => request(`/essays/${essayId}/polish`, { method: 'POST', body: JSON.stringify(payload) }),
   ocr: (images, mode) => request('/ocr', { method: 'POST', body: JSON.stringify({ images, mode }) }),
+
+  // --- 计费（余额 / 兑换码 / 用量 / 管理）---
+  billing: {
+    me: () => request('/billing/me'),
+    redeem: (code) => request('/billing/redeem', { method: 'POST', body: JSON.stringify({ code }) }),
+    usage: (limit = 50) => request(`/billing/usage?limit=${limit}`),
+    admin: {
+      gift: (username, pointsYuan, note) => request('/billing/admin/gift', {
+        method: 'POST', body: JSON.stringify({ username, points_yuan: pointsYuan, note }),
+      }),
+      user: (username) => request(`/billing/admin/user/${encodeURIComponent(username)}`),
+      tags: (username, add = [], remove = []) => request('/billing/admin/tags', {
+        method: 'POST', body: JSON.stringify({ username, add, remove }),
+      }),
+      codes: (pointsYuan, count) => request('/billing/admin/codes', {
+        method: 'POST', body: JSON.stringify({ points_yuan: pointsYuan, count }),
+      }),
+      orders: (limit = 50) => request(`/billing/admin/orders?limit=${limit}`),
+      manualOrder: (username, pointsYuan, note) => request('/billing/admin/orders/manual', {
+        method: 'POST', body: JSON.stringify({ username, points_yuan: pointsYuan, note }),
+      }),
+      migrateByok: () => request('/billing/admin/migrate-byok', { method: 'POST', body: '{}' }),
+    },
+  },
 };
 
 // ── Toast ──
@@ -114,6 +145,15 @@ export function countWords(text) {
   const t = (text || '').trim();
   if (!t) return 0;
   return t.split(/\s+/).length;
+}
+
+// ── 等第映射（25 分制；由分数推导，前端本地计算，旧批改记录同样适用）──
+export function gradeFor(score) {
+  if (typeof score !== 'number' || !Number.isFinite(score)) return null;
+  if (score >= 20) return { grade: 'A', label: '优秀' };
+  if (score >= 15) return { grade: 'B', label: '良好' };
+  if (score >= 10) return { grade: 'C', label: '合格' };
+  return { grade: 'D', label: '待提高' };
 }
 
 // ── 按需加载外部脚本（幂等：已加载则跳过）──

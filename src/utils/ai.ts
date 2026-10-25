@@ -111,8 +111,15 @@ export interface ContentPart {
   image_url?: { url: string };
 }
 
+/** callAI 返回值：内容 + 成功那次的 token 用量（计费结算用） */
+export interface AIResult {
+  content: string;
+  usage?: { prompt_tokens: number; completion_tokens: number };
+}
+
 /** 统一调用 AI，带超时。json=true 时要求返回 JSON。contentParts 存在时走多模态（手写 OCR / 看图批改）。
- *  temperature 显式覆盖默认温度（json 0.3 / 纯文本 0.7）。 */
+ *  temperature 显式覆盖默认温度（json 0.3 / 纯文本 0.7）。
+ *  多端点/重试路径透传"成功那次"的 usage（失败重试的中间成本不单独计费，吸收进加价倍率 N）。 */
 export async function callAI(
   apiKey: string,
   baseUrl: string | string[],
@@ -123,7 +130,7 @@ export async function callAI(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
-): Promise<string> {
+): Promise<AIResult> {
   // json 请求带 response_format 仅是"强制输出 JSON"的开关。部分端点不支持该参数
   // （Agnes 文档未列出该字段），失败后去掉重试一次即可——提示词本身已强制"输出纯 JSON"。
   const responseFormatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
@@ -166,7 +173,7 @@ async function callAIEndpoints(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
-): Promise<string> {
+): Promise<AIResult> {
   const urls = orderEndpoints(baseUrl);
   if (urls.length === 0) throw new Error('未配置 AI 接口地址');
 
@@ -195,7 +202,7 @@ async function callAIEndpoints(
     for (const url of order) {
       try {
         const result = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature);
-        if (result && result.trim()) return result;
+        if (result.content && result.content.trim()) return result;
         console.error(`[callAI] 端点 ${url} 返回空内容（HTTP 200），尝试下一端点`);
         lastError = new Error(`AI 返回空内容（${url}）`);
         allEdgeBlocked = false;
@@ -223,7 +230,7 @@ async function callAIEndpoints(
           await sleep(sec === null ? 1000 : Math.min(sec * 1000 + 300, 5000));
           try {
             const retry = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature);
-            if (retry && retry.trim()) return retry;
+            if (retry.content && retry.content.trim()) return retry;
           } catch (retryErr: any) {
             lastError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
           }
@@ -262,7 +269,7 @@ async function callAIFetch(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
-): Promise<string> {
+): Promise<AIResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
@@ -306,7 +313,10 @@ async function callAIFetch(
     }
 
     const data: any = await resp.json();
-    return data.choices?.[0]?.message?.content ?? '';
+    const usage = data.usage && typeof data.usage.prompt_tokens === 'number'
+      ? { prompt_tokens: data.usage.prompt_tokens, completion_tokens: data.usage.completion_tokens ?? 0 }
+      : undefined;
+    return { content: data.choices?.[0]?.message?.content ?? '', usage };
   } finally {
     clearTimeout(timer);
   }

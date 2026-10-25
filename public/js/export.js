@@ -6,7 +6,7 @@
 // 由 essay.js 调用 openExportModal({ mode:'report', getData })。
 // ============================================================
 
-import { loadScript, toast } from './api.js';
+import { loadScript, toast, gradeFor } from './api.js?v=20261025';
 
 // ── CDN 资源（jsdmirror 镜像）──
 const DOCX_CDN = 'https://cdn.jsdmirror.com/npm/docx@8.5.0/build/index.umd.js';
@@ -159,7 +159,9 @@ function stripBold(s) {
 
 function draftHeadline(d, total) {
   const name = `${cnNum[d.version - 1] || d.version}稿`;
-  return d.review ? `${name}（得分 ${d.review.score}/${total}）` : `${name}（未批改）`;
+  if (!d.review) return `${name}（未批改）`;
+  const g = gradeFor(d.review.score);
+  return `${name}（得分 ${d.review.score}/${total}${g ? ` · ${g.grade} 等第` : ''}）`;
 }
 
 // ============================================================
@@ -213,10 +215,12 @@ async function buildDocxBlob(data) {
     const r = d.review;
     if (!r) continue;
 
+    const g = gradeFor(r.score);
     p(new Paragraph({
       children: [
         new TextRun({ text: '批改结果  ', bold: true }),
         new TextRun({ text: `总分 ${r.score}/${data.total}`, bold: true, color: '3056D3' }),
+        ...(g ? [new TextRun({ text: `（${g.grade} 等第 · ${g.label}）`, bold: true, color: '2F6B3F' })] : []),
         new TextRun({ text: `（内容 ${r.subscores.content}/10 · 语言 ${r.subscores.language}/10 · 结构 ${r.subscores.organization}/5）`, color: '555555' }),
       ],
     }));
@@ -263,6 +267,25 @@ async function buildDocxBlob(data) {
       p(new Paragraph({ text: '提升建议', heading: HeadingLevel.HEADING_3 }));
       for (const s of r.suggestions) {
         p(new Paragraph({ text: `• ${s}`, spacing: { after: 60 } }));
+      }
+    }
+    if (r.practice && r.practice.items && r.practice.items.length) {
+      p(new Paragraph({ text: '巩固练习', heading: HeadingLevel.HEADING_3 }));
+      if (r.practice.intro) {
+        p(new Paragraph({ children: [new TextRun({ text: r.practice.intro, italics: true, color: '555555' })], spacing: { after: 80 } }));
+      }
+      for (const [i, it] of r.practice.items.entries()) {
+        p(new Paragraph({
+          children: [
+            new TextRun({ text: `第 ${i + 1} 题  `, bold: true }),
+            new TextRun({ text: `将下列句子译成英语：${it.chinese}` }),
+          ],
+          spacing: { after: 40 },
+        }));
+        if (it.target) {
+          p(new Paragraph({ children: [new TextRun({ text: `考点：${it.target}`, size: 20, color: '666666' })], spacing: { after: 40 }, indent: { left: 360 } }));
+        }
+        p(new Paragraph({ children: [new TextRun({ text: `参考答案：${it.answer}`, color: '2F6B3F' })], spacing: { after: 100 }, indent: { left: 360 } }));
       }
     }
     if (r.improvement) {
@@ -384,7 +407,8 @@ async function buildPdfBlob(data) {
     const r = d.review;
     if (!r) continue;
 
-    drawHeading(`批改结果：总分 ${r.score}/${data.total}（内容 ${r.subscores.content}/10 · 语言 ${r.subscores.language}/10 · 结构 ${r.subscores.organization}/5）`, 12);
+    const g = gradeFor(r.score);
+    drawHeading(`批改结果：总分 ${r.score}/${data.total}${g ? `（${g.grade} 等第 · ${g.label}）` : ''}（内容 ${r.subscores.content}/10 · 语言 ${r.subscores.language}/10 · 结构 ${r.subscores.organization}/5）`, 12);
     if (r.overall_comment) drawLines(`总评：${r.overall_comment}`, 11, textColor, 6);
 
     if (r.diagnosis && (r.diagnosis.content || r.diagnosis.language || r.diagnosis.organization)) {
@@ -411,6 +435,16 @@ async function buildPdfBlob(data) {
     if (r.suggestions && r.suggestions.length) {
       drawHeading('提升建议', 12);
       for (const s of r.suggestions) drawLines(`• ${s}`, 10, textColor, 3);
+    }
+
+    if (r.practice && r.practice.items && r.practice.items.length) {
+      drawHeading('巩固练习（先自己翻译，再看参考答案）', 12);
+      if (r.practice.intro) drawLines(r.practice.intro, 9, softColor, 6);
+      for (const [i, it] of r.practice.items.entries()) {
+        drawLines(`第 ${i + 1} 题：${it.chinese}`, 11, textColor, 2);
+        if (it.target) drawLines(`考点：${it.target}`, 9, softColor, 2, 16);
+        drawLines(`参考答案：${it.answer}`, 10, primaryColor, 6, 16);
+      }
     }
 
     if (r.improvement) {

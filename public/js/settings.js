@@ -1,9 +1,9 @@
 // ============================================================
-// settings.js — AI 服务配置 + 批改提示词模板
+// settings.js — AI 服务配置 + 账户与用量 + 批改提示词模板
 // swup 管理：导出 init/cleanup。表单元素随 main 每次切页重建，均在 init 中绑定。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml } from './api.js';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261025';
 
 let disposed = false;
 
@@ -18,7 +18,84 @@ export async function init() {
 
   await initApiSection();
   if (disposed) return;
+  initBillingSection();
   await initPromptSection();
+}
+
+// ============================================================
+// 账户与用量（余额 / 免费额度 / 兑换码 / 近期用量）
+// ============================================================
+const SERVICE_LABELS = {
+  'llm:agnes-flash': '批改（免费档）',
+  'llm:deepseek-flash': '批改（DeepSeek）',
+  'ocr:baidu': '百度 OCR',
+  'byok': '自备 Key',
+};
+
+export async function initBillingSection() {
+  const balanceEl = document.getElementById('billing-balance');
+  const quotaEl = document.getElementById('billing-quota');
+  const tbody = document.getElementById('billing-usage-body');
+  if (!balanceEl) return;
+
+  let me;
+  try {
+    me = await api.billing.me();
+  } catch (err) {
+    if (disposed) return;
+    balanceEl.textContent = '—';
+    quotaEl.innerHTML = `<span style="color:var(--text-light);font-size:12px">计费信息加载失败：${escapeHtml(err.message)}</span>`;
+    return;
+  }
+  if (disposed) return;
+
+  balanceEl.textContent = (me.balance / 100).toFixed(2);
+
+  const quotaRows = (me.quota?.writing || []).map(q => {
+    const pct = q.limit > 0 ? Math.min(100, Math.round(q.used / q.limit * 100)) : 100;
+    return `<div style="display:flex;align-items:center;gap:8px">
+      <span style="min-width:104px">${SERVICE_LABELS[q.service] || q.service}</span>
+      <div class="score-bar-track" style="flex:1;height:6px"><div class="score-bar-fill" style="width:${pct}%"></div></div>
+      <span style="font-variant-numeric:tabular-nums;color:var(--text-light)">${q.used}/${q.limit} 今日</span>
+    </div>`;
+  }).join('');
+  quotaEl.innerHTML = quotaRows || '<span style="color:var(--text-light);font-size:12px">暂无免费额度配置</span>';
+
+  const statusBadge = (s) => s === 'ok' ? '<span class="badge badge-completed">已计费</span>'
+    : s === 'free' ? '<span class="badge badge-pending">免费额度</span>'
+    : s === 'byok' ? '<span class="badge badge-new">自备 Key</span>'
+    : `<span class="badge badge-failed">${escapeHtml(s)}</span>`;
+  tbody.innerHTML = (me.recent_usage || []).map(u => `
+    <tr>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text-light);white-space:nowrap">${formatBeijingTime(u.created_at)}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${SERVICE_LABELS[u.service] || escapeHtml(u.service)}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums">${(u.points_charged / 100).toFixed(2)} 积分</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${statusBadge(u.status)}</td>
+    </tr>`).join('') || `<tr><td colspan="4" style="padding:12px 8px;color:var(--text-light)">暂无用量记录</td></tr>`;
+
+  const form = document.getElementById('billing-redeem-form');
+  if (form && !form.dataset.bound) {
+    form.dataset.bound = '1';
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('billing-code-input');
+      const btn = document.getElementById('billing-redeem-btn');
+      const code = input.value.trim();
+      if (!code) { toast('请输入兑换码', 'error'); return; }
+      btn.disabled = true; btn.textContent = '兑换中...';
+      try {
+        const res = await api.billing.redeem(code);
+        toast(`兑换成功，到账 ${(res.points / 100).toFixed(2)} 积分`, 'success');
+        input.value = '';
+        await initBillingSection();
+      } catch (err) {
+        toast(err.message, 'error');
+        btn.disabled = false; btn.textContent = '兑换';
+      }
+    });
+  }
+  const btnReset = document.getElementById('billing-redeem-btn');
+  if (btnReset) { btnReset.disabled = false; btnReset.textContent = '兑换'; }
 }
 
 // ============================================================

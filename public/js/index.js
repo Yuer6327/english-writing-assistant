@@ -2,7 +2,7 @@
 // index.js — 作文列表 + 新建作文（swup 管理：导出 init/cleanup）
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime, compressImageFile } from './api.js';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime, compressImageFile, gradeFor } from './api.js?v=20261025';
 
 let disposed = false;
 /** 新建表单暂存的题目图片（data URL） */
@@ -96,7 +96,9 @@ async function loadEssays() {
     return;
   }
 
-  el.innerHTML = data.essays.map(e => `
+  el.innerHTML = data.essays.map(e => {
+    const g = e.latest_score !== null ? gradeFor(e.latest_score) : null;
+    return `
     <div class="card" style="margin-bottom:12px;cursor:pointer" data-essay="${e.id}">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
         <div style="min-width:0">
@@ -108,12 +110,16 @@ async function loadEssays() {
         </div>
         <div style="text-align:right;flex-shrink:0">
           ${e.latest_score !== null
-            ? `<div style="font-size:22px;font-weight:700;color:var(--primary)">${e.latest_score}<small style="font-size:12px;color:var(--text-light)">/${25}</small></div>
-               <div style="font-size:11px;color:var(--text-light)">最新得分</div>`
+            ? `<div style="display:flex;align-items:center;gap:8px;justify-content:flex-end">
+                 <div style="font-size:22px;font-weight:700;color:var(--primary)">${e.latest_score}<small style="font-size:12px;color:var(--text-light)">/${25}</small></div>
+                 ${g ? `<span class="grade-badge grade-sm g-${g.grade}">${g.grade}</span>` : ''}
+               </div>
+               <div style="font-size:11px;color:var(--text-light)">最新得分${g ? ` · ${g.label}` : ''}</div>`
             : '<div style="font-size:12px;color:var(--text-light)">未批改</div>'}
         </div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   el.querySelectorAll('[data-essay]').forEach(card =>
     card.addEventListener('click', () => {

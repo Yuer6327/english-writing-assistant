@@ -4,11 +4,13 @@
 // ============================================================
 
 import { Hono } from 'hono';
-import type { Env, Vars, ApiConfig } from '../types';
+import type { Env, Vars } from '../types';
 import { authMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart } from '../utils/ai';
-import { getUserApiKey, getVisionConfig } from '../utils/api-config';
+import { getUserApiKey, getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
+import * as billing from '../utils/billing';
+import { tryAcquire, releaseSlot } from '../utils/inflight';
 import {
   GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock,
   FRAGMENT_POLISH_PROMPT, FULL_REWRITE_PROMPT,
@@ -24,6 +26,28 @@ const api = new Hono<{ Bindings: Env; Variables: Vars }>();
 const MAX_IMAGES = 3;
 const MAX_IMAGE_CHARS = 400_000;          // data URL 长度上限（约 300KB 二进制）
 const MAX_ESSAY_CHARS = 20_000;
+
+/** 图片 data URL 的粗略 token 估算（base64 约 4 字符 ≈ 1 token） */
+function estimateImageTokens(images: string[]): number {
+  return Math.ceil(images.join('').length / 4);
+}
+
+/** deepseek-flash 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大 */
+const maxOutputFor = (lane: Lane, base: number): number => (lane === 'deepseek' ? Math.max(base * 2, 8192) : base);
+
+/** billing 错误 → HTTP 响应（402 等直接透传，code 供前端分流） */
+function billingFail(err: unknown): { body: { error: string; code?: string }; status: number } {
+  if (err instanceof billing.BillingError) {
+    return { body: { error: err.message, code: err.code }, status: err.status };
+  }
+  console.error('[billing] 调用异常:', err instanceof Error ? err.message : err);
+  return { body: { error: '计费服务暂不可用，请稍后重试', code: 'billing_unavailable' }, status: 503 };
+}
+
+/** 车道 → 对外标签（前端显示与响应 lane 字段） */
+function laneLabel(lane: Lane): 'free' | 'paid' | 'byok' {
+  return lane === 'deepseek' ? 'paid' : lane;
+}
 
 /** 校验图片数组：每项必须是 data:image/ URL，数量/体积封顶 */
 function validImages(images: unknown): { ok: true; images: string[] } | { ok: false; error: string } {
@@ -308,6 +332,7 @@ api.delete('/drafts/:id', authMiddleware, async (c) => {
 api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
   const draftId = parseInt(c.req.param('id'));
+  const body = await c.req.json<{ model_id?: string }>().catch(() => ({}) as any);
 
   const draft = await c.env.DB.prepare(
     'SELECT * FROM drafts WHERE id = ? AND user_id = ?',
@@ -354,67 +379,122 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
       : '',
   });
 
-  // 题目带图 → 视觉通道（图画作文看图批改）；纯文本 → 主模型
-  let cfg: ApiConfig;
+  // 车道（body.model_id 可选；缺省 = 默认车道）与模型配置解析
+  const lane = await laneFromBody(c.env, userId, body.model_id);
+  let cfg: ResolvedConfig;
   let contentParts: ContentPart[] | undefined;
   try {
     if (topicImages.length) {
-      cfg = await getVisionConfig(c.env, userId);
+      cfg = await getVisionConfig(c.env, userId, lane);
       contentParts = [
         { type: 'text', text: filled },
         ...topicImages.map(url => ({ type: 'image_url', image_url: { url } })),
       ];
     } else {
-      cfg = await getUserApiKey(c.env, userId);
+      cfg = await resolveLane(c.env, userId, lane);
     }
   } catch (err) {
     const fail = aiConfigFail(err);
     return c.json(fail.body, fail.status);
   }
 
-  // 调用 + 校验 + 一次严格重试
-  let result = null as ReturnType<typeof sanitizeReview> | null;
-  let lastErr = '';
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const userPrompt = attempt === 0
-        ? filled
-        : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
-      const raw = await callAI(
-        cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, contentParts, 4096, 0.3);
-      result = sanitizeReview(extractJSON(raw), draft.text, !!prevReview);
-      break;
-    } catch (err: any) {
-      if (isAIRateLimitError(err)) {
-        return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+  // ── 预扣费（免费额度 → mode:'free'；BYOK → mode:'byok'；付费 → 冻结）──
+  const maxOutput = maxOutputFor(lane, 4096);
+  let holdInfo: billing.HoldInfo;
+  try {
+    holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
+      estInputTokens: Math.ceil(filled.length / 3) + estimateImageTokens(topicImages),
+      maxOutputTokens: maxOutput,
+    });
+  } catch (err) {
+    const fail = billingFail(err);
+    return c.json(fail.body, fail.status as 402);
+  }
+
+  // heavy 并发锁：同用户在飞 1 笔（仅预扣费档占用）
+  if (holdInfo.mode === 'hold' && !tryAcquire(userId)) {
+    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    return c.json({ error: '已有批改任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
+  }
+  const locked = holdInfo.mode === 'hold';
+
+  let settled = false;
+  let charged = 0;
+  try {
+    // 调用 + 校验 + 一次严格重试
+    let result = null as ReturnType<typeof sanitizeReview> | null;
+    let lastErr = '';
+    let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const userPrompt = attempt === 0
+          ? filled
+          : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
+        const raw = await callAI(
+          cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, contentParts, maxOutput, 0.3);
+        lastUsage = raw.usage;
+        result = sanitizeReview(extractJSON(raw.content), draft.text, !!prevReview);
+        break;
+      } catch (err: any) {
+        if (isAIRateLimitError(err)) {
+          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+        }
+        lastErr = err?.message ?? String(err);
+        console.error(`[review] 第 ${attempt + 1} 次尝试失败: ${lastErr}`);
       }
-      lastErr = err?.message ?? String(err);
-      console.error(`[review] 第 ${attempt + 1} 次尝试失败: ${lastErr}`);
     }
+    if (!result) {
+      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      return c.json({ error: '批改失败：AI 返回格式不符合要求', details: lastErr.slice(0, 300) }, 502);
+    }
+
+    // 结算（实际成本，多退少补；settle 失败不阻塞结果返回，未结算的 hold 由 cron 过期释放兜底）
+    if (holdInfo.mode === 'hold') {
+      try {
+        const s = await billing.settle(c.env, holdInfo.holdId!, {
+          promptTokens: lastUsage?.prompt_tokens,
+          completionTokens: lastUsage?.completion_tokens,
+        });
+        charged = s.charged;
+        settled = true;
+      } catch (err) {
+        console.error('[review] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    // improvement 分差兜底：以真实分差覆盖
+    if (result.improvement && prevReview) {
+      result.improvement.score_delta = result.score - prevReview.score;
+    }
+
+    const model = cfg.provider === 'agnes' ? `${cfg.model}（免费通道）`
+      : cfg.provider === 'deepseek' ? `${cfg.model}（按量计费）` : cfg.model;
+    const insert = await c.env.DB.prepare(
+      `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, draft.text).run();
+
+    await c.env.DB.prepare("UPDATE essays SET updated_at = datetime('now') WHERE id = ?").bind(draft.essay_id).run();
+
+    return c.json({
+      review_id: insert.meta.last_row_id as number,
+      prompt_source: promptSource,
+      model,
+      result,
+      points_charged: charged,          // 分（前端 ÷100 展示）
+      lane: laneLabel(lane),            // free / paid / byok
+    });
+  } catch (err: any) {
+    // 外层兜底：任何未结算的意外失败都释放预扣
+    if (holdInfo.mode === 'hold' && !settled) {
+      await billing.releaseQuietly(c.env, holdInfo.holdId);
+    }
+    console.error('[review] 未预期失败:', err?.message ?? err);
+    return c.json({ error: friendlyAIError(err) }, 502);
+  } finally {
+    if (locked) releaseSlot(userId);
   }
-  if (!result) {
-    return c.json({ error: '批改失败：AI 返回格式不符合要求', details: lastErr.slice(0, 300) }, 502);
-  }
-
-  // improvement 分差兜底：以真实分差覆盖
-  if (result.improvement && prevReview) {
-    result.improvement.score_delta = result.score - prevReview.score;
-  }
-
-  const model = cfg.provider === 'agnes' ? `${cfg.model}（免费通道）` : cfg.model;
-  const insert = await c.env.DB.prepare(
-    `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, draft.text).run();
-
-  await c.env.DB.prepare("UPDATE essays SET updated_at = datetime('now') WHERE id = ?").bind(draft.essay_id).run();
-
-  return c.json({
-    review_id: insert.meta.last_row_id as number,
-    prompt_source: promptSource,
-    model,
-    result,
-  });
 });
 
 // ============================================================
@@ -425,7 +505,7 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
   const essayId = parseInt(c.req.param('id'));
   const body = await c.req.json<{
-    mode?: string; fragment?: string; instruction?: string; draft_id?: number;
+    mode?: string; fragment?: string; instruction?: string; draft_id?: number; model_id?: string;
   }>().catch(() => ({}) as any);
 
   const essay = await c.env.DB.prepare(
@@ -451,16 +531,43 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
     if (d) { contextDraftId = d.id; contextText = d.text; }
   }
 
-  let cfg: ApiConfig;
+  const lane = await laneFromBody(c.env, userId, body.model_id);
+  let cfg: ResolvedConfig;
   try {
-    cfg = await getUserApiKey(c.env, userId);
+    cfg = await resolveLane(c.env, userId, lane);
   } catch (err) {
     const fail = aiConfigFail(err);
     return c.json(fail.body, fail.status);
   }
 
+  const isFragment = body.mode === 'fragment';
+  const maxOutput = maxOutputFor(lane, isFragment ? 3000 : 4096);
+
+  // ── 预扣费（片段 / 全文输出上限）──
+  let holdInfo: billing.HoldInfo;
   try {
-    if (body.mode === 'fragment') {
+    const estBase = isFragment
+      ? Math.ceil((essay.topic_text.length + (contextText || '').length + (body.fragment || '').length) / 3)
+      : Math.ceil((essay.topic_text.length + (contextText || '').length) / 3);
+    holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
+      estInputTokens: estBase,
+      maxOutputTokens: maxOutput,
+    });
+  } catch (err) {
+    const fail = billingFail(err);
+    return c.json(fail.body, fail.status as 402);
+  }
+
+  if (holdInfo.mode === 'hold' && !tryAcquire(userId)) {
+    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
+  }
+  const locked = holdInfo.mode === 'hold';
+
+  let settled = false;
+  let charged = 0;
+  try {
+    if (isFragment) {
       // ── 片段精修 ──
       const fragment = (body.fragment || '').trim();
       if (fragment.length < 3) return c.json({ error: '选中的片段过短' }, 400);
@@ -476,30 +583,57 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
 
       let parsedResult = null as ReturnType<typeof sanitizeFragmentPolish> | null;
       let lastErr = '';
+      let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const userPrompt = attempt === 0
             ? filled
             : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}），请严格按 JSON 格式输出。`;
-          const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, 3000, 0.4);
-          parsedResult = sanitizeFragmentPolish(extractJSON(raw));
+          const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4);
+          lastUsage = raw.usage;
+          parsedResult = sanitizeFragmentPolish(extractJSON(raw.content));
           break;
         } catch (err: any) {
-          if (isAIRateLimitError(err)) return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+          if (isAIRateLimitError(err)) {
+            await billing.releaseQuietly(c.env, holdInfo.holdId);
+            return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+          }
           lastErr = err?.message ?? String(err);
         }
       }
-      if (!parsedResult) throw new Error(lastErr || '精修失败');
+      if (!parsedResult) {
+        await billing.releaseQuietly(c.env, holdInfo.holdId);
+        throw new Error(lastErr || '精修失败');
+      }
+
+      if (holdInfo.mode === 'hold') {
+        try {
+          const s = await billing.settle(c.env, holdInfo.holdId!, {
+            promptTokens: lastUsage?.prompt_tokens,
+            completionTokens: lastUsage?.completion_tokens,
+          });
+          charged = s.charged;
+          settled = true;
+        } catch (err) {
+          console.error('[polish] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
+        }
+      }
 
       const insert = await c.env.DB.prepare(
         `INSERT INTO polishes (essay_id, draft_id, user_id, mode, fragment, instruction, result)
          VALUES (?, ?, ?, 'fragment', ?, ?, ?)`,
       ).bind(essayId, contextDraftId, userId, fragment, instruction, JSON.stringify(parsedResult)).run();
-      return c.json({ polish_id: insert.meta.last_row_id as number, mode: 'fragment', result: parsedResult });
+      return c.json({
+        polish_id: insert.meta.last_row_id as number, mode: 'fragment', result: parsedResult,
+        points_charged: charged, lane: laneLabel(lane),
+      });
     }
 
     // ── 全文润色 ──
-    if (!contextText) return c.json({ error: '该作文还没有稿件，无法润色' }, 400);
+    if (!contextText) {
+      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      return c.json({ error: '该作文还没有稿件，无法润色' }, 400);
+    }
     const filled = fillTemplate(FULL_REWRITE_PROMPT, {
       topic: essay.topic_text.slice(0, 2000),
       essay: contextText,
@@ -508,28 +642,57 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
 
     let parsedResult = null as ReturnType<typeof sanitizeFullRewrite> | null;
     let lastErr = '';
+    let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const userPrompt = attempt === 0
           ? filled
           : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}），请严格按 JSON 格式输出。`;
-        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, 4096, 0.4);
-        parsedResult = sanitizeFullRewrite(extractJSON(raw), contextText);
+        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4);
+        lastUsage = raw.usage;
+        parsedResult = sanitizeFullRewrite(extractJSON(raw.content), contextText);
         break;
       } catch (err: any) {
-        if (isAIRateLimitError(err)) return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+        if (isAIRateLimitError(err)) {
+          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
+        }
         lastErr = err?.message ?? String(err);
       }
     }
-    if (!parsedResult) throw new Error(lastErr || '润色失败');
+    if (!parsedResult) {
+      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      throw new Error(lastErr || '润色失败');
+    }
+
+    if (holdInfo.mode === 'hold') {
+      try {
+        const s = await billing.settle(c.env, holdInfo.holdId!, {
+          promptTokens: lastUsage?.prompt_tokens,
+          completionTokens: lastUsage?.completion_tokens,
+        });
+        charged = s.charged;
+        settled = true;
+      } catch (err) {
+        console.error('[polish] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
+      }
+    }
 
     const insert = await c.env.DB.prepare(
       `INSERT INTO polishes (essay_id, draft_id, user_id, mode, fragment, instruction, result)
        VALUES (?, ?, ?, 'full', NULL, NULL, ?)`,
     ).bind(essayId, contextDraftId, userId, JSON.stringify(parsedResult)).run();
-    return c.json({ polish_id: insert.meta.last_row_id as number, mode: 'full', result: parsedResult });
+    return c.json({
+      polish_id: insert.meta.last_row_id as number, mode: 'full', result: parsedResult,
+      points_charged: charged, lane: laneLabel(lane),
+    });
   } catch (err: any) {
+    if (holdInfo.mode === 'hold' && !settled) {
+      await billing.releaseQuietly(c.env, holdInfo.holdId);
+    }
     return c.json({ error: friendlyAIError(err) }, 502);
+  } finally {
+    if (locked) releaseSlot(userId);
   }
 });
 

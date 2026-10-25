@@ -7,6 +7,7 @@
 
 import { createMiddleware } from 'hono/factory';
 import type { Env, Vars } from '../types';
+import { BillingError } from './billing';
 
 interface Bucket {
   timestamps: number[]; // 窗口内的请求时间戳（ms）
@@ -55,29 +56,16 @@ export function clientIp(c: { req: { header(name: string): string | undefined } 
 
 // ── AI 调用限流（挂在 authMiddleware 之后）──
 // Agnes 公用免费档 RPM 20（整把共享密钥共用，不是每用户 20）。
-// 按用户 18/分钟 拦住突发；全局 18/分钟 拦住多用户叠加打爆共享额度。
-// BYOK 用户不吃全局桶（走自己的 Key）。
+// 用户级 18/分钟 对所有用户生效（防单账户突发）；
+// 全局 18/分钟（agnesGlobalRateHit，挂在 api-config 免费车道解析路径）拦住多用户叠加打爆共享额度。
 const AI_USER_RPM = 18;
 const AI_GLOBAL_RPM = 18;
 const AI_WINDOW_MS = 60 * 1000;
 
 export const aiRateLimit = createMiddleware<{ Bindings: Env; Variables: Vars }>(async (c, next) => {
   const userId = c.get('userId');
-  // 仅 Agnes 用户吃 RPM；BYOK / 未配 Key 不拦（OCR 等也不该吃 Agnes 桶）
-  try {
-    const row = await c.env.DB.prepare(
-      'SELECT provider FROM api_keys WHERE user_id = ? ORDER BY id DESC LIMIT 1',
-    ).bind(userId).first<{ provider: string }>();
-    if (row?.provider !== 'agnes') {
-      await next();
-      return;
-    }
-  } catch {
-    await next();
-    return;
-  }
   if (rateLimitHit(`ai:user:${userId}`, AI_USER_RPM, AI_WINDOW_MS)) {
-    return c.json({ error: 'AI 调用过于频繁，请约 1 分钟后再试（免费档每分钟约 20 次）' }, 429);
+    return c.json({ error: 'AI 调用过于频繁，请约 1 分钟后再试（每分钟约 20 次）' }, 429);
   }
   await next();
 });
@@ -100,8 +88,11 @@ export function isAgnesRateLimitError(err: unknown): boolean {
   return /每分钟约 20|rate limit|RPM/i.test(msg) || /\b429\b/.test(msg);
 }
 
-/** getUserApiKey 失败时的 HTTP 响应：限流 429，其余 500 */
-export function aiConfigFail(err: unknown): { body: { error: string; details?: string }; status: 429 | 500 } {
+/** getUserApiKey/resolveLane 失败时的 HTTP 响应：BillingError 原样透传（409/404/503…），限流 429，其余 500 */
+export function aiConfigFail(err: unknown): { body: { error: string; code?: string; details?: string }; status: 400 | 402 | 404 | 409 | 429 | 500 | 503 } {
+  if (err instanceof BillingError) {
+    return { body: { error: err.message, code: err.code }, status: err.status as 409 };
+  }
   if (isAgnesRateLimitError(err)) {
     const msg = err instanceof Error ? err.message : '免费 API 调用过于频繁，请稍后再试';
     return { body: { error: msg }, status: 429 };

@@ -1,88 +1,88 @@
 // ============================================================
-// api-config.ts — AI 提供方配置解析（BYOK + Agnes 免费层）
-// 复用自 english-reading-assistant 的 articles.ts，扩展了可选视觉模型列。
+// api-config.ts — AI 提供方配置解析（经 billing 平台）
+// BYOK 凭证与上游密钥均已上收 yuer-billing（加密存储、跨项目复用）；
+// 本文件只负责：车道选择（free/deepseek/byok）→ 经 Service Binding
+// 取明文配置（仅内网），并保留 Agnes 全局共享额度的限流闸门。
+// 旧实现（直查 essay api_keys 表）已在 BYOK 迁移后废弃，原表保留作历史备份。
 // ============================================================
 
 import type { Env, ApiConfig } from '../types';
-import { encryptApiKey, decryptApiKey } from './crypto';
 import { agnesGlobalRateHit, AgnesRateLimitError } from './rate-limit';
+import * as billing from './billing';
 
-// ── 公用免费 API（Agnes）──
-// 双官方端点（中国大陆优先）；agnes-3.0-flash 原生支持图像 URL 输入，
-// 手写 OCR 与看图批改对免费用户开箱即用。
+// ── 公用免费 API（Agnes）——常量保留（前端展示用）──
 export const AGNES_BASE_URLS = [
   'https://apihub.agnes-ai.cn/v1',   // 中国大陆（Workers 出网实际能通）
   'https://apihub.agnes-ai.com/v1',  // 国际
 ];
-const AGNES_BASE_URL = AGNES_BASE_URLS[0]; // 存入 DB 的主端点（展示用）
 export const AGNES_MODEL = 'agnes-3.0-flash';
 
-interface ApiKeyRow {
-  encrypted_key: string;
-  api_base_url: string;
-  model_name: string;
-  vision_api_base_url: string | null;
-  vision_model_name: string | null;
-  vision_encrypted_key: string | null;
-  provider: string;
+/** 用户可选车道（前端模型选择器的值 → billing 服务档位） */
+export type Lane = 'free' | 'deepseek' | 'byok';
+
+export const LANE_SERVICE: Record<Lane, string> = {
+  free: 'llm:agnes-flash',
+  deepseek: 'llm:deepseek-flash',
+  byok: 'byok',
+};
+
+/** 解析后的配置：ApiConfig + 计费所需的服务档位 id */
+export interface ResolvedConfig extends ApiConfig {
+  /** billing 服务档位（hold/settle 用）；byok 视觉模型解析后仍为 'byok' */
+  serviceId: string;
+  /** 归一化后的车道（'deepseek' 对外显示为积分档） */
+  lane: Lane;
 }
 
-async function readRow(env: Env, userId: string): Promise<ApiKeyRow | null> {
-  return env.DB.prepare(
-    `SELECT encrypted_key, api_base_url, model_name,
-            vision_api_base_url, vision_model_name, vision_encrypted_key, provider
-     FROM api_keys WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
-  ).bind(userId).first<ApiKeyRow>();
-}
-
-async function toConfig(env: Env, row: ApiKeyRow): Promise<ApiConfig> {
-  if (row.provider === 'agnes') {
-    if (!env.AGNES_API_KEY) {
-      throw new Error('Agnes 公用免费 API 未配置（缺少 AGNES_API_KEY Secret）');
-    }
-    if (agnesGlobalRateHit()) {
-      throw new AgnesRateLimitError();
-    }
-    return { provider: 'agnes', key: env.AGNES_API_KEY, baseUrl: AGNES_BASE_URLS, model: AGNES_MODEL };
+/** 用户默认车道（未显式选择时）：已配置 BYOK → byok，否则免费档（与历史行为一致） */
+export async function defaultLane(env: Env, userId: string): Promise<Lane> {
+  try {
+    const st = await billing.byokStatus(env, userId);
+    return st.configured ? 'byok' : 'free';
+  } catch (err) {
+    // billing 不可用时按免费档走（后续 config 解析会给出明确错误）
+    console.error('[api-config] byokStatus 失败，默认免费档:', err instanceof Error ? err.message : err);
+    return 'free';
   }
-  const plainKey = await decryptApiKey(row.encrypted_key, env.ENCRYPTION_KEY);
-  return { provider: 'byok', key: plainKey, baseUrl: row.api_base_url, model: row.model_name };
 }
 
-/** 主模型配置（未配置任何 Key 时回退 Agnes 免费层） */
-export async function getUserApiKey(env: Env, userId: string): Promise<ApiConfig> {
-  const row = await readRow(env, userId);
-  if (!row) {
-    // 未配置：默认免费通道（与兄弟项目一致的行为）
-    if (!env.AGNES_API_KEY) {
-      throw new Error('尚未配置 AI 服务：请到「设置」绑定 API Key，或联系管理员开启免费通道');
-    }
-    if (agnesGlobalRateHit()) throw new AgnesRateLimitError();
-    return { provider: 'agnes', key: env.AGNES_API_KEY, baseUrl: AGNES_BASE_URLS, model: AGNES_MODEL };
-  }
-  return toConfig(env, row);
+/** 按显式车道解析模型配置（路由层用） */
+export async function resolveLane(env: Env, userId: string, lane: Lane): Promise<ResolvedConfig> {
+  // Agnes 全局共享额度闸门：只拦免费车道（BYOK / 付费档不吃共享桶）
+  if (lane === 'free' && agnesGlobalRateHit()) throw new AgnesRateLimitError();
+  const serviceId = LANE_SERVICE[lane];
+  const cfg = await billing.config(env, userId, serviceId);
+  return {
+    provider: cfg.provider,
+    key: cfg.key,
+    baseUrl: cfg.baseUrl,
+    model: cfg.model,
+    vision: cfg.vision ?? null,
+    serviceId,
+    lane,
+  };
+}
+
+function normalizeLane(v: string | undefined | null): Lane | null {
+  return v === 'free' || v === 'deepseek' || v === 'byok' ? v : null;
+}
+
+/** 请求体里的 model_id → 车道（非法/缺省 → 用户默认车道） */
+export async function laneFromBody(env: Env, userId: string, modelId: unknown): Promise<Lane> {
+  return normalizeLane(typeof modelId === 'string' ? modelId : null) ?? defaultLane(env, userId);
+}
+
+/** 主模型配置（兼容旧调用：未显式选择车道时用默认车道） */
+export async function getUserApiKey(env: Env, userId: string): Promise<ResolvedConfig> {
+  return resolveLane(env, userId, await defaultLane(env, userId));
 }
 
 /** 视觉模型配置：BYOK 单独配置了视觉模型则用之，否则与主模型相同（含 Agnes，原生支持图片） */
-export async function getVisionConfig(env: Env, userId: string): Promise<ApiConfig> {
-  const row = await readRow(env, userId);
-  if (!row) {
-    if (!env.AGNES_API_KEY) {
-      throw new Error('尚未配置 AI 服务：请到「设置」绑定 API Key，或联系管理员开启免费通道');
-    }
-    if (agnesGlobalRateHit()) throw new AgnesRateLimitError();
-    return { provider: 'agnes', key: env.AGNES_API_KEY, baseUrl: AGNES_BASE_URLS, model: AGNES_MODEL };
+export async function getVisionConfig(env: Env, userId: string, lane?: Lane): Promise<ResolvedConfig> {
+  const resolvedLane = lane ?? (await defaultLane(env, userId));
+  const cfg = await resolveLane(env, userId, resolvedLane);
+  if (cfg.provider === 'byok' && cfg.vision?.model) {
+    return { ...cfg, key: cfg.vision.key, baseUrl: cfg.vision.baseUrl, model: cfg.vision.model };
   }
-  if (row.provider === 'byok' && row.vision_model_name?.trim()) {
-    const key = row.vision_encrypted_key
-      ? await decryptApiKey(row.vision_encrypted_key, env.ENCRYPTION_KEY)
-      : await decryptApiKey(row.encrypted_key, env.ENCRYPTION_KEY);
-    return {
-      provider: 'byok',
-      key,
-      baseUrl: row.vision_api_base_url?.trim() || row.api_base_url,
-      model: row.vision_model_name.trim(),
-    };
-  }
-  return toConfig(env, row);
+  return cfg;
 }
