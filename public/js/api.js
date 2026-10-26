@@ -162,20 +162,39 @@ export function toast(message, type = 'info') {
 }
 
 // ── 会话 ──
+// 会话在页面生命周期内只取一次并缓存：
+//   1. 导航栏注入与页面 init 会同时要会话，缓存后只发一个请求；
+//   2. 更重要——游客首次访问时若并发两个请求，服务端会各发一个新 wg cookie，
+//      页面拿着 A 的会话却带着 B 的 cookie，数据就对不上了。
+//   （登录/退出都会整页跳转，缓存不会过期；需要强制刷新用 getSession(true)）
+let sessionCache = null;
+let sessionPromise = null;
+
 /** 会话探测（不跳转）：登录返回 logged_in:true，游客返回 logged_in:false + quota */
-export async function getSession() {
-  try {
-    return await api.me();
-  } catch (err) {
-    if (err.status === 401) return { logged_in: false };
-    toast(`无法验证登录状态：${err.message}`, 'error');
-    return null;
-  }
+export function getSession(force = false) {
+  if (!force && sessionCache) return Promise.resolve(sessionCache);
+  if (!force && sessionPromise) return sessionPromise;
+  sessionPromise = (async () => {
+    try {
+      sessionCache = await api.me();
+      return sessionCache;
+    } catch (err) {
+      if (err.status === 401) {
+        sessionCache = { logged_in: false };
+        return sessionCache;
+      }
+      toast(`无法验证登录状态：${err.message}`, 'error');
+      return null;
+    } finally {
+      sessionPromise = null;
+    }
+  })();
+  return sessionPromise;
 }
 
 /** 需要登录的页面用：未登录直接跳统一认证（游客访问设置/管理页） */
 export async function requireAuth() {
-  const session = await getSession();
+  const session = await getSession(true);
   if (!session) return null;
   if (session.logged_in) return session;
   gotoAuth('login');

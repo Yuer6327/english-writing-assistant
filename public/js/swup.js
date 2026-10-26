@@ -262,6 +262,9 @@ async function injectNavbarSession() {
 }
 
 (async function bootstrap() {
+  // 会话与页面数据并行：导航栏的登录态/余额不必等作文列表加载完
+  // （getSession 有缓存，和页面 init 复用同一个请求）
+  injectNavbarSession();
   try {
     await loadCurrentPage();
   } catch (err) {
@@ -269,6 +272,5 @@ async function injectNavbarSession() {
   }
   highlightNav(currentPath);
   setupLogout();
-  injectNavbarSession();   // 后台拉取，不阻塞首屏
   ready = true;
 })();
