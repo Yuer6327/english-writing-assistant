@@ -10,12 +10,13 @@
 
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
-import { authMiddleware } from '../middleware/auth';
+import { userMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError } from '../utils/ai';
 import { getVisionConfig, defaultLane, type Lane } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
+import { checkGuestOcrGate, recordSuccess } from '../utils/quota';
 import { OCR_VLM_PROMPT } from '../utils/prompts';
 import { sanitizeOcrVlm } from '../utils/validate';
 import { baiduOcr, BAIDU_ENDPOINT_LABELS } from '../utils/baidu-ocr';
@@ -35,14 +36,19 @@ function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: fa
   return { ok: true, base64 };
 }
 
-ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
+ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
   const body = await c.req.json<{ images?: string[]; mode?: string }>().catch(() => ({}) as any);
   const images = Array.isArray(body.images) ? body.images : [];
   if (images.length === 0) return c.json({ error: '请至少上传一张图片' }, 400);
   if (images.length > MAX_IMAGES) return c.json({ error: `图片最多 ${MAX_IMAGES} 张` }, 400);
 
   const mode = body.mode === 'baidu' ? 'baidu' : 'vlm';
+
+  // 游客：仅百度通道、每天 3 次；大模型视觉识别需要登录
+  const ocrGate = await checkGuestOcrGate(c.env.DB, userId, isGuest, mode);
+  if (!ocrGate.ok) return c.json({ error: ocrGate.error, code: ocrGate.code }, ocrGate.status);
 
   // ── 百度 OCR（按次计费：每日 5 次免费额度，超出按 images 数预扣）──
   if (mode === 'baidu') {
@@ -62,14 +68,17 @@ ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
       parsedImages.push(parsed.base64);
     }
 
-    let holdInfo: billing.HoldInfo;
-    try {
-      holdInfo = await billing.hold(c.env, userId, 'writing', 'ocr:baidu', { calls: images.length });
-    } catch (err) {
-      if (err instanceof billing.BillingError) {
-        return c.json({ error: err.message, code: err.code }, err.status as 402);
+    // 游客不经过 billing（没有钱包/免费额度记录），只受本地次数门禁约束
+    let holdInfo: billing.HoldInfo = { mode: 'free' };
+    if (!isGuest) {
+      try {
+        holdInfo = await billing.hold(c.env, userId, 'writing', 'ocr:baidu', { calls: images.length });
+      } catch (err) {
+        if (err instanceof billing.BillingError) {
+          return c.json({ error: err.message, code: err.code }, err.status as 402);
+        }
+        return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
       }
-      return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
     }
 
     let settled = false;
@@ -86,6 +95,9 @@ ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
         await billing.releaseQuietly(c.env, holdInfo.holdId);
         return c.json({ error: '未识别到文字，请确认图片清晰或更换图片' }, 422);
       }
+
+      // 游客识别次数（成功才计数，与批改同口径）
+      if (isGuest) await recordSuccess(c.env.DB, userId, 'ocr');
 
       if (holdInfo.mode === 'hold') {
         try {
@@ -146,6 +158,7 @@ ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       estInputTokens: Math.ceil(OCR_VLM_PROMPT.length / 3) + Math.ceil(images.join('').length / 4),
       maxOutputTokens: maxOutput,
+      skipQuota: vlmLane === 'free',
     });
   } catch (err) {
     if (err instanceof billing.BillingError) {
@@ -154,11 +167,11 @@ ocr.post('/', authMiddleware, aiRateLimit, async (c) => {
     return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
   }
 
-  if (holdInfo.mode === 'hold' && !tryAcquire(userId)) {
+  if (holdInfo.mode !== 'byok' && !tryAcquire(userId)) {
     await billing.releaseQuietly(c.env, holdInfo.holdId);
     return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
-  const locked = holdInfo.mode === 'hold';
+  const locked = holdInfo.mode !== 'byok';
 
   const contentParts = [
     { type: 'text', text: OCR_VLM_PROMPT },

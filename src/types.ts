@@ -24,12 +24,15 @@ export interface Env {
   ENABLE_DEV_SESSION?: string;
 }
 
-/** Hono 上下文变量（userId 为统一认证平台的用户 id，UUID 字符串） */
+/** Hono 上下文变量（userId 为统一认证平台的用户 id，UUID 字符串；
+ *  游客为 'guest:<设备 cookie id>'） */
 export interface Vars {
   userId: string;
   username: string;
   /** 认证平台用户角色（'admin' 等，权限判定用；与计费标签组无关） */
   role: string;
+  /** true = 未登录的游客会话（每日 3 次批改 + 一篇三稿限制） */
+  isGuest: boolean;
 }
 
 // ── 业务类型 ──

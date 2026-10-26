@@ -219,6 +219,19 @@ a.card-link:active,
 .card.card-link:active { transform: translateY(1px); }
 a.card-link { display: block; color: inherit; }
 
+/* ===== 会话横幅（游客试用 / 每日额度）===== */
+.session-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 10px 14px; margin-bottom: 18px;
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--bg-soft);
+  font-size: 12px; color: var(--text-soft);
+}
+.session-bar .session-who { font-weight: 600; color: var(--text); font-size: 13px; }
+.session-bar .btn { margin-left: auto; }
+.session-bar.session-guest { border-color: rgba(48,86,211,.35); background: var(--primary-soft); }
+.session-bar.session-guest .session-who { color: var(--primary); }
+
 /* ===== 表单 ===== */
 .form-group { margin-bottom: 16px; }
 .form-label {

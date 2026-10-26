@@ -206,38 +206,57 @@ window.addEventListener('popstate', async () => {
 });
 
 // ── 初始化 ──
-import { api } from './api.js?v=20261026b';
+import { getSession, loginHref } from './api.js?v=20261026c';
 
-// ── 导航栏余额 pill + 管理链接（navbar 持久化，查重防重复追加；本模块全站常驻）──
+// ── 导航栏会话态（navbar 持久化，查重防重复追加；本模块全站常驻）──
+//   登录：余额 pill + 管理链接（admin）
+//   游客：隐藏「设置/退出」，露出「登录」
 const PILL_ID = 'nav-balance-pill';
 const ADMIN_LINK_ID = 'nav-admin-link';
+const LOGIN_LINK_ID = 'nav-login-link';
 
-async function injectNavbarBilling() {
+async function injectNavbarSession() {
   const right = document.querySelector('.navbar-right');
   if (!right) return;
-  let me = null;
-  try {
-    me = await api.me();
-  } catch { return; }
-  if (!me) return;
+  const session = await getSession();
+  if (!session) return;
 
-  if (typeof me.wallet?.balance === 'number' && !document.getElementById(PILL_ID)) {
+  const settingsLink = right.querySelector('a[href="/settings.html"]');
+  const logoutLink = document.getElementById('logout-btn');
+
+  if (!session.logged_in) {
+    if (settingsLink) settingsLink.style.display = 'none';
+    if (logoutLink) logoutLink.style.display = 'none';
+    if (!document.getElementById(LOGIN_LINK_ID)) {
+      const a = document.createElement('a');
+      a.id = LOGIN_LINK_ID;
+      a.href = loginHref();
+      a.textContent = '登录';
+      a.style.fontWeight = '600';
+      a.setAttribute('rel', 'nofollow');
+      right.appendChild(a);
+    }
+    return;
+  }
+
+  if (settingsLink) settingsLink.style.display = '';
+  if (logoutLink) logoutLink.style.display = '';
+
+  if (typeof session.wallet?.balance === 'number' && !document.getElementById(PILL_ID)) {
     const pill = document.createElement('a');
     pill.id = PILL_ID;
     pill.className = 'badge badge-completed';
     pill.href = '/settings.html#billing';
     pill.style.cssText = 'font-variant-numeric:tabular-nums;text-decoration:none';
-    pill.textContent = `${(me.wallet.balance / 100).toFixed(2)} 积分`;
-    const settingsLink = right.querySelector('a[href="/settings.html"]');
+    pill.textContent = `${(session.wallet.balance / 100).toFixed(2)} 积分`;
     right.insertBefore(pill, settingsLink || right.lastElementChild);
   }
-  if (me.role === 'admin' && !document.getElementById(ADMIN_LINK_ID)) {
+  if (session.role === 'admin' && !document.getElementById(ADMIN_LINK_ID)) {
     const a = document.createElement('a');
     a.id = ADMIN_LINK_ID;
     a.href = '/admin.html';
     a.setAttribute('data-nav', '');
     a.textContent = '管理';
-    const settingsLink = right.querySelector('a[href="/settings.html"]');
     right.insertBefore(a, settingsLink);
   }
 }
@@ -250,6 +269,6 @@ async function injectNavbarBilling() {
   }
   highlightNav(currentPath);
   setupLogout();
-  injectNavbarBilling();   // 后台拉取，不阻塞首屏
+  injectNavbarSession();   // 后台拉取，不阻塞首屏
   ready = true;
 })();

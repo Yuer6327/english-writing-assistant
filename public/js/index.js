@@ -1,29 +1,82 @@
 // ============================================================
 // index.js — 作文列表 + 新建作文（swup 管理：导出 init/cleanup）
+// 游客（未登录）也能用：每天 1 篇、一稿/二稿/三稿，共 3 次成功批改。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime, compressImageFile, gradeFor } from './api.js?v=20261026b';
+import {
+  api, toast, getSession, loginHref, escapeHtml, formatBeijingTime, compressImageFile, gradeFor,
+} from './api.js?v=20261026c';
 
 let generation = 0;
 /** 新建表单暂存的题目图片（data URL） */
 let topicImages = [];
 let compressionPending = false;
 let createPending = false;
+let session = null;
 
 export function cleanup() {
   generation++;
   topicImages = [];
   compressionPending = false;
   createPending = false;
+  session = null;
 }
 
 export async function init() {
   const gen = ++generation;
-  const user = await requireAuth();
-  if (!user || gen !== generation) return;
+  // 不跳登录：游客同样进入工作流，额度由服务端按「成功批改」计数
+  session = await getSession();
+  if (!session || gen !== generation) return;
 
+  renderBanner();
   bindCreateForm(gen);
   await loadEssays(gen);
+}
+
+// ── 会话横幅：游客额度 / 登录态额度 ──
+function quotaChips(quota) {
+  if (!quota) return '';
+  if (quota.scope === 'guest') {
+    return `<span class="chip accent">今日剩余 ${quota.remaining}/${quota.limit} 次批改</span>
+      <span class="chip">每天 ${quota.essay_limit} 篇</span>
+      <span class="chip">一稿 · 二稿 · 三稿</span>`;
+  }
+  return `<span class="chip accent">今日剩余 ${quota.remaining}/${quota.limit} 次免费批改</span>
+    <span class="chip">付费通道不计次</span>`;
+}
+
+function renderBanner() {
+  const el = document.getElementById('session-banner');
+  if (!el) return;
+  if (session.logged_in) {
+    el.innerHTML = `<div class="session-bar"><span class="session-who">${escapeHtml(session.username || '')}</span>${quotaChips(session.quota)}</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="session-bar session-guest">
+    <span class="session-who">游客试用</span>
+    ${quotaChips(session.quota)}
+    <a class="btn btn-primary btn-sm" href="${loginHref()}" rel="nofollow">登录（每天 10 次）</a>
+  </div>`;
+}
+
+/** 游客今天已经建过作文 → 禁用新建表单（服务端同样会拒） */
+function syncCreateAvailability() {
+  const form = document.getElementById('create-essay-form');
+  if (!form || !session) return;
+  const submitBtn = form.querySelector('button[type=submit]');
+  if (!submitBtn) return;
+  if (compressionPending || createPending) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = compressionPending ? '图片处理中...' : '创建中...';
+    return;
+  }
+  const quota = session.quota;
+  const blocked = !session.logged_in && quota && quota.essay_limit !== null
+    && (quota.essay_used || 0) >= quota.essay_limit;
+  submitBtn.disabled = blocked;
+  submitBtn.textContent = blocked
+    ? '游客今天这篇已经建好了 · 登录后不限篇数'
+    : '创建并进入工作台';
 }
 
 // ── 新建作文 ──
@@ -31,11 +84,6 @@ function bindCreateForm(gen) {
   const form = document.getElementById('create-essay-form');
   const fileInput = document.getElementById('new-topic-images');
   const thumbs = document.getElementById('new-topic-thumbs');
-  const submitBtn = form.querySelector('button[type=submit]');
-  const syncSubmit = () => {
-    submitBtn.disabled = compressionPending || createPending;
-    submitBtn.textContent = compressionPending ? '图片处理中...' : createPending ? '创建中...' : '创建并进入工作台';
-  };
 
   fileInput.addEventListener('change', async () => {
     const available = 3 - topicImages.length;
@@ -47,7 +95,7 @@ function bindCreateForm(gen) {
 
     compressionPending = true;
     fileInput.disabled = true;
-    syncSubmit();
+    syncCreateAvailability();
     const results = await Promise.allSettled(files.map(f => compressImageFile(f)));
     if (gen !== generation) return;
     for (const result of results) {
@@ -57,7 +105,7 @@ function bindCreateForm(gen) {
     compressionPending = false;
     fileInput.disabled = false;
     renderThumbs(thumbs);
-    syncSubmit();
+    syncCreateAvailability();
   });
 
   form.addEventListener('submit', async (e) => {
@@ -69,7 +117,7 @@ function bindCreateForm(gen) {
     if (!title || !topic) return;
 
     createPending = true;
-    syncSubmit();
+    syncCreateAvailability();
     try {
       const res = await api.createEssay({
         title,
@@ -82,9 +130,11 @@ function bindCreateForm(gen) {
     } catch (err) {
       if (gen === generation) toast(err.message, 'error');
     } finally {
-      if (gen === generation) { createPending = false; syncSubmit(); }
+      if (gen === generation) { createPending = false; syncCreateAvailability(); }
     }
   });
+
+  syncCreateAvailability();
 }
 
 function renderThumbs(container) {
@@ -117,8 +167,15 @@ async function loadEssays(gen) {
   if (gen !== generation || !el.isConnected) return;
   el.removeAttribute('aria-busy');
 
+  if (data.quota && session) {
+    session.quota = data.quota;
+    renderBanner();
+    syncCreateAvailability();
+  }
+
   if (!data.essays.length) {
-    el.innerHTML = '<div class="card" style="text-align:center;color:var(--text-soft);padding:32px">还没有作文。从上方新建一篇开始吧（注册自带一篇示例）。</div>';
+    el.innerHTML = `<div class="card" style="text-align:center;color:var(--text-soft);padding:32px">还没有作文。从上方新建一篇开始吧${
+      session?.logged_in ? '（新账号自带一篇示例）' : ''}。</div>`;
     return;
   }
 

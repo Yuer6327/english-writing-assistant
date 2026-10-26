@@ -4,13 +4,17 @@
 // ============================================================
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { Env, Vars } from '../types';
-import { authMiddleware } from '../middleware/auth';
-import { aiRateLimit, aiConfigFail } from '../utils/rate-limit';
+import { userMiddleware } from '../middleware/auth';
+import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart } from '../utils/ai';
-import { getUserApiKey, getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
+import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
+import {
+  checkReviewGate, recordSuccess, quotaState, checkEssayGate, checkDraftGate,
+} from '../utils/quota';
 import {
   GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock,
   FRAGMENT_POLISH_PROMPT, FULL_REWRITE_PROMPT,
@@ -75,13 +79,26 @@ function parseId(raw: unknown): number | null {
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
+/** 仅登录用户可用的能力：游客拿到 403（code=login_required），前端弹登录引导而非整页跳转 */
+function memberOnly(c: Context<{ Bindings: Env; Variables: Vars }>): Response | null {
+  if (!c.get('isGuest')) return null;
+  return c.json({ error: '该功能登录后可用（游客仅支持批改）', code: 'login_required' }, 403);
+}
+
+/** 游客 IP 级软兜底：清掉 cookie 就能重置次数，IP 计数让刷次数变贵（内存计数，尽力而为） */
+function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, limit: number): boolean {
+  if (!c.get('isGuest')) return false;
+  return rateLimitHit(`guest:ip:${clientIp(c)}`, limit, 24 * 3600_000);
+}
+
 // ============================================================
 // 作文 CRUD
 // ============================================================
 
 // ── 创建作文 ──
-api.post('/essays', authMiddleware, async (c) => {
+api.post('/essays', userMiddleware, async (c) => {
   const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
   const body = await c.req.json<{
     title?: string; genre?: string; topic_text?: string;
     topic_images?: string[]; custom_prompt?: string;
@@ -98,6 +115,10 @@ api.post('/essays', authMiddleware, async (c) => {
 
   const customPrompt = body.custom_prompt?.trim() ? body.custom_prompt.trim().slice(0, 20000) : null;
 
+  // 游客：每天 1 篇（一稿/二稿/三稿共用那 3 次批改）
+  const gate = await checkEssayGate(c.env.DB, userId, isGuest);
+  if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
+
   const result = await c.env.DB.prepare(
     `INSERT INTO essays (user_id, title, genre, topic_text, topic_images, custom_prompt)
      VALUES (?, ?, ?, ?, ?, ?)`,
@@ -108,23 +129,27 @@ api.post('/essays', authMiddleware, async (c) => {
 });
 
 // ── 作文列表（含稿件数与最新得分）──
-api.get('/essays', authMiddleware, async (c) => {
+api.get('/essays', userMiddleware, async (c) => {
   const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
 
   // 新用户首次访问：预置示例作文（一次性；标记入 user_flags，用户清空作文后不会重复灌入）
-  const flag = await c.env.DB.prepare(
-    "SELECT 1 FROM user_flags WHERE user_id = ? AND flag = 'seeded'",
-  ).bind(userId).first();
-  if (!flag) {
-    const cnt = await c.env.DB.prepare(
-      'SELECT COUNT(*) AS n FROM essays WHERE user_id = ?',
-    ).bind(userId).first<{ n: number }>();
-    if ((cnt?.n ?? 0) === 0) {
-      await seedSampleEssay(c.env.DB, userId);
+  // 游客不预置：他们要的是空白试用，塞一篇示例会占用"每天 1 篇"的名额
+  if (!isGuest) {
+    const flag = await c.env.DB.prepare(
+      "SELECT 1 FROM user_flags WHERE user_id = ? AND flag = 'seeded'",
+    ).bind(userId).first();
+    if (!flag) {
+      const cnt = await c.env.DB.prepare(
+        'SELECT COUNT(*) AS n FROM essays WHERE user_id = ?',
+      ).bind(userId).first<{ n: number }>();
+      if ((cnt?.n ?? 0) === 0) {
+        await seedSampleEssay(c.env.DB, userId);
+      }
+      await c.env.DB.prepare(
+        "INSERT OR IGNORE INTO user_flags (user_id, flag) VALUES (?, 'seeded')",
+      ).bind(userId).run();
     }
-    await c.env.DB.prepare(
-      "INSERT OR IGNORE INTO user_flags (user_id, flag) VALUES (?, 'seeded')",
-    ).bind(userId).run();
   }
 
   const rows = await c.env.DB.prepare(
@@ -145,11 +170,11 @@ api.get('/essays', authMiddleware, async (c) => {
       created_at: r.created_at, updated_at: r.updated_at,
     };
   });
-  return c.json({ essays });
+  return c.json({ essays, quota: await quotaState(c.env.DB, userId, isGuest) });
 });
 
 // ── 作文详情（题目 + 全部稿件及其批改 + 最近精修记录）──
-api.get('/essays/:id', authMiddleware, async (c) => {
+api.get('/essays/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -207,7 +232,7 @@ api.get('/essays/:id', authMiddleware, async (c) => {
 });
 
 // ── 更新作文（标题/题目/自定义提示词）──
-api.put('/essays/:id', authMiddleware, async (c) => {
+api.put('/essays/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -250,7 +275,7 @@ api.put('/essays/:id', authMiddleware, async (c) => {
 });
 
 // ── 删除作文（级联删稿件/批改/精修）──
-api.delete('/essays/:id', authMiddleware, async (c) => {
+api.delete('/essays/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -264,8 +289,9 @@ api.delete('/essays/:id', authMiddleware, async (c) => {
 // ============================================================
 
 // ── 新增稿件（一稿/二稿/…；来源：photo/text/polish）──
-api.post('/essays/:id/drafts', authMiddleware, async (c) => {
+api.post('/essays/:id/drafts', userMiddleware, async (c) => {
   const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   const body = await c.req.json<{
@@ -295,6 +321,10 @@ api.post('/essays/:id/drafts', authMiddleware, async (c) => {
   ).bind(essayId).first<{ v: number | null }>();
   const version = (maxRow?.v ?? 0) + 1;
 
+  // 游客：每篇最多 3 稿（一稿/二稿/三稿）；登录用户不限
+  const gate = await checkDraftGate(c.env.DB, userId, isGuest, essayId, version);
+  if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
+
   const result = await c.env.DB.prepare(
     `INSERT INTO drafts (essay_id, user_id, version, text, source, word_count, handwriting_score, ocr_images)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -307,7 +337,7 @@ api.post('/essays/:id/drafts', authMiddleware, async (c) => {
 });
 
 // ── 修改稿件文本（保存后可重新批改）──
-api.put('/drafts/:id', authMiddleware, async (c) => {
+api.put('/drafts/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
@@ -330,7 +360,7 @@ api.put('/drafts/:id', authMiddleware, async (c) => {
 });
 
 // ── 删除稿件（连带其批改记录）──
-api.delete('/drafts/:id', authMiddleware, async (c) => {
+api.delete('/drafts/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
@@ -344,8 +374,9 @@ api.delete('/drafts/:id', authMiddleware, async (c) => {
 // ============================================================
 
 // ── 对稿件执行批改 ──
-api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
+api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const body = await c.req.json<{ model_id?: string }>().catch(() => ({}) as any);
@@ -362,7 +393,20 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
   }>();
   if (!essay) return c.json({ error: '作文不存在' }, 404);
 
-  // 生效提示词：作文自定义 > 用户模板 > 内置默认
+  // 游客只能用免费通道（没有钱包/自备 Key）；付费通道需要登录
+  if (isGuest && body.model_id && body.model_id !== 'free') {
+    return c.json({ error: '游客只能使用免费通道，登录后可选 DeepSeek 或自备 Key', code: 'login_required' }, 403);
+  }
+
+  // 次数门禁（业务侧口径：成功才计数）——放在调 AI 之前，避免白烧 token
+  if (guestIpLimitHit(c, 15)) {
+    return c.json({ error: '今日批改次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
+  }
+  const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
+  const gate = await checkReviewGate(c.env.DB, userId, isGuest, { lane, draftId });
+  if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
+
+  // 生效提示词：作文自定义 > 用户模板（按题型） > 内置默认
   const { prompt: template, source: promptSource } = await getEffectivePrompt(
     c.env.DB, userId, essay.genre, essay.custom_prompt);
 
@@ -395,8 +439,7 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
       : '',
   });
 
-  // 车道（body.model_id 可选；缺省 = 默认车道）与模型配置解析
-  const lane = await laneFromBody(c.env, userId, body.model_id);
+  // 模型配置解析（车道已在门禁前确定）
   let cfg: ResolvedConfig;
   let contentParts: ContentPart[] | undefined;
   try {
@@ -415,24 +458,28 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
   }
 
   // ── 预扣费（免费额度 → mode:'free'；BYOK → mode:'byok'；付费 → 冻结）──
+  // 免费档带 skipQuota：次数由上面的 checkReviewGate/recordSuccess 按「成功」计数，
+  // 不由 billing 在调用前扣（否则失败也扣次数）。
   const maxOutput = maxOutputFor(lane, 4096);
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       estInputTokens: Math.ceil(filled.length / 3) + estimateImageTokens(topicImages),
       maxOutputTokens: maxOutput,
+      skipQuota: lane === 'free',
     });
   } catch (err) {
     const fail = billingFail(err);
     return c.json(fail.body, fail.status as 402);
   }
 
-  // heavy 并发锁：同用户在飞 1 笔（仅预扣费档占用）
-  if (holdInfo.mode === 'hold' && !tryAcquire(userId)) {
+  // heavy 并发锁：同用户在飞 1 笔（免费档与付费档占用；BYOK 不占）
+  // 免费档也必须锁：否则连点会并发跑多次，成功后 3 次额度被瞬间吃光
+  if (holdInfo.mode !== 'byok' && !tryAcquire(userId)) {
     await billing.releaseQuietly(c.env, holdInfo.holdId);
     return c.json({ error: '已有批改任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
-  const locked = holdInfo.mode === 'hold';
+  const locked = holdInfo.mode !== 'byok';
 
   let settled = false;
   let charged = 0;
@@ -486,6 +533,12 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
 
     const model = cfg.provider === 'agnes' ? `${cfg.model}（免费通道）`
       : cfg.provider === 'deepseek' ? `${cfg.model}（按量计费）` : cfg.model;
+
+    // 「成功批改」计数：只有走到这里（拿到了合法结果）才算一次
+    if (lane === 'free') {
+      await recordSuccess(c.env.DB, userId, 'review', draft.essay_id, draftId);
+    }
+
     const insert = await c.env.DB.prepare(
       `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
        VALUES (?, ?, ?, ?, ?, ?)`,
@@ -500,6 +553,7 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
       result,
       points_charged: charged,          // 分（前端 ÷100 展示）
       lane: laneLabel(lane),            // free / paid / byok
+      quota: await quotaState(c.env.DB, userId, isGuest),
     });
   } catch (err: any) {
     // 外层兜底：任何未结算的意外失败都释放预扣
@@ -517,7 +571,10 @@ api.post('/drafts/:id/review', authMiddleware, aiRateLimit, async (c) => {
 // 精修（片段） / 全文润色
 // ============================================================
 
-api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
+api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
+  // 精修/润色对游客关闭（免费通道的 token 成本只留给 3 次批改）
+  const denied = memberOnly(c);
+  if (denied) return denied;
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -585,17 +642,20 @@ api.post('/essays/:id/polish', authMiddleware, aiRateLimit, async (c) => {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       estInputTokens: estBase,
       maxOutputTokens: maxOutput,
+      // 免费档的每日次数由本 Worker 的 quota_events 管（批改才计数，精修/润色不计次），
+      // billing 侧不再对它做次数判定（writing 的 LLM 次数规则已删除）
+      skipQuota: lane === 'free',
     });
   } catch (err) {
     const fail = billingFail(err);
     return c.json(fail.body, fail.status as 402);
   }
 
-  if (holdInfo.mode === 'hold' && !tryAcquire(userId)) {
+  if (holdInfo.mode !== 'byok' && !tryAcquire(userId)) {
     await billing.releaseQuietly(c.env, holdInfo.holdId);
     return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
-  const locked = holdInfo.mode === 'hold';
+  const locked = holdInfo.mode !== 'byok';
 
   let settled = false;
   let charged = 0;

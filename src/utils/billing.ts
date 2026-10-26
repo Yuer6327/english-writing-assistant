@@ -47,10 +47,12 @@ export interface HoldInfo {
   quotaRemaining?: number;
 }
 
-/** service：'llm:agnes-flash' / 'llm:deepseek-flash' / 'ocr:baidu' / 'byok' */
+/** service：'llm:agnes-flash' / 'llm:deepseek-flash' / 'ocr:baidu' / 'byok'
+ *  skipQuota：跳过 billing 的免费额度判定（次数由本 Worker 的 quota_events 按
+ *  「成功批改」自计，避免调用失败也扣次数） */
 export function hold(
   env: Env, userId: string, project: string, service: string,
-  opts: { estInputTokens?: number; maxOutputTokens?: number; calls?: number } = {},
+  opts: { estInputTokens?: number; maxOutputTokens?: number; calls?: number; skipQuota?: boolean } = {},
 ): Promise<HoldInfo> {
   return call(env, '/internal/hold', { method: 'POST', body: { userId, project, service, ...opts } });
 }

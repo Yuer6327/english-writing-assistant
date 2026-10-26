@@ -6,7 +6,7 @@
 // 由 essay.js 调用 openExportModal({ mode:'report', getData })。
 // ============================================================
 
-import { loadScript, toast, gradeFor } from './api.js?v=20261026b';
+import { loadScript, toast, gradeFor } from './api.js?v=20261026c';
 
 // ── CDN 资源（jsdmirror 镜像）──
 const DOCX_CDN = 'https://cdn.jsdmirror.com/npm/docx@8.5.0/build/index.umd.js';

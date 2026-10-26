@@ -1,32 +1,53 @@
 // ============================================================
-// routes/auth.ts — 当前用户信息（统一认证）
+// routes/auth.ts — 当前用户信息（统一认证）+ 游客会话
 // ============================================================
 // 登录/注册/退出已上移到统一认证平台 https://auth.yuer6327.top：
 //   登录：https://auth.yuer6327.top/login?next=<回跳地址>
 //   注册：https://auth.yuer6327.top/register?next=<回跳地址>
 //   退出：https://auth.yuer6327.top/logout?next=<回跳地址>
 // 本地不再有登录/注册接口；会话校验见 middleware/auth.ts。
+//
+// GET /me 用 userMiddleware：未登录不返回 401，而是 200 + logged_in:false，
+// 前端据此渲染游客模式（否则每个游客进来就被弹去登录页）。
+// ============================================================
 
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
-import { authMiddleware } from '../middleware/auth';
+import { userMiddleware } from '../middleware/auth';
 import { wallet } from '../utils/billing';
+import { quotaState } from '../utils/quota';
 
 const auth = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-// ── 当前用户信息（前端 requireAuth 用；附带钱包余额，失败降级不阻塞登录态）──
-auth.get('/me', authMiddleware, async (c) => {
+// ── 当前会话（前端 requireAuth / 游客模式判定；配额状态一并返回）──
+auth.get('/me', userMiddleware, async (c) => {
+  const userId = c.get('userId');
+  const isGuest = c.get('isGuest');
+
+  let quota = null;
+  try {
+    quota = await quotaState(c.env.DB, userId, isGuest);
+  } catch (err) {
+    console.error('[auth/me] 配额查询失败（降级为 null）:', err instanceof Error ? err.message : err);
+  }
+
+  if (isGuest) {
+    return c.json({ logged_in: false, id: userId, guest: true, quota });
+  }
+
   let balance: number | null = null;
   try {
-    balance = (await wallet(c.env, c.get('userId'))).balance;
+    balance = (await wallet(c.env, userId)).balance;
   } catch (err) {
     console.error('[auth/me] 钱包查询失败（降级为 null）:', err instanceof Error ? err.message : err);
   }
   return c.json({
-    id: c.get('userId'),
+    logged_in: true,
+    id: userId,
     username: c.get('username'),
     role: c.get('role'),
     wallet: { balance },
+    quota,
   });
 });
 

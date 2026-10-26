@@ -3,7 +3,7 @@
 // swup 管理：导出 init/cleanup。表单元素随 main 每次切页重建，均在 init 中绑定。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026b';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026c';
 
 let generation = 0;
 let reloadTimer = null;
@@ -43,11 +43,41 @@ const SERVICE_LABELS = {
   'byok': '自备 Key',
 };
 
+function quotaBar(label, used, limit) {
+  const pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 100;
+  return `<div style="display:flex;align-items:center;gap:8px">
+      <span style="min-width:104px">${label}</span>
+      <div class="score-bar-track" style="flex:1;height:6px"><div class="score-bar-fill" style="width:${pct}%"></div></div>
+      <span style="font-variant-numeric:tabular-nums;color:var(--text-light)">${used}/${limit} 今日</span>
+    </div>`;
+}
+
+/** 额度行：批改次数来自业务侧（成功计数），其余来自 billing（如百度 OCR） */
+function renderQuotaRows(el, quota, billingRows) {
+  const rows = [];
+  if (quota) {
+    rows.push(quotaBar(quota.scope === 'guest' ? '批改（游客）' : '批改（免费通道）', quota.used, quota.limit));
+  }
+  for (const q of billingRows || []) {
+    rows.push(quotaBar(SERVICE_LABELS[q.service] || escapeHtml(q.service), q.used, q.limit));
+  }
+  const note = quota && quota.scope === 'guest'
+    ? `<div class="muted" style="font-size:12px;margin-top:6px">游客：每天 ${quota.essay_limit} 篇 · 一稿/二稿/三稿各一次；登录后每天 10 次、不限篇数</div>`
+    : (quota ? '<div class="muted" style="font-size:12px;margin-top:6px">免费通道按「成功批改」计次，失败不扣；DeepSeek 与自备 Key 不计次</div>' : '');
+  el.innerHTML = (rows.join('') || '<span class="muted" style="font-size:12px">暂无额度配置</span>') + note;
+}
+
 export async function initBillingSection(gen = generation) {
   const balanceEl = document.getElementById('billing-balance');
   const quotaEl = document.getElementById('billing-quota');
   const tbody = document.getElementById('billing-usage-body');
   if (!balanceEl) return;
+
+  // 批改次数先渲染：它不依赖 billing，计费服务抖动时也要能看到剩余次数
+  let session = null;
+  try { session = await api.me(); } catch { /* 忽略，下面按 billing 结果兜底 */ }
+  if (gen !== generation) return;
+  if (session?.quota) renderQuotaRows(quotaEl, session.quota, null);
 
   let me;
   try {
@@ -55,23 +85,17 @@ export async function initBillingSection(gen = generation) {
   } catch (err) {
     if (gen !== generation) return;
     balanceEl.textContent = '—';
-    // 具体原因由 toast 展示，这里只留一眼可读的状态，避免重复长文案
-    quotaEl.innerHTML = '<span class="muted" style="font-size:12px">计费信息暂不可用</span>';
+    if (!session?.quota) {
+      // 具体原因由 toast 展示，这里只留一眼可读的状态，避免重复长文案
+      quotaEl.innerHTML = '<span class="muted" style="font-size:12px">计费信息暂不可用</span>';
+    }
     return;
   }
   if (gen !== generation) return;
 
   balanceEl.textContent = (me.balance / 100).toFixed(2);
 
-  const quotaRows = (me.quota?.writing || []).map(q => {
-    const pct = q.limit > 0 ? Math.min(100, Math.round(q.used / q.limit * 100)) : 100;
-    return `<div style="display:flex;align-items:center;gap:8px">
-      <span style="min-width:104px">${SERVICE_LABELS[q.service] || q.service}</span>
-      <div class="score-bar-track" style="flex:1;height:6px"><div class="score-bar-fill" style="width:${pct}%"></div></div>
-      <span style="font-variant-numeric:tabular-nums;color:var(--text-light)">${q.used}/${q.limit} 今日</span>
-    </div>`;
-  }).join('');
-  quotaEl.innerHTML = quotaRows || '<span style="color:var(--text-light);font-size:12px">暂无免费额度配置</span>';
+  renderQuotaRows(quotaEl, session?.quota, me.quota?.writing || []);
 
   const statusBadge = (s) => s === 'ok' ? '<span class="badge badge-completed">已计费</span>'
     : s === 'free' ? '<span class="badge badge-pending">免费额度</span>'
@@ -226,80 +250,126 @@ async function initApiSection(gen = generation) {
 }
 
 // ============================================================
-// 批改提示词模板
+// 批改提示词模板（按模式独立：每个模式一套系统提示词，单独保存）
 // ============================================================
+/** { list: Map<genre, item>, current, saved } */
+let promptState = null;
+
 async function initPromptSection(gen = generation) {
-  const listEl = document.getElementById('prompt-list');
-  listEl.innerHTML = '<span class="spinner"></span> 加载中...';
+  const select = document.getElementById('prompt-genre');
+  const editor = document.getElementById('prompt-editor');
+  const saveBtn = document.getElementById('btn-save-prompt');
+  const resetBtn = document.getElementById('btn-reset-prompt');
+  const dirtyBadge = document.getElementById('prompt-dirty');
+  const updatedEl = document.getElementById('prompt-updated');
+  const statusBadge = document.getElementById('prompt-status-badge');
+  const descEl = document.getElementById('prompt-genre-desc');
+  if (!select || !editor) return;
 
   let data;
   try {
     data = await api.getPrompts();
   } catch (err) {
     if (gen !== generation) return;
-    listEl.innerHTML = `<div style="color:var(--text-soft);font-size:13px">加载失败：${escapeHtml(err.message)}</div>`;
+    descEl.textContent = `模板加载失败：${err.message}`;
     return;
   }
   if (gen !== generation) return;
 
-  listEl.innerHTML = '';
-  for (const p of data.prompts) {
-    const wrap = document.createElement('div');
-    wrap.style.marginBottom = '18px';
-    wrap.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <div style="font-weight:600;font-size:14px">
-          ${escapeHtml(p.label)}
-          <span style="font-weight:400;font-size:12px;color:var(--text-light)">${escapeHtml(p.desc)}</span>
-        </div>
-        <span class="badge ${p.is_default ? 'badge-pending' : 'badge-completed'}">${p.is_default ? '内置默认' : '已自定义'}</span>
-      </div>
-      <textarea class="form-input" rows="10" style="font-family:var(--font-mono);font-size:12px;line-height:1.6"
-        data-prompt-content>${escapeHtml(p.content)}</textarea>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button type="button" class="btn btn-primary" data-save style="padding:6px 16px;font-size:13px">保存修改</button>
-        <button type="button" class="btn" data-reset style="padding:6px 16px;font-size:13px">恢复默认</button>
-      </div>
-    `;
-
-    const textarea = wrap.querySelector('[data-prompt-content]');
-    const defaultContent = p.content;
-
-    wrap.querySelector('[data-save]').addEventListener('click', async (e) => {
-      const btn = e.currentTarget;
-      const content = textarea.value.trim();
-      if (!content.includes('{essay}')) {
-        toast('提示词必须包含 {essay} 占位符', 'error');
-        return;
-      }
-      btn.disabled = true; btn.textContent = '保存中...';
-      try {
-        await api.savePrompt(p.genre, content);
-        if (gen !== generation) return;
-        toast('模板已保存', 'success');
-        scheduleReload(gen);
-      } catch (err) {
-        if (gen !== generation) return;
-        toast(err.message, 'error');
-        btn.disabled = false; btn.textContent = '保存修改';
-      }
-    });
-
-    wrap.querySelector('[data-reset]').addEventListener('click', async (e) => {
-      const btn = e.currentTarget;
-      btn.disabled = true;
-      try {
-        await api.savePrompt(p.genre, '');
-        if (gen !== generation) return;
-        toast('已恢复内置默认', 'success');
-        scheduleReload(gen);
-      } catch (err) {
-        if (gen !== generation) return;
-        toast(err.message, 'error');
-        btn.disabled = false; btn.textContent = '恢复默认';
-      }
-    });
-
-    listEl.appendChild(wrap);
+  if (!data.prompts?.length) {
+    descEl.textContent = '暂无可配置的模式';
+    return;
   }
+
+  promptState = {
+    list: new Map(data.prompts.map(p => [p.genre, p])),
+    current: data.prompts[0].genre,
+    saved: '',
+  };
+  select.innerHTML = data.prompts
+    .map(p => `<option value="${escapeHtml(p.genre)}">${escapeHtml(p.label)}</option>`)
+    .join('');
+  select.value = promptState.current;
+  select.disabled = false;
+
+  const isDirty = () => editor.value !== promptState.saved;
+
+  const render = () => {
+    const item = promptState.list.get(promptState.current);
+    if (!item) return;
+    promptState.saved = item.content;
+    editor.value = item.content;
+    editor.disabled = false;
+    saveBtn.disabled = false;
+    resetBtn.disabled = !item.is_custom;
+    descEl.textContent = item.desc || '';
+    statusBadge.innerHTML = item.is_custom
+      ? '<span class="badge badge-completed">已自定义</span>'
+      : '<span class="badge badge-pending">内置默认</span>';
+    updatedEl.textContent = item.updated_at ? `上次保存 ${formatBeijingTime(item.updated_at)}` : '';
+    dirtyBadge.hidden = true;
+  };
+  render();
+
+  editor.addEventListener('input', () => { dirtyBadge.hidden = editor.value === promptState.saved; });
+
+  // 切模式：有未保存改动先确认（各模式内容互不覆盖）
+  select.addEventListener('change', () => {
+    if (isDirty() && !confirm('当前模式有未保存的修改，切换模式会丢弃。继续？')) {
+      select.value = promptState.current;
+      return;
+    }
+    promptState.current = select.value;
+    render();
+  });
+
+  saveBtn.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const genre = promptState.current;
+    const item = promptState.list.get(genre);
+    const content = editor.value.trim();
+    if (!content.includes('{essay}')) {
+      toast('提示词必须包含 {essay} 占位符', 'error');
+      return;
+    }
+    btn.disabled = true; btn.textContent = '保存中...';
+    try {
+      const res = await api.savePrompt(genre, content);
+      if (gen !== generation) return;
+      if (item) {
+        item.content = content;
+        item.is_custom = true;
+        item.updated_at = res.updated_at;
+      }
+      render();
+      toast(`已保存「${item ? item.label : genre}」的提示词`, 'success');
+    } catch (err) {
+      if (gen === generation) toast(err.message, 'error');
+    } finally {
+      if (gen === generation && btn.isConnected) { btn.disabled = false; btn.textContent = '保存该模式'; }
+    }
+  });
+
+  resetBtn.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const genre = promptState.current;
+    const item = promptState.list.get(genre);
+    if (!confirm(`恢复「${item ? item.label : genre}」为内置默认？其他模式的模板不受影响。`)) return;
+    btn.disabled = true; btn.textContent = '恢复中...';
+    try {
+      await api.savePrompt(genre, '');
+      if (gen !== generation) return;
+      if (item) {
+        item.content = item.default_content;
+        item.is_custom = false;
+        item.updated_at = null;
+      }
+      render();
+      toast('已恢复内置默认', 'success');
+    } catch (err) {
+      if (gen === generation) toast(err.message, 'error');
+    } finally {
+      if (gen === generation && btn.isConnected) { btn.disabled = false; btn.textContent = '恢复默认'; }
+    }
+  });
 }

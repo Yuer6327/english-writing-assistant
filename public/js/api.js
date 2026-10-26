@@ -11,6 +11,12 @@ export function gotoAuth(action = 'login') {
   location.href = `${AUTH_BASE}/${action}?next=${next}`;
 }
 
+/** 登录链接（用于游客模式下的「登录」按钮/横幅，保留当前页回跳） */
+export function loginHref() {
+  const next = encodeURIComponent(location.origin + location.pathname + location.search);
+  return `${AUTH_BASE}/login?next=${next}`;
+}
+
 async function request(path, options = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     ...options,
@@ -57,9 +63,10 @@ export const api = {
   saveApiKey: (payload) => request('/settings/api-keys', { method: 'POST', body: JSON.stringify(payload) }),
   getApiKeyStatus: () => request('/settings/api-keys/status'),
 
-  // --- 提示词模板 ---
+  // --- 提示词模板（按模式/题型独立）---
   getPrompts: () => request('/prompts'),
-  savePrompt: (genre, content) => request(`/prompts/${genre}`, { method: 'PUT', body: JSON.stringify({ content }) }),
+  getPrompt: (genre) => request(`/prompts/${encodeURIComponent(genre)}`),
+  savePrompt: (genre, content) => request(`/prompts/${encodeURIComponent(genre)}`, { method: 'PUT', body: JSON.stringify({ content }) }),
 
   // --- 作文 ---
   getEssays: () => request('/essays'),
@@ -154,15 +161,25 @@ export function toast(message, type = 'info') {
   return el;
 }
 
-// ── Auth guard ──
-export async function requireAuth() {
+// ── 会话 ──
+/** 会话探测（不跳转）：登录返回 logged_in:true，游客返回 logged_in:false + quota */
+export async function getSession() {
   try {
     return await api.me();
   } catch (err) {
-    if (err.status === 401) return null; // request() 已负责登录跳转
+    if (err.status === 401) return { logged_in: false };
     toast(`无法验证登录状态：${err.message}`, 'error');
     return null;
   }
+}
+
+/** 需要登录的页面用：未登录直接跳统一认证（游客访问设置/管理页） */
+export async function requireAuth() {
+  const session = await getSession();
+  if (!session) return null;
+  if (session.logged_in) return session;
+  gotoAuth('login');
+  return null;
 }
 
 // ── HTML escape ──

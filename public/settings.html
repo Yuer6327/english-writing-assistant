@@ -15,7 +15,7 @@
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#151515" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="https://blog.yuer6327.top/favicon/gravatar.png" type="image/x-icon">
-  <link rel="stylesheet" href="/css/style.css?v=20261026b">
+  <link rel="stylesheet" href="/css/style.css?v=20261026c">
   <script>(function(){var t=localStorage.getItem('theme')||'auto';var d=t==='dark'||(t==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);if(d)document.documentElement.setAttribute('data-theme','dark');})();</script>
 </head>
 <body>
@@ -32,7 +32,7 @@
     </div>
   </nav>
 
-  <main id="main" tabindex="-1" data-page-module="/js/settings.js?v=20261026b">
+  <main id="main" tabindex="-1" data-page-module="/js/settings.js?v=20261026c">
     <div class="container" style="max-width:640px">
       <h1 style="font-size:24px;margin-bottom:24px">设置</h1>
 
@@ -153,17 +153,39 @@
         </div>
       </div>
 
-      <!-- 批改提示词模板 -->
+      <!-- 批改提示词模板（按模式独立） -->
       <div class="card">
-        <h3 style="margin-bottom:10px">批改提示词模板</h3>
-        <p style="font-size:13px;color:var(--text-light);margin-bottom:10px">改动对之后所有批改生效；单篇作文可在工作台单独覆盖。</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">
+          <h3>批改提示词模板</h3>
+          <span id="prompt-status-badge"></span>
+        </div>
+        <p style="font-size:13px;color:var(--text-light);margin-bottom:14px">
+          每个模式一套系统提示词，单独保存、互不影响。单篇作文还可在工作台再做一次覆盖。
+        </p>
+
+        <div class="form-group" style="margin-bottom:14px">
+          <label class="form-label" for="prompt-genre">模式</label>
+          <select class="form-input" id="prompt-genre" disabled>
+            <option>加载中...</option>
+          </select>
+          <div class="token-hint" id="prompt-genre-desc"></div>
+        </div>
+
         <div class="chip-row" style="margin-bottom:14px">
           <span class="chip accent"><code>{essay}</code> 作文全文 · 必填</span>
           <span class="chip"><code>{topic}</code> 题目</span>
           <span class="chip"><code>{word_count}</code> 词数</span>
           <span class="chip"><code>{previous_feedback}</code> 上一稿反馈</span>
         </div>
-        <div id="prompt-list"><span class="spinner"></span> 加载中...</div>
+
+        <textarea class="form-input" id="prompt-editor" rows="12" disabled
+          style="font-family:var(--font-mono);font-size:12px;line-height:1.6"></textarea>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+          <button type="button" class="btn btn-primary" id="btn-save-prompt" disabled>保存该模式</button>
+          <button type="button" class="btn" id="btn-reset-prompt" disabled>恢复默认</button>
+          <span class="badge badge-pending" id="prompt-dirty" hidden>未保存</span>
+          <span class="muted" id="prompt-updated" style="font-size:12px;margin-left:auto"></span>
+        </div>
       </div>
     </div>
   </main>
@@ -173,7 +195,7 @@
     Project lead by <a href="https://www.yuer6327.top" target="_blank" rel="noopener noreferrer">Yuer6327</a> · <a href="https://github.com/Yuer6327/english-writing-assistant" target="_blank" rel="noopener noreferrer">GitHub</a>
   </footer>
 
-  <script src="/js/theme.js?v=20261026b"></script>
-  <script type="module" src="/js/swup.js?v=20261026b"></script>
+  <script src="/js/theme.js?v=20261026c"></script>
+  <script type="module" src="/js/swup.js?v=20261026c"></script>
 </body>
 </html>

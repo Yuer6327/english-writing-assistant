@@ -5,7 +5,7 @@
 // 兑换码为一次性明码展示，刷新即丢，请立即复制保存。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026b';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026c';
 
 let generation = 0;
 

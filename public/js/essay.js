@@ -4,8 +4,11 @@
 // 批改渲染（分数卡+原文高亮+问题卡）/ 片段精修 / 全文润色 / 导出
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, renderBold, formatBeijingTime, countWords, compressImageFile, gradeFor } from './api.js?v=20261026b';
-import { openExportModal, closeExportModal } from './export.js?v=20261026b';
+import {
+  api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
+  compressImageFile, gradeFor,
+} from './api.js?v=20261026c';
+import { openExportModal, closeExportModal } from './export.js?v=20261026c';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
@@ -15,6 +18,11 @@ let selBtn = null;           // 选中片段的浮动精修按钮
 let delegatedBound = false;  // document 级委托只绑一次（swup 重复进页不叠加）
 const pendingOps = new Set(); // 跨重新渲染保持的写操作锁（防重复计费/提交）
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+/** 会话：游客（未登录）只能用免费通道批改，其余 AI 功能需登录 */
+let isGuest = false;
+let sessionQuota = null;
+let sessionName = '';
 
 function busyButton(btn, label, hint = '') {
   btn.dataset.idleHtml = btn.innerHTML;
@@ -49,6 +57,8 @@ let lastCharge = null;       // { reviewId, points, lane } 本次批改消耗（
 
 async function loadLaneInfo() {
   if (laneInfo.loaded) return;
+  // 游客没有钱包/自备 Key，不去碰计费接口（那会 401 触发整页跳登录）
+  if (isGuest) { laneInfo.loaded = true; return; }
   try {
     const me = await api.billing.me();
     laneInfo.paidEnabled = !!me.paid_enabled;
@@ -59,15 +69,26 @@ async function loadLaneInfo() {
 
 /** 默认车道：已配置我的 Key → byok，否则免费通道（与服务端默认规则一致） */
 function defaultLane() {
-  return laneInfo.byokConfigured ? 'byok' : 'free';
+  return laneInfo.byokConfigured && !isGuest ? 'byok' : 'free';
+}
+
+/** 剩余免费次数徽标文案 */
+function remainingLabel() {
+  if (!sessionQuota) return '';
+  return `剩余 ${sessionQuota.remaining}/${sessionQuota.limit}`;
 }
 
 /** 模型选择 <select> HTML（id 唯一）；value 归一到合法车道 */
 function modelSelectHtml(id, remembered) {
+  if (isGuest) {
+    return `<select class="form-input" id="${id}" aria-label="模型通道（游客仅免费通道）" style="width:auto;padding:4px 8px;font-size:13px" title="游客只能使用免费通道">
+      <option value="free">免费通道 · ${escapeHtml(remainingLabel())}</option>
+    </select>`;
+  }
   const value = ['free', 'deepseek', 'byok'].includes(remembered)
     ? remembered : defaultLane();
   const opts = [
-    `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（每日 3 次）</option>`,
+    `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（今日剩余 ${sessionQuota ? sessionQuota.remaining : '—'} 次）</option>`,
     laneInfo.paidEnabled
       ? `<option value="deepseek"${value === 'deepseek' ? ' selected' : ''}>DeepSeek（积分）</option>` : '',
     laneInfo.byokConfigured
@@ -107,10 +128,42 @@ function showInsufficientBalance() {
   if (closeBtn) closeBtn.addEventListener('click', () => closeWbModal());
 }
 
-/** 统一错误分流：402 → 余额不足弹窗；返回 true 表示已处理 */
+/** 游客限制 / 需登录功能的统一引导弹窗 */
+function showLoginPrompt(title, desc) {
+  wbModal(`
+    <div style="text-align:center;padding:8px 0">
+      <div style="font-size:34px;margin-bottom:10px">🔓</div>
+      <div style="font-weight:600;font-size:16px;margin-bottom:10px">${escapeHtml(title)}</div>
+      <div style="font-size:13px;color:var(--text-soft);line-height:1.8;margin-bottom:16px">${escapeHtml(desc)}</div>
+      <div class="chip-row" style="justify-content:center;margin-bottom:18px">
+        <span class="chip">每天 10 次免费批改</span>
+        <span class="chip">不限篇数 · 不限稿数</span>
+        <span class="chip">精修 / 润色 / 大模型识别</span>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center">
+        <a class="btn btn-primary" href="${loginHref()}" rel="nofollow" style="text-decoration:none">登录</a>
+        <button type="button" class="btn" id="btn-login-cancel">知道了</button>
+      </div>
+    </div>
+  `, { title });
+  const closeBtn = document.getElementById('btn-login-cancel');
+  if (closeBtn) closeBtn.addEventListener('click', () => closeWbModal());
+}
+
+const GUEST_LIMIT_CODES = new Set([
+  'login_required', 'guest_quota_exhausted', 'guest_draft_reviewed',
+  'guest_essay_limit', 'guest_draft_limit', 'guest_ocr_limit', 'guest_ip_limit',
+]);
+
+/** 统一错误分流：402 → 余额不足；游客受限 → 登录引导；返回 true 表示已处理 */
 function handleBillingError(err) {
-  if (err && err.code === 'insufficient_balance') {
+  if (!err) return false;
+  if (err.code === 'insufficient_balance') {
     showInsufficientBalance();
+    return true;
+  }
+  if (GUEST_LIMIT_CODES.has(err.code)) {
+    showLoginPrompt(err.code === 'login_required' ? '登录后可用' : '游客额度提示', err.message);
     return true;
   }
   return false;
@@ -132,15 +185,44 @@ export function cleanup() {
 
 export async function init() {
   const gen = ++generation;
-  const user = await requireAuth();
-  if (!user || gen !== generation) return;
+  // 客服端软探测：游客也能进工作台（额度按「成功批改」由服务端计）
+  const session = await getSession();
+  if (!session || gen !== generation) return;
+  isGuest = !session.logged_in;
+  sessionQuota = session.quota || null;
+  sessionName = session.username || '已登录';
+  laneInfo.loaded = false;
+  laneInfo.paidEnabled = false;
+  laneInfo.byokConfigured = false;
+  reviewLane = null;
+  polishLane = null;
+  lastCharge = null;
 
   const id = new URLSearchParams(location.search).get('id');
   if (!id) { window.swupNavigate('/'); return; }
 
+  renderSessionBanner();
   // 车道信息与作文数据相互独立：并行拉取，统一确认后再渲染
   await reload(id, gen, loadLaneInfo());
   bindDelegated();
+}
+
+/** 顶部会话条：游客剩余次数 / 登录态剩余次数 */
+function renderSessionBanner() {
+  const el = document.getElementById('session-banner');
+  if (!el) return;
+  const q = sessionQuota;
+  const chips = q
+    ? (isGuest
+      ? `<span class="chip accent">今日剩余 ${q.remaining}/${q.limit} 次批改</span>
+         <span class="chip">一稿二稿三稿 · 每稿一次</span>`
+      : `<span class="chip accent">今日剩余 ${q.remaining}/${q.limit} 次免费批改</span>
+         <span class="chip">付费通道不计次</span>`)
+    : '';
+  el.innerHTML = isGuest
+    ? `<div class="session-bar session-guest"><span class="session-who">游客试用</span>${chips}
+         <a class="btn btn-primary btn-sm" href="${loginHref()}" rel="nofollow">登录（每天 10 次）</a></div>`
+    : `<div class="session-bar"><span class="session-who">${escapeHtml(sessionName)}</span>${chips}</div>`;
 }
 
 // ============================================================
@@ -197,13 +279,18 @@ function renderHeader() {
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap">
-        <button class="btn" id="btn-prompt" style="padding:6px 14px;font-size:13px">批改提示词</button>
+        ${isGuest
+          ? `<button class="btn" id="btn-prompt" title="提示词按模式配置，登录后可编辑" style="padding:6px 14px;font-size:13px">批改提示词 🔒</button>`
+          : `<button class="btn" id="btn-prompt" style="padding:6px 14px;font-size:13px">批改提示词</button>`}
         <button class="btn" id="btn-export" style="padding:6px 14px;font-size:13px">导出报告</button>
         <button class="btn" id="btn-delete-essay" style="padding:6px 14px;font-size:13px">删除作文</button>
       </div>
     </div>`;
 
-  document.getElementById('btn-prompt').addEventListener('click', openPromptModal);
+  document.getElementById('btn-prompt').addEventListener('click', () => {
+    if (isGuest) { showLoginPrompt('登录后可用', '提示词按模式单独配置。游客先用默认模板批改，登录后可自定义。'); return; }
+    openPromptModal();
+  });
   document.getElementById('btn-export').addEventListener('click', () => {
     openExportModal({ mode: 'report', getData: () => buildReportPayload() });
   });
@@ -294,6 +381,11 @@ function renderDraftPanel() {
   const sourceLabel = { photo: '拍照识别', text: '直接输入', polish: '精修/润色采纳' }[d.source] || d.source;
   const hwScore = d.handwriting_score !== null && d.handwriting_score !== undefined
     ? ` · 书写质量 ${(d.handwriting_score * 100).toFixed(0)}%` : '';
+  // 游客限制：每篇最多 3 稿、无精修/润色/自定义提示词
+  const draftLocked = isGuest && sessionQuota?.draft_limit !== null && sessionQuota?.draft_limit !== undefined
+    && d.version >= sessionQuota.draft_limit;
+  const rewriteLocked = isGuest;
+  const reviewExhausted = !!sessionQuota && sessionQuota.remaining <= 0;
 
   el.innerHTML = `
     <div class="card">
@@ -307,10 +399,10 @@ function renderDraftPanel() {
             ? `<button class="btn btn-primary" id="btn-save-draft" style="padding:5px 12px;font-size:13px">保存稿件</button>
                <button class="btn" id="btn-cancel-edit" style="padding:5px 12px;font-size:13px">取消</button>`
             : `${modelSelectHtml('review-model-select', reviewLane)}
-               <button class="btn btn-primary ${reviewPending ? 'btn-busy' : ''}" id="btn-review" style="padding:5px 12px;font-size:13px" ${reviewPending ? 'disabled title="预计约 1 分钟"' : ''}>${reviewPending ? '<span class="spinner spinner-sm"></span><span>批改中</span><span class="busy-time">约 1 分钟</span>' : (rv ? '重新批改' : '开始批改')}</button>
+               <button class="btn btn-primary ${reviewPending ? 'btn-busy' : ''}" id="btn-review" style="padding:5px 12px;font-size:13px" ${reviewPending ? 'disabled title="预计约 1 分钟"' : (reviewExhausted ? 'title="今日免费次数已用完，点一下试试可切换的通道"' : '')}>${reviewPending ? '<span class="spinner spinner-sm"></span><span>批改中</span><span class="busy-time">约 1 分钟</span>' : (rv ? '重新批改' : '开始批改')}</button>
                <button class="btn" id="btn-edit-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''}>编辑稿件</button>
-               <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''}>✍️ 写${cnNum[d.version] || d.version + 1}稿</button>
-               <button class="btn ${rewritePending ? 'btn-busy' : ''}" id="btn-rewrite" style="padding:5px 12px;font-size:13px" ${rewritePending ? 'disabled title="预计约 1 分钟"' : reviewPending || deletePending ? 'disabled' : ''}>${rewritePending ? '<span class="spinner spinner-sm"></span><span>润色中</span><span class="busy-time">约 1 分钟</span>' : '全文润色'}</button>
+               <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''} ${draftLocked ? 'title="游客每篇最多 3 稿，登录后可继续写"' : ''}>✍️ 写${cnNum[d.version] || d.version + 1}稿${draftLocked ? ' 🔒' : ''}</button>
+               <button class="btn ${rewritePending ? 'btn-busy' : ''}" id="btn-rewrite" style="padding:5px 12px;font-size:13px" ${rewritePending ? 'disabled title="预计约 1 分钟"' : reviewPending || deletePending ? 'disabled' : ''} ${rewriteLocked ? 'title="全文润色需要登录"' : ''}>${rewritePending ? '<span class="spinner spinner-sm"></span><span>润色中</span><span class="busy-time">约 1 分钟</span>' : `全文润色${rewriteLocked ? ' 🔒' : ''}`}</button>
                <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px" ${deletePending ? 'disabled' : ''}>${deletePending ? '删除中...' : '删除'}</button>
                <span id="review-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>`}
         </div>
@@ -320,7 +412,7 @@ function renderDraftPanel() {
         ? `<textarea class="form-input" id="draft-editor" rows="14" style="font-size:15px;line-height:1.9">${escapeHtml(d.text)}</textarea>
            <div class="wordcount-hint" id="draft-wc" style="margin-top:6px"></div>`
         : `<div class="essay-annotated" id="draft-text-view">${renderAnnotated(d)}</div>
-           <div style="margin-top:10px"><span class="chip">✨ 选中句子可精修</span></div>`}
+           <div style="margin-top:10px"><span class="chip">${isGuest ? '🔒 片段精修需登录' : '✨ 选中句子可精修'}</span></div>`}
     </div>`;
 
   if (editingDraft) {
@@ -359,7 +451,14 @@ function renderDraftPanel() {
     bindPaidHint(el.querySelector('#review-model-select'), el.querySelector('#review-paid-hint'));
     el.querySelector('#btn-review').addEventListener('click', runReview);
     el.querySelector('#btn-edit-draft').addEventListener('click', () => { editingDraft = true; renderDraftPanel(); });
-    el.querySelector('#btn-new-draft').addEventListener('click', () => openDraftModal('text', d.text));
+    el.querySelector('#btn-new-draft').addEventListener('click', () => {
+      if (isGuest && sessionQuota?.draft_limit !== null && sessionQuota?.draft_limit !== undefined
+        && d.version >= sessionQuota.draft_limit) {
+        showLoginPrompt('登录后继续写', `游客每篇最多 ${sessionQuota.draft_limit} 稿（一稿、二稿、三稿）。登录后可继续写四稿、五稿，并保留全部历史。`);
+        return;
+      }
+      openDraftModal('text', d.text);
+    });
     el.querySelector('#btn-rewrite').addEventListener('click', runFullRewrite);
     el.querySelector('#btn-del-draft').addEventListener('click', async (ev) => {
       if (!confirm(`确定删除${cnNum[d.version - 1] || d.version}稿及其批改记录？`)) return;
@@ -498,6 +597,10 @@ async function runReview(e) {
   try {
     const res = await api.reviewDraft(d.id, lane);
     if (gen !== generation) return;
+    if (res.quota) {
+      sessionQuota = res.quota;
+      renderSessionBanner();
+    }
     lastCharge = {
       reviewId: res.review_id,
       points: res.points_charged ?? 0,
@@ -672,16 +775,24 @@ function openDraftModal(mode, prefill) {
       </div>
       <div class="form-group">
         <label class="form-label">识别引擎</label>
-        <label style="font-size:13px;display:block;margin-bottom:6px" title="逐字转写 + 书写质量评分，保留原始错误">
-          <input type="radio" name="ocr-engine" value="vlm" checked> 大模型视觉 <span class="chip">推荐</span>
-        </label>
-        <label style="font-size:13px;display:block" title="手写体 → 高精度 → 标准版自动降级，无书写质量分">
-          <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR <span class="chip">省额度</span>
-        </label>
-        <div class="chip-row" style="margin-top:8px">
-          <span class="chip">百度 5 次/日免费</span>
-          <span class="chip">大模型按量计积分</span>
-        </div>
+        ${isGuest
+          ? `<label style="font-size:13px;display:block" title="手写体 → 高精度 → 标准版自动降级，无书写质量分">
+               <input type="radio" name="ocr-engine" value="baidu" checked> 百度 OCR
+             </label>
+             <div class="chip-row" style="margin-top:8px">
+               <span class="chip accent">游客每天 3 次</span>
+               <span class="chip">登录后可用大模型视觉（带书写质量分）</span>
+             </div>`
+          : `<label style="font-size:13px;display:block;margin-bottom:6px" title="逐字转写 + 书写质量评分，保留原始错误">
+               <input type="radio" name="ocr-engine" value="vlm" checked> 大模型视觉 <span class="chip">推荐</span>
+             </label>
+             <label style="font-size:13px;display:block" title="手写体 → 高精度 → 标准版自动降级，无书写质量分">
+               <input type="radio" name="ocr-engine" value="baidu"> 百度 OCR <span class="chip">省额度</span>
+             </label>
+             <div class="chip-row" style="margin-top:8px">
+               <span class="chip">百度 5 次/日免费</span>
+               <span class="chip">大模型按量计积分</span>
+             </div>`}
       </div>
       <button class="btn btn-primary" id="btn-ocr">开始识别</button>
       <span id="ocr-status" style="font-size:13px;color:var(--text-soft);margin-left:10px"></span>
@@ -850,6 +961,7 @@ function bindDelegated() {
 
 function onMouseUp() {
   const gen = generation;
+  if (isGuest) { removeSelBtn(); return; }   // 游客不提供精修入口
   setTimeout(() => {
     if (gen !== generation) return;
     const view = document.getElementById('draft-text-view');
@@ -1008,6 +1120,10 @@ function renderPolishResult(container, result, fragment, prefixHtml = '') {
 // 全文润色
 // ============================================================
 async function runFullRewrite(e) {
+  if (isGuest) {
+    showLoginPrompt('全文润色需要登录', '游客可以用 3 次批改看批改报告与修改稿；整篇润色、片段精修、按模式自定义提示词需登录后使用。');
+    return;
+  }
   const btn = e.currentTarget;
   const d = activeDraft();
   if (!d) return;
@@ -1093,7 +1209,9 @@ function openPromptModal() {
   const gen = generation;
   const needsTemplate = !e.custom_prompt;
   const modal = wbModal(`
-    <p style="font-size:13px;color:var(--text-light);margin-bottom:10px">留空 = 使用「设置」里的全局模板（或内置默认）</p>
+    <p style="font-size:13px;color:var(--text-light);margin-bottom:10px">
+      当前模式：<strong>${escapeHtml(e.genre_label)}</strong>。留空 = 使用该模式在「设置」里的模板（或内置默认）；此处只影响本作文。
+    </p>
     <div class="chip-row" style="margin-bottom:12px">
       <span class="chip accent"><code>{essay}</code> 必填</span>
       <span class="chip"><code>{topic}</code></span>
@@ -1104,6 +1222,7 @@ function openPromptModal() {
     <textarea class="form-input" id="essay-prompt" rows="12" style="font-family:var(--font-mono);font-size:12px;line-height:1.6" ${needsTemplate ? 'disabled' : ''}>${escapeHtml(e.custom_prompt || '')}</textarea>
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn btn-primary" id="btn-save-prompt" ${needsTemplate ? 'disabled' : ''}>保存（仅本作文）</button>
+      <button class="btn" id="btn-save-genre-prompt" ${needsTemplate ? 'disabled' : ''} title="把框内内容保存为「${escapeHtml(e.genre_label)}」的模式模板，之后该模式的作文都用它">存为该模式模板</button>
       ${e.custom_prompt ? '<button class="btn" id="btn-clear-prompt">清除自定义</button>' : ''}
     </div>
   `, { wide: true, title: '批改提示词' });
@@ -1139,9 +1258,32 @@ function openPromptModal() {
     try {
       await api.updateEssay(e.id, { custom_prompt: null });
       if (gen !== generation) return;
-      toast('已清除，回落全局模板', 'success');
+      toast('已清除，回落到该模式的模板', 'success');
       closeWbModal(modal);
       await reload(e.id, gen);
+    } catch (err) {
+      if (gen === generation && modal === wbModalEl) {
+        toast(err.message, 'error');
+        idleButton(btn);
+      }
+    }
+  });
+
+  // 把框内内容存为该**模式**的模板（按 genre 独立保存，不影响其它模式）
+  const genreBtn = modal.querySelector('#btn-save-genre-prompt');
+  if (genreBtn) genreBtn.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const content = textarea.value.trim();
+    if (!content.includes('{essay}')) {
+      toast('提示词必须包含 {essay} 占位符', 'error');
+      return;
+    }
+    busyButton(btn, '保存中');
+    try {
+      await api.savePrompt(e.genre, content);
+      if (gen !== generation) return;
+      toast(`已保存为「${e.genre_label}」模式模板`, 'success');
+      idleButton(btn);
     } catch (err) {
       if (gen === generation && modal === wbModalEl) {
         toast(err.message, 'error');
@@ -1166,6 +1308,7 @@ function openPromptModal() {
         if (gen === generation && modal === wbModalEl) {
           textarea.disabled = false;
           saveBtn.disabled = false;
+          if (genreBtn) genreBtn.disabled = false;
         }
       }
     })();
