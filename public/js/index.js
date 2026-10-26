@@ -5,7 +5,7 @@
 
 import {
   api, toast, getSession, loginHref, escapeHtml, formatBeijingTime, compressImageFile, gradeFor,
-} from './api.js?v=20261026c';
+} from './api.js?v=20261026d';
 
 let generation = 0;
 /** 新建表单暂存的题目图片（data URL） */

@@ -3,7 +3,7 @@
 // swup 管理：导出 init/cleanup。表单元素随 main 每次切页重建，均在 init 中绑定。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026c';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026d';
 
 let generation = 0;
 let reloadTimer = null;

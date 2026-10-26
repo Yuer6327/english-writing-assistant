@@ -7,8 +7,8 @@
 import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor,
-} from './api.js?v=20261026c';
-import { openExportModal, closeExportModal } from './export.js?v=20261026c';
+} from './api.js?v=20261026d';
+import { openExportModal, closeExportModal } from './export.js?v=20261026d';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
