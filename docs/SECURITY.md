@@ -127,3 +127,9 @@ node scripts/security/mock-ai.mjs &        # 本地 mock AI（:9101）
 node scripts/security/attack-writing.mjs   # writing 37 用例（:8788）
 node scripts/security/attack-billing.mjs   # billing 23 用例（:8789，需 --test-scheduled 启动 cron 用例）
 ```
+### 生产上线记录（2026-10-31）
+
+- 两仓库 push → CI 绿（自动远程迁移 + 部署），部署顺序 billing → writing。
+- 生产探针：`/api/health` ok；游客态配额按北京日正确；chunked 大请求被边缘归一化后仍被业务 400 拒；`dev-session` 生产 404；`yuer-billing.<subdomain>.workers.dev` 不可达（公网入口关闭实测）；生产两 Worker `INTERNAL_TOKEN` 已配置（`wrangler secret list` 确认）。
+- 已知边缘行为：生产静态页 `X-Frame-Options: SAMEORIGIN` 来自 zone 级边缘注入（Worker 层已强制 DENY，被边缘覆盖；SAMEORIGIN 同样阻断第三方嵌入，属可接受取值，如需 DENY 须在 Cloudflare Zone Transform Rule 调整）。
+- 用户侧待办：auth 平台 admin 账号开启 2FA + 短会话（评审 G4，无法从代码侧核实）；可选配 `ALERT_WEBHOOK` secret 让资金对账告警推到手机。
