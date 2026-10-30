@@ -39,3 +39,7 @@ Thumbs.db
 # 冒烟测试输出（本地）
 .ai-smoke-last.json
 .ai-smoke-16points.json
+
+# 本地密钥备份文件绝不入库
+*.secbackup
+.dev.vars*

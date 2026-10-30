@@ -39,7 +39,11 @@ type SessionResult =
   | { kind: 'error' };
 
 async function resolveSession(c: Ctx): Promise<SessionResult> {
-  const m = (c.req.header('cookie') || '').match(/(?:^|;\s*)s=([A-Za-z0-9_-]+)/);
+  // 取【最后一个】s=：浏览器按 cookie path 长度排序发送，若同名 cookie 被植入
+  // （兄弟子域/可注入 cookie 的向量），窄 path 的会在前面遮蔽真会话；
+  // 取最后匹配与 Hono getCookie 语义一致（后写者优先），不依赖排序。
+  const matches = [...(c.req.header('cookie') || '').matchAll(/(?:^|;\s*)s=([A-Za-z0-9_-]+)/g)];
+  const m = matches[matches.length - 1];
   if (!m) return { kind: 'none' };
   try {
     const row = await c.env.AUTH_DB.prepare(

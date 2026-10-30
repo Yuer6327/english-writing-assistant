@@ -64,7 +64,8 @@ billingRoutes.post('/redeem', authMiddleware, async (c) => {
 
 billingRoutes.get('/usage', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const limit = Math.min(100, parseInt(c.req.query('limit') || '50', 10) || 50);
+  // limit 钳到 [1,100]：负数直穿 SQLite 会变成「无 LIMIT」（旧实现实测 -5 返回全量）
+  const limit = Math.max(1, Math.min(100, parseInt(c.req.query('limit') || '50', 10) || 50));
   try {
     return c.json(await billing.usageView(c.env, userId, limit));
   } catch (err) {
@@ -93,13 +94,15 @@ admin.post('/gift', async (c) => {
   const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
-  if (!Number.isFinite(points) || points === 0) return c.json({ error: '积分需为非零数值' }, 400);
+  // 单笔上界 100 万元（1e10 微积分）：1e300 级输入会落成 SQLite REAL（实测账实核对失明）
+  if (!Number.isFinite(points) || points === 0 || Math.abs(points) > 1e10) return c.json({ error: '积分需为非零数值且单笔 ≤ 100 万元' }, 400);
 
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
 
   try {
-    const r = await billing.adminGift(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined);
+    // operator 取会话身份，绝不采信请求体——资金操作的不可抵赖审计锚点
+    const r = await billing.adminGift(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined, c.get('userId'));
     return c.json(r);
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
@@ -138,10 +141,12 @@ admin.post('/tags', async (c) => {
 admin.post('/codes', async (c) => {
   const body = await c.req.json<{ points_yuan?: number; count?: number; batch?: string }>().catch(() => ({}) as any);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
-  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '面额需为正数' }, 400);
+  // 单笔上界 100 万元（1e10 微积分）
+  if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: '面额需为正数且单笔 ≤ 100 万元' }, 400);
+
   const count = Math.max(1, Math.min(200, Number(body.count) || 1));
   try {
-    return c.json(await billing.adminCodes(c.env, points, count, body.batch?.trim().slice(0, 60) || undefined));
+    return c.json(await billing.adminCodes(c.env, points, count, body.batch?.trim().slice(0, 60) || undefined, c.get('userId')));
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
     return c.json({ error: '计费服务暂不可用' }, 503);
@@ -152,11 +157,11 @@ admin.post('/orders/manual', async (c) => {
   const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
-  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '积分需为正数' }, 400);
+  if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: '积分需为正数且单笔 ≤ 100 万元' }, 400);
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
   try {
-    return c.json(await billing.adminManualOrder(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined));
+    return c.json(await billing.adminManualOrder(c.env, userId, points, body.note?.trim().slice(0, 200) || undefined, c.get('userId')));
   } catch (err) {
     if (err instanceof billing.BillingError) return c.json({ error: err.message }, err.status as 400);
     return c.json({ error: '计费服务暂不可用' }, 503);

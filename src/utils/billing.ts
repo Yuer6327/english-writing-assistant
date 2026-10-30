@@ -24,11 +24,13 @@ async function call<T>(env: Env, path: string, init?: { method?: string; body?: 
   const body = init?.body !== undefined ? JSON.stringify(init.body) : undefined;
   let resp: Response;
   try {
-    // 本地开发回退：wrangler 多 worker dev registry 在部分环境不稳（Network connection lost）。
-    // 配置 DEV_BILLING_URL 时直接 HTTP 调本地 billing（仅限本地 dev；生产不配置，恒走 Service Binding）。
-    resp = env.DEV_BILLING_URL
-      ? await fetch(env.DEV_BILLING_URL.replace(/\/$/, '') + path, { method: init?.method ?? 'GET', headers, body })
-      : await env.BILLING.fetch(`https://yuer-billing${path}`, { method: init?.method ?? 'GET', headers, body });
+  // 本地开发回退：wrangler 多 worker dev registry 在部分环境不稳（Network connection lost）。
+  // 双门禁（ENABLE_DEV_SESSION=1 且配置了 DEV_BILLING_URL）才走 HTTP 直连——生产两个变量都不配，
+  // 恒走 Service Binding；误配单一变量的半开状态直接被门禁挡掉（否则计费流量+内部令牌会发往任意主机）。
+  const devDirect = (env.ENABLE_DEV_SESSION || '') === '1' && !!env.DEV_BILLING_URL;
+  resp = devDirect
+    ? await fetch((env.DEV_BILLING_URL as string).replace(/\/$/, '') + path, { method: init?.method ?? 'GET', headers, body })
+    : await env.BILLING.fetch(`https://yuer-billing${path}`, { method: init?.method ?? 'GET', headers, body });
   } catch (err) {
     console.error('[billing] BILLING.fetch 异常:', err instanceof Error ? err.message : err);
     throw new BillingError('计费服务暂不可用，请稍后重试', 503, 'billing_unreachable');
@@ -136,9 +138,10 @@ export function redeem(
 // ── 管理代理（/admin/*，仅 admin 角色路由可达）──
 
 export function adminGift(
-  env: Env, userId: string, points: number, note?: string,
+  env: Env, userId: string, points: number, note?: string, operator?: string,
 ): Promise<{ balance: number }> {
-  return call(env, '/admin/gift', { method: 'POST', body: { userId, points, note } });
+  // operator：资金操作不可抵赖审计锚点（essay 代理层从管理员会话注入，billing 不信任任何客户端自报身份）
+  return call(env, '/admin/gift', { method: 'POST', body: { userId, points, note, operator } });
 }
 
 export function adminByokSet(
@@ -152,15 +155,15 @@ export function adminByokSet(
 }
 
 export function adminCodes(
-  env: Env, points: number, count: number, batch?: string,
+  env: Env, points: number, count: number, batch?: string, operator?: string,
 ): Promise<{ codes: string[]; batch: string }> {
-  return call(env, '/admin/codes', { method: 'POST', body: { points, count, batch } });
+  return call(env, '/admin/codes', { method: 'POST', body: { points, count, batch, operator } });
 }
 
 export function adminManualOrder(
-  env: Env, userId: string, points: number, note?: string,
+  env: Env, userId: string, points: number, note?: string, operator?: string,
 ): Promise<{ orderId: string }> {
-  return call(env, '/admin/orders/manual', { method: 'POST', body: { userId, points, note } });
+  return call(env, '/admin/orders/manual', { method: 'POST', body: { userId, points, note, operator } });
 }
 
 export function adminUser(

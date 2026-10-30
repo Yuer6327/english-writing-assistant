@@ -82,10 +82,26 @@ function memberOnly(c: Context<{ Bindings: Env; Variables: Vars }>): Response | 
   return c.json({ error: '该功能登录后可用（游客仅支持批改）', code: 'login_required' }, 403);
 }
 
-/** 游客 IP 级软兜底：清掉 cookie 就能重置次数，IP 计数让刷次数变贵（内存计数，尽力而为） */
-function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, limit: number): boolean {
+/** 游客 IP 级软兜底：清掉 cookie 就能重置次数，IP 计数让刷次数变贵（内存计数，尽力而为）。
+ *  scope 分桶：批改/建作文/OCR 的合理频次不同，共用一个桶会互相挤占（过度限制）。 */
+function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, scope: string, limit: number): boolean {
   if (!c.get('isGuest')) return false;
-  return rateLimitHit(`guest:ip:${clientIp(c)}`, limit, 24 * 3600_000);
+  return rateLimitHit(`guest:ip:${scope}:${clientIp(c)}`, limit, 24 * 3600_000);
+}
+
+/**
+ * 登录用户写路径限流：PUT/DELETE（改稿/删稿/改作文）与创建类 POST 原先零限流，
+ * 脚本化高频写会放大 D1 写配额与存储消耗（实测 25 连发 PUT 全 200）。30 次/分钟
+ * 对正常用户无感（前端每次写都有人工间隔），足以掐掉写放大。
+ */
+function memberWriteLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>): boolean {
+  if (c.get('isGuest')) return false; // 游客另有 guestIpLimit 逐操作兜底
+  return rateLimitHit(`write:${c.get('userId')}`, 60, 60_000);
+}
+
+/** 写路径限流统一响应 */
+function writeLimitResponse(c: Context<{ Bindings: Env; Variables: Vars }>): Response {
+  return c.json({ error: '操作过于频繁，请稍后再试', code: 'write_rate_limited' }, 429);
 }
 
 /**
@@ -119,6 +135,7 @@ api.post('/essays', userMiddleware, async (c) => {
     topic_images?: string[]; custom_prompt?: string;
   }>().catch(() => ({}) as any);
 
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const title = (body.title || '').trim();
   const topicText = (body.topic_text || '').trim();
   if (!title) return c.json({ error: '标题不能为空' }, 400);
@@ -135,7 +152,7 @@ api.post('/essays', userMiddleware, async (c) => {
   }
 
   // 游客 IP 兜底：建作文同样受 IP 计数约束（清 cookie 轮换不能再无限灌作文/图片）
-  if (guestIpLimitHit(c, 15)) {
+  if (guestIpLimitHit(c, 'essay', 15)) {
     return c.json({ error: '今日请求次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
   }
 
@@ -271,6 +288,7 @@ api.put('/essays/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const body = await c.req.json<{
     title?: string; topic_text?: string; topic_images?: string[]; custom_prompt?: string | null;
   }>().catch(() => ({}) as any);
@@ -309,7 +327,8 @@ api.put('/essays/:id', userMiddleware, async (c) => {
   if (sets.length === 0) return c.json({ ok: true });
 
   sets.push("updated_at = datetime('now')");
-  await c.env.DB.prepare(`UPDATE essays SET ${sets.join(', ')} WHERE id = ?`).bind(...vals, essayId).run();
+  await c.env.DB.prepare(`UPDATE essays SET ${sets.join(', ')} WHERE id = ? AND user_id = ?`)
+    .bind(...vals, essayId, userId).run();
   return c.json({ ok: true });
 });
 
@@ -462,7 +481,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   }
 
   // 次数门禁（业务侧口径：成功才计数）——放在调 AI 之前，避免白烧 token
-  if (guestIpLimitHit(c, 15)) {
+  if (guestIpLimitHit(c, 'review', 15)) {
     return c.json({ error: '今日批改次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
   }
   const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
@@ -662,7 +681,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
       prompt_source: promptSource,
       model,
       result,
-      points_charged: charged,          // 分（前端 ÷100 展示）
+      points_charged: charged,          // 微积分（前端 ÷10000 展示为积分）
       lane: laneLabel(lane),            // free / paid / byok
       quota: await quotaState(c.env.DB, userId, isGuest),
     });

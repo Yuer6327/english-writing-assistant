@@ -30,6 +30,15 @@ app.use('/api/*', async (c, next) => {
 app.use('/api/*', corsMiddleware);
 app.use('/api/*', sameOriginGuard);
 
+// ── 请求体大小闸门：按 Content-Length 在入口拒绝（旧实现 6MB JSON 也会被完整解析后才截断）──
+// /api/ocr 上限 14MB（3 张 ×4MB base64 + JSON 开销）；其余 API 2.5MB（题目 3 图前端压至 ≤300KB/张绰绰有余）
+app.use('/api/*', async (c, next) => {
+  const len = Number(c.req.header('content-length') || 0);
+  const cap = c.req.path.startsWith('/api/ocr') ? 14 * 1024 * 1024 : 2.5 * 1024 * 1024;
+  if (len > cap) return c.json({ error: '请求体过大', code: 'payload_too_large' }, 413);
+  await next();
+});
+
 // ── API 路由 ──
 app.route('/api/auth', authRoutes);
 app.route('/api', essayRoutes);      // /api/essays..., /api/drafts...

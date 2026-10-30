@@ -25,10 +25,10 @@ import { baiduOcr, BAIDU_ENDPOINT_LABELS } from '../utils/baidu-ocr';
 
 const ocr = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-/** 游客 IP 级软兜底（与 essays.ts 同口径：清 cookie 重置后，IP 计数让刷额度变贵） */
-function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, limit: number): boolean {
+/** 游客 IP 级软兜底（scope 独立分桶，与 essays.ts 同口径：清 cookie 重置后，IP 计数让刷额度变贵） */
+function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, scope: string, limit: number): boolean {
   if (!c.get('isGuest')) return false;
-  return rateLimitHit(`guest:ip:${clientIp(c)}`, limit, 24 * 3600_000);
+  return rateLimitHit(`guest:ip:${scope}:${clientIp(c)}`, limit, 24 * 3600_000);
 }
 
 function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: false; error: string } {
@@ -55,7 +55,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   const mode = body.mode === 'baidu' ? 'baidu' : 'vlm';
 
   // 游客 IP 兜底：OCR 打的是共享百度/AI 额度，清 cookie 轮换不能无限刷
-  if (guestIpLimitHit(c, 10)) {
+  if (guestIpLimitHit(c, 'ocr', 10)) {
     return c.json({ error: '今日识别次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
   }
 

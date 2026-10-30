@@ -8,18 +8,27 @@
 
 import { loadScript, toast, gradeFor } from './api.js?v=20261027c';
 
-// ── CDN 资源（jsdmirror 镜像）──
+// ── CDN 资源 ──
+// 脚本带 SRI（sha384）：镜像被投毒时浏览器拒绝执行，供应链风险收敛为「不可用」而非「任意代码」。
+// 中文字体已改为同源自托管（public/fonts/，2026-10-31）：旧实现拉 noto-cjk@main 移动分支，
+// 上游一更新就静默换文件——同源 + CSP font-src 'self' 后不再依赖第三方。
 const DOCX_CDN = 'https://cdn.jsdmirror.com/npm/docx@8.5.0/build/index.umd.js';
 const PDFLIB_CDN = 'https://cdn.jsdmirror.com/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js';
 const FONTKIT_CDN = 'https://cdn.jsdmirror.com/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js';
-const NOTO_FONT_URL = 'https://cdn.jsdmirror.com/gh/googlefonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf';
+/** SRI 与上面的固定版本 URL 一一对应；升级版本号必须同步重算（下载文件算 sha384） */
+const SRI = {
+  [DOCX_CDN]: 'sha384-4xaIisuLEy2lo2HkB2C4rEf7v8jbTb2kuogX6TkuEt9feTWKBSFSOzsqNNbV+sKh',
+  [PDFLIB_CDN]: 'sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI',
+  [FONTKIT_CDN]: 'sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn',
+};
+const NOTO_FONT_URL = '/fonts/NotoSansSC-Regular.otf';
 
 const _libs = { docx: null, PDFLib: null, fontkit: null, notoFont: null };
 
 async function ensureDocx() {
   if (_libs.docx) return _libs.docx;
   if (window.docx) { _libs.docx = window.docx; return _libs.docx; }
-  await loadScript(DOCX_CDN);
+  await loadScript(DOCX_CDN, SRI[DOCX_CDN]);
   _libs.docx = window.docx;
   if (!_libs.docx) throw new Error('Word 生成组件加载失败，请检查网络后重试');
   return _libs.docx;
@@ -31,7 +40,7 @@ async function ensurePdfLib() {
     _libs.PDFLib = window.PDFLib; _libs.fontkit = window.fontkit;
     return { PDFLib: _libs.PDFLib, fontkit: _libs.fontkit };
   }
-  await Promise.all([loadScript(PDFLIB_CDN), loadScript(FONTKIT_CDN)]);
+  await Promise.all([loadScript(PDFLIB_CDN, SRI[PDFLIB_CDN]), loadScript(FONTKIT_CDN, SRI[FONTKIT_CDN])]);
   _libs.PDFLib = window.PDFLib; _libs.fontkit = window.fontkit;
   if (!_libs.PDFLib || !_libs.fontkit) throw new Error('PDF 生成组件加载失败，请检查网络后重试');
   return { PDFLib: _libs.PDFLib, fontkit: _libs.fontkit };
@@ -40,7 +49,7 @@ async function ensurePdfLib() {
 function ensureNotoFont() {
   if (_libs.notoFont) return _libs.notoFont;
   _libs.notoFont = fetch(NOTO_FONT_URL).then(r => {
-    if (!r.ok) throw new Error('中文字体下载失败（HTTP ' + r.status + '），请检查网络后重试');
+    if (!r.ok) throw new Error('中文字体载入失败（HTTP ' + r.status + '），请检查网络后重试');
     return r.arrayBuffer();
   }).catch(err => { _libs.notoFont = null; throw err; });
   return _libs.notoFont;

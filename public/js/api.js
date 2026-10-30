@@ -246,7 +246,8 @@ export function gradeFor(score) {
 
 // ── 按需加载外部脚本（并发共享同一个加载 Promise）──
 const scriptPromises = new Map();
-export function loadScript(src) {
+/** 加载外部脚本；外部 CDN 一律带 integrity（SRI）——镜像被投毒时浏览器拒绝执行而非注入代码 */
+export function loadScript(src, integrity) {
   if (scriptPromises.has(src)) return scriptPromises.get(src);
   const existing = document.querySelector(`script[src="${src}"]`);
   if (existing?.dataset.loaded === 'true') return Promise.resolve();
@@ -255,9 +256,13 @@ export function loadScript(src) {
     s.addEventListener('load', () => { s.dataset.loaded = 'true'; resolve(); }, { once: true });
     s.addEventListener('error', () => {
       scriptPromises.delete(src);
-      reject(new Error(`脚本加载失败: ${src}`));
+      reject(new Error(`脚本加载失败${integrity ? '（校验不匹配或网络异常）' : ''}: ${src}`));
     }, { once: true });
     if (!existing) {
+      if (integrity) {
+        s.integrity = integrity;
+        s.crossOrigin = 'anonymous';
+      }
       s.src = src;
       s.async = true;
       document.head.appendChild(s);
