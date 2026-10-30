@@ -38,7 +38,7 @@ billingRoutes.get('/me', authMiddleware, async (c) => {
 billingRoutes.post('/redeem', authMiddleware, async (c) => {
   const userId = c.get('userId');
   const body = await c.req.json<{ code?: string }>().catch(() => ({}) as any);
-  const code = (body.code || '').trim();
+  const code = (typeof body.code === 'string' ? body.code : '').trim();
   if (!code) return c.json({ error: '请输入兑换码' }, 400);
   // 兑换码格式固定，限制长度避免超长串打到计费服务
   if (code.length > 64) return c.json({ error: '兑换码格式不正确' }, 400);

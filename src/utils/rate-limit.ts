@@ -80,6 +80,16 @@ export function agnesGlobalRateHit(): boolean {
   return rateLimitHit('ai:agnes:global', AI_GLOBAL_RPM, AI_WINDOW_MS);
 }
 
+/**
+ * 登录用户写路径限流（60 次/分钟）：PUT/DELETE 与创建类 POST 共用。
+ * 动机：脚本化高频写会放大 D1 写配额与存储消耗（实测 25 连发 PUT 全 200）。
+ * 游客不占此桶（另有 guest:ip 逐操作兜底）。prompts/settings 等其余写端点同挂。
+ */
+export function memberWriteLimitHit(c: { get(name: string): unknown }): boolean {
+  if (c.get('isGuest')) return false;
+  return rateLimitHit(`write:${c.get('userId')}`, 60, 60_000);
+}
+
 export class AgnesRateLimitError extends Error {
   constructor(message = '免费 API 调用过于频繁（每分钟约 20 次），请稍后再试') {
     super(message);

@@ -8,6 +8,7 @@
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
 import { authMiddleware } from '../middleware/auth';
+import { memberWriteLimitHit } from '../utils/rate-limit';
 import { AGNES_BASE_URLS, AGNES_MODEL } from '../utils/api-config';
 import * as billing from '../utils/billing';
 
@@ -49,13 +50,16 @@ function checkModelName(raw: string | undefined): string | null {
 
 // ── 保存 / 更新 API 配置 ──
 settings.post('/api-keys', authMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return c.json({ error: '操作过于频繁，请稍后再试', code: 'write_rate_limited' }, 429);
   const userId = c.get('userId');
   const body = await c.req.json<SaveBody>().catch(() => ({}) as SaveBody);
   const p = body.provider === 'agnes' ? 'agnes' : 'byok';
 
   // ── 端点/模型名校验：https（本地环回可用 http），并封顶长度 ──
-  const baseUrlErr = normalizeBaseUrl(body.api_base_url) ?? normalizeBaseUrl(body.vision_api_base_url) ?? '';
-  const modelErr = checkModelName(body.model_name) ?? checkModelName(body.vision_model_name) ?? '';
+  const baseUrlErr = normalizeBaseUrl(typeof body.api_base_url === 'string' ? body.api_base_url : undefined)
+    ?? normalizeBaseUrl(typeof body.vision_api_base_url === 'string' ? body.vision_api_base_url : undefined) ?? '';
+  const modelErr = checkModelName(typeof body.model_name === 'string' ? body.model_name : undefined)
+    ?? checkModelName(typeof body.vision_model_name === 'string' ? body.vision_model_name : undefined) ?? '';
   const bad = baseUrlErr || modelErr;
   if (bad) return c.json({ error: bad }, 400);
 
@@ -67,18 +71,18 @@ settings.post('/api-keys', authMiddleware, async (c) => {
     }
 
     // ── BYOK：Key 留空则 billing 侧保留旧值 ──
-    const key = body.api_key?.trim();
+    const key = typeof body.api_key === 'string' ? body.api_key.trim() : undefined;
     const st = await billing.byokStatus(c.env, userId);
     if (!key && !st.configured) return c.json({ error: 'API Key 不能为空' }, 400);
     if (key && key.length > 400) return c.json({ error: 'API Key 过长' }, 400);
 
-    const baseUrl = body.api_base_url?.trim() || st.baseUrl || 'https://api.openai.com/v1';
-    const model = body.model_name?.trim() || st.model || 'gpt-4o-mini';
+    const baseUrl = (typeof body.api_base_url === 'string' ? body.api_base_url.trim() : '') || st.baseUrl || 'https://api.openai.com/v1';
+    const model = (typeof body.model_name === 'string' ? body.model_name.trim() : '') || st.model || 'gpt-4o-mini';
     await billing.adminByokSet(c.env, userId, {
       key,
       baseUrl,
       model,
-      visionKey: body.vision_api_key?.trim() || undefined,
+      visionKey: typeof body.vision_api_key === 'string' ? body.vision_api_key.trim() || undefined : undefined,
       visionBaseUrl: body.vision_api_base_url?.trim() || undefined,
       visionModel: body.vision_model_name?.trim() || undefined,
     });

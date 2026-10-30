@@ -7,7 +7,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
-import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp } from '../utils/rate-limit';
+import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp, memberWriteLimitHit } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart } from '../utils/ai';
 import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
@@ -69,6 +69,11 @@ function parseJsonField<T>(v: unknown, fallback: T, context = ''): T {
   }
 }
 
+/** 请求体字符串字段统一收敛：JSON 类型混淆（{} / [] / 数字）不再触发 .trim() TypeError → 500 */
+function strField(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
 /** 路径/请求体里的自增 id：必须是正整数，否则直接当"不存在"（避免 NaN 绑定与无谓查库） */
 function parseId(raw: unknown): number | null {
   if (typeof raw !== 'string' && typeof raw !== 'number') return null;
@@ -87,16 +92,6 @@ function memberOnly(c: Context<{ Bindings: Env; Variables: Vars }>): Response | 
 function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, scope: string, limit: number): boolean {
   if (!c.get('isGuest')) return false;
   return rateLimitHit(`guest:ip:${scope}:${clientIp(c)}`, limit, 24 * 3600_000);
-}
-
-/**
- * 登录用户写路径限流：PUT/DELETE（改稿/删稿/改作文）与创建类 POST 原先零限流，
- * 脚本化高频写会放大 D1 写配额与存储消耗（实测 25 连发 PUT 全 200）。30 次/分钟
- * 对正常用户无感（前端每次写都有人工间隔），足以掐掉写放大。
- */
-function memberWriteLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>): boolean {
-  if (c.get('isGuest')) return false; // 游客另有 guestIpLimit 逐操作兜底
-  return rateLimitHit(`write:${c.get('userId')}`, 60, 60_000);
 }
 
 /** 写路径限流统一响应 */
@@ -136,8 +131,8 @@ api.post('/essays', userMiddleware, async (c) => {
   }>().catch(() => ({}) as any);
 
   if (memberWriteLimitHit(c)) return writeLimitResponse(c);
-  const title = (body.title || '').trim();
-  const topicText = (body.topic_text || '').trim();
+  const title = strField(body.title).trim();
+  const topicText = strField(body.topic_text).trim();
   if (!title) return c.json({ error: '标题不能为空' }, 400);
   if (!topicText) return c.json({ error: '题目内容不能为空' }, 400);
   const genre = body.genre && GENRES[body.genre] ? body.genre : 'sh-gaokao-essay';
@@ -145,7 +140,8 @@ api.post('/essays', userMiddleware, async (c) => {
   const img = validImages(body.topic_images);
   if (!img.ok) return c.json({ error: img.error }, 400);
 
-  const customPrompt = body.custom_prompt?.trim() ? body.custom_prompt.trim() : null;
+  const customPromptRaw = strField(body.custom_prompt).trim();
+  const customPrompt = customPromptRaw ? customPromptRaw : null;
   if (customPrompt) {
     const valid = validatePromptTemplate(customPrompt);
     if (!valid.ok) return c.json({ error: valid.error }, 400);
@@ -236,12 +232,17 @@ api.get('/essays/:id', userMiddleware, async (c) => {
   ).bind(essayId).all<any>();
 
   const draftIds = drafts.results.map(d => d.id);
-  const reviews = draftIds.length
-    ? (await c.env.DB.prepare(
-        `SELECT id, draft_id, result, model, reviewed_text, created_at FROM reviews
-         WHERE draft_id IN (${draftIds.map(() => '?').join(',')}) ORDER BY id ASC`,
-      ).bind(...draftIds).all<any>()).results
-    : [];
+  // D1 单查询绑定参数上限 100：成员建稿数无上限（by design），
+  // ≥100 稿时 IN (?) 展开会直接 500 —— 按 90 一批分片取回后合并。
+  const reviews: any[] = [];
+  for (let i = 0; i < draftIds.length; i += 90) {
+    const chunk = draftIds.slice(i, i + 90);
+    const rows = await c.env.DB.prepare(
+      `SELECT id, draft_id, result, model, reviewed_text, created_at FROM reviews
+       WHERE draft_id IN (${chunk.map(() => '?').join(',')}) ORDER BY id ASC`,
+    ).bind(...chunk).all<any>();
+    reviews.push(...rows.results);
+  }
 
   const polishes = (await c.env.DB.prepare(
     `SELECT id, draft_id, mode, created_at
@@ -301,12 +302,12 @@ api.put('/essays/:id', userMiddleware, async (c) => {
   const sets: string[] = [];
   const vals: any[] = [];
   if (body.title !== undefined) {
-    const t = body.title.trim();
+    const t = strField(body.title).trim();
     if (!t) return c.json({ error: '标题不能为空' }, 400);
     sets.push('title = ?'); vals.push(t.slice(0, 200));
   }
   if (body.topic_text !== undefined) {
-    const t = body.topic_text.trim();
+    const t = strField(body.topic_text).trim();
     if (!t) return c.json({ error: '题目内容不能为空' }, 400);
     sets.push('topic_text = ?'); vals.push(t.slice(0, 8000));
   }
@@ -317,7 +318,8 @@ api.put('/essays/:id', userMiddleware, async (c) => {
   }
   if (body.custom_prompt !== undefined) {
     // 显式传 null / 空串 = 清除自定义，回落用户模板/内置默认
-    const p = body.custom_prompt && body.custom_prompt.trim() ? body.custom_prompt.trim() : null;
+    const pRaw = strField(body.custom_prompt).trim();
+    const p = pRaw ? pRaw : null;
     if (p) {
       const valid = validatePromptTemplate(p);
       if (!valid.ok) return c.json({ error: valid.error }, 400);
@@ -363,7 +365,7 @@ api.post('/essays/:id/drafts', userMiddleware, async (c) => {
   ).bind(essayId, userId).first();
   if (!essay) return c.json({ error: '作文不存在' }, 404);
 
-  const text = (body.text || '').replace(/\r\n/g, '\n').trim();
+  const text = strField(body.text).replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
   if (text.length > MAX_ESSAY_CHARS) return c.json({ error: '稿件内容过长' }, 400);
 
@@ -426,7 +428,7 @@ api.put('/drafts/:id', userMiddleware, async (c) => {
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const body = await c.req.json<{ text?: string }>().catch(() => ({}) as any);
 
-  const text = (body.text || '').replace(/\r\n/g, '\n').trim();
+  const text = strField(body.text).replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
   // 与新建稿件同一条上限，避免绕过前端直接写超长文本撑爆 D1 行体积
   if (text.length > MAX_ESSAY_CHARS) return c.json({ error: '稿件内容过长' }, 400);
@@ -721,8 +723,8 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
   // 旧实现把片段长度校验放在 hold 之后，早退时既没 settle 也没 release，
   // 冻结的积分要等 cron 过期才回滚（用户会看到"没批改却扣了额度"）。
   const isFragment = body.mode === 'fragment';
-  const fragment = (body.fragment || '').trim();
-  const instruction = (body.instruction || '').trim().slice(0, 1000) || '无特别要求，按常规标准精修';
+  const fragment = strField(body.fragment).trim();
+  const instruction = strField(body.instruction).trim().slice(0, 1000) || '无特别要求，按常规标准精修';
   if (isFragment) {
     if (fragment.length < 3) return c.json({ error: '选中的片段过短' }, 400);
     if (fragment.length > 3000) return c.json({ error: '选中的片段过长（≤3000 字符）' }, 400);

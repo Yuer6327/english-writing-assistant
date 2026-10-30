@@ -57,6 +57,12 @@ app.route('/api/billing', billingRoutes);
 // ── 健康检查 ──
 app.get('/api/health', (c) => c.json({ status: 'ok', time: new Date().toISOString() }));
 
+// ── 未捕获异常统一出口：JSON 而非 HTML「Internal Server Error」──
+app.onError((err, c) => {
+  console.error('[unhandled]', c.req.method, c.req.path, err instanceof Error ? err.message : err);
+  return c.json({ error: '服务器开小差了，请稍后重试' }, 500);
+});
+
 // ── 未知 API 路径：明确 404，避免落到静态资源层拿到 index.html ──
 app.all('/api/*', (c) => c.json({ error: '接口不存在' }, 404));
 

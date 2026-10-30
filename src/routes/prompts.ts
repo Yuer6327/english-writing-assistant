@@ -10,6 +10,7 @@
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
 import { authMiddleware } from '../middleware/auth';
+import { memberWriteLimitHit } from '../utils/rate-limit';
 import { DEFAULT_PROMPTS, GENRES, PLACEHOLDER_DOC, validatePromptTemplate } from '../utils/prompts';
 
 const prompts = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -60,12 +61,13 @@ prompts.get('/:genre', authMiddleware, async (c) => {
 
 // ── 保存 / 清除某个模式的覆盖（content 传空 = 该模式恢复内置默认）──
 prompts.put('/:genre', authMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return c.json({ error: '操作过于频繁，请稍后再试', code: 'write_rate_limited' }, 429);
   const userId = c.get('userId');
   const genre = c.req.param('genre');
   if (!GENRES[genre]) return c.json({ error: '未知模式' }, 404);
 
   const body = await c.req.json<{ content?: string }>().catch(() => ({}) as any);
-  const content = (body.content || '').trim();
+  const content = (typeof body.content === 'string' ? body.content : '').trim();
 
   if (!content) {
     await c.env.DB.prepare('DELETE FROM prompt_templates WHERE user_id = ? AND genre = ?')
