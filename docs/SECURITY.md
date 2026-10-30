@@ -101,3 +101,29 @@
 - P2-5：统一 429 语义（`code` + `retry_after`），前端可倒计时。
 - billing `redeem`：核销（guarded UPDATE）与入账（credit+order）分两批，中间崩溃会「码烧了钱没到」；可合并进一个 batch（先 claim 后，同批写入）。
 - `expireHolds` 认领与退款 batch 之间崩溃会留下「expired 未退款」的 hold；可加对账查询兜底。
+
+---
+
+## 六、第 2-7 轮子代理攻防循环（2026-10-31，收敛记录）
+
+按「每轮修改后由独立 subagent 审计/攻击，直到无子代理能挖出漏洞」的流程又跑了六轮，发现数逐轮收敛：**13 → 4 → 3 → 2 → 1 → 0**。
+
+| 轮次 | 角色 | 发现 | 修复 |
+|---|---|---|---|
+| R1（2 名独立审计员） | writing 权限视角 + billing 资金视角 | P1×5（admin 资金操作无 operator 溯源、settle 崩溃窗口资金卡死、debit 非原子、浮点资金、internal fail-open）+ P2×8 + P3×10+ | 全部修复（billing 28942fb / writing 874ff9d）：fail-closed、operator 列（0005 迁移）、对账 cron、幂等如实返回、金额钳制、redeem 孤儿码对账、恒时比较、写路径限流、SRI、会话解析 last-wins、DEV 双门禁、CJK token 估算 |
+| R2（对抗验证员） | 逐项攻击 15 项修复 | 14/15 成立；4 P2（chunked 绕过 body 闸门、billing LIMIT 负数直穿、写限流覆盖缺口、cron 用例空断言） | 修复（45341db / cb5696c） |
+| R3（终局狩猎员） | HTTP 语义/类型混淆/资源边界等 14 角度 | 3 P3（类型混淆 500、prompts/settings 限流缺口、≥100 稿 D1 bind 悬崖） | 修复（586cfbc） |
+| R4（收敛判定员） | R3 修复验证 + 自由狩猎 | 2 P3（null body 500、GENRES 原型键混淆持久自伤） | 修复（4ccfea4） |
+| R5（收敛终判） | R4 验证 + 存量数据/SPA 竞态 | billing null body 漏网（11 处）+ getEffectivePrompt 存量原型键 + swup stale-init | 修复（5a9f97d / 304f0e9） |
+| R6（终判） | R5 验证 + 全域抽查 | 3 P3（settle null body 漏网、byok/tags 错型、swup 窄竞态） | 修复（d9ae016 / 8b11714） |
+| R7（最终确认） | R6 验证 + 双套件 + 5 攻击面复测 | **无新发现** | —（判「收敛成立，可以上线」） |
+
+权限体系独立评审结论（R2 并行的架构评审）：**「基本达标，可以上线，但有条件」**——条件为 INTERNAL_TOKEN 生产配置（✅ 已配两 Worker 并实测确认存在）、账实漂移告警出网（✅ ALERT_WEBHOOK 已实现）、admin 2FA（auth 平台侧人工确认项）、billing 无公网入口实测（✅ workers_dev=false + preview_urls=false）。评审列出的路线图项：管理面/业务面双令牌拆分（G1，一周内）、免费车道 polish/ocr 计次（G6）、AUTH_DB 绑定改会话验证接口（G5，中期）。
+
+### 运行套件
+
+```bash
+node scripts/security/mock-ai.mjs &        # 本地 mock AI（:9101）
+node scripts/security/attack-writing.mjs   # writing 37 用例（:8788）
+node scripts/security/attack-billing.mjs   # billing 23 用例（:8789，需 --test-scheduled 启动 cron 用例）
+```
