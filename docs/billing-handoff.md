@@ -54,7 +54,7 @@
 | 11 | 作文 App 先行接入；阅读助手暂不动 |
 | 12 | 政策：积分不过期、不可提现、问题订单人工补退 |
 | 13 | BYOK 凭证上收 billing（加密存储、跨项目复用），essay `api_keys` 表迁移后废弃 |
-| 14 | 计费最小单位 = 0.01 积分（分），单次结算**向上取整到分**；0.0001 微点仅存 usage_logs 供成本核算 |
+| 14 | 计费最小单位 = 0.0001 积分（微积分），单次结算向上取整到 1 微积分；1 积分 = 1 元（2026-10-30 修订，原「0.01 积分」口径作废） |
 | 15 | 兑换码面额：0.1 / 0.5 / 1 / 3 / 5 / 10 元 |
 | 16 | 仓库 Yuer6327-billing（私有）/ Worker 名 yuer-billing |
 | 17 | DeepSeek 暂无 Key：付费档代码完整但目录 disabled |
@@ -256,7 +256,7 @@ interface ServiceDef {
 初始三条 + 一个伪模型：
 1. `llm:agnes-flash` — free / enabled / heavy / vision:true / **jsonMode:false**（Agnes 不支持 response_format）/ baseUrl 双端点数组 `['https://apihub.agnes-ai.cn/v1','https://apihub.agnes-ai.com/v1']` / upstreamModel `agnes-3.0-flash` / secret AGNES_API_KEY / price null（免费）。
 2. `llm:deepseek-flash` — paid / **enabled:false（无 Key）** / heavy / vision:true / jsonMode:true（启用时实测核验，见 §9.2）/ baseUrl `https://api.deepseek.com/v1` / upstreamModel `deepseek-flash` / secret DEEPSEEK_API_KEY / price null（拿到控制台单价后填，N 先按 2）。
-3. `ocr:baidu` — kind percall / tier free-quota（额度内免费，超出按次）/ enabled:true / heavy:false / price `{perCall: 1}`（1 分 = 0.01 积分）。
+3. `ocr:baidu` — kind percall / tier free-quota（额度内免费，超出按次）/ enabled:true / heavy:false / price `{perCall: 10000}`（10000 微积分 = 1 积分）。
 4. 伪模型 `byok` — 不入目录；`config/hold` 遇到 `modelId='byok'` 走 byok_keys 解析，零计费。
 
 另外导出 `PROJECTS = ['writing']`（未来加 'reading'）与 `estimateHoldCost(service, estInputTokens, maxOutputTokens)`：llm = `ceil((est_in*inputPer1k + max_out*outputPer1k)/1000)`，最低 1 分；percall = perCall。
@@ -340,7 +340,7 @@ interface ServiceDef {
 2. **`public/js/essay.js`** — 三处 AI 触发点：
    - 模型选择控件：批改在 `renderDraftPanel()` 按钮行（~L171-180，「开始批改」旁）；精修在 `openPolishModal()`（~L646）表单内；统一 `<select>`：免费通道 / DeepSeek（积分）（仅当 `billing.me().paid_enabled`）/ 我的 Key（仅当 settings status provider==='byok'）。默认值 = 我的 Key（若配置）否则免费通道，与服务端默认规则一致；精修/批改各自记忆上次选择（内存即可）。
    - 积分档提示：选中 DeepSeek 时在按钮旁显示 muted 文案「按用量计积分，通常约 0.02~0.1 积分/次，实结多退少补」。
-   - OCR 弹窗（`openDraftModal()`，现有 radio `name="ocr-engine"` 行）加一行 muted 说明：「百度 OCR 每日 5 次免费，超出 0.01 积分/次；大模型识别按用量计积分」。
+   - OCR 弹窗（`openDraftModal()`，现有 radio `name="ocr-engine"` 行）加一行 muted 说明：「百度 OCR 每日 5 次免费，超出按次计费；大模型识别按用量计积分」。
    - **402 处理**：runReview/runFullRewrite/精修/OCR 的 catch 里判 `err.code === 'insufficient_balance'` → `wbModal()` 弹「余额不足」卡片（余额 + 「去设置页充值」链接 `/settings.html#billing`），其余错误维持 toast。
    - 成功展示：响应新增 `points_charged`，在 `renderReview()` 的模型行（现有 rv.model `<span class="muted">`）旁追加「本次消耗 X 积分」（X = points_charged/100，两位小数；0 则显示「免费」）。
 3. **`public/settings.html` + `settings.js`**：在「AI 服务配置」与「批改提示词模板」两张 card 之间插入「账户与用量」card（`id="card-billing"`，可深链 `#billing`）：余额大数字（两位小数）、兑换码表单（输入 + 兑换按钮 → toast + 刷新余额）、近 20 条用量表（时间/服务/消耗/状态）、以及一行 muted 提示「**在线支付暂未开放**，当前可通过兑换码充值」。settings.js 的 `init()` 加 `initBillingSection()`（沿用现有 initXxx 模式）。

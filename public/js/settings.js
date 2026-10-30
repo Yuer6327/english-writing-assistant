@@ -3,7 +3,7 @@
 // swup 管理：导出 init/cleanup。表单元素随 main 每次切页重建，均在 init 中绑定。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026d';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261027c';
 
 let generation = 0;
 let reloadTimer = null;
@@ -93,7 +93,7 @@ export async function initBillingSection(gen = generation) {
   }
   if (gen !== generation) return;
 
-  balanceEl.textContent = (me.balance / 100).toFixed(2);
+  balanceEl.textContent = (me.balance / 10000).toFixed(2);
 
   renderQuotaRows(quotaEl, session?.quota, me.quota?.writing || []);
 
@@ -105,7 +105,7 @@ export async function initBillingSection(gen = generation) {
     <tr>
       <td style="padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text-light);white-space:nowrap">${formatBeijingTime(u.created_at)}</td>
       <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${SERVICE_LABELS[u.service] || escapeHtml(u.service)}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums">${(u.points_charged / 100).toFixed(2)} 积分</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums">${(u.points_charged / 10000).toFixed(2)} 积分</td>
       <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${statusBadge(u.status)}</td>
     </tr>`).join('') || `<tr><td colspan="4" style="padding:12px 8px;color:var(--text-light)">暂无用量记录</td></tr>`;
 
@@ -122,7 +122,7 @@ export async function initBillingSection(gen = generation) {
       try {
         const res = await api.billing.redeem(code);
         if (gen !== generation) return;
-        toast(`兑换成功，到账 ${(res.points / 100).toFixed(2)} 积分`, 'success');
+        toast(`兑换成功，到账 ${(res.points / 10000).toFixed(2)} 积分`, 'success');
         input.value = '';
         await initBillingSection(gen);
       } catch (err) {

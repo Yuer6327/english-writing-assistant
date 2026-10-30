@@ -92,8 +92,8 @@ async function userIdByUsername(env: Env, username: string): Promise<string | nu
 admin.post('/gift', async (c) => {
   const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
-  const points = Math.round((Number(body.points_yuan) || 0) * 100);
-  if (!Number.isFinite(points) || points === 0) return c.json({ error: '金额需为非零数值（元）' }, 400);
+  const points = Math.round((Number(body.points_yuan) || 0) * 10000);
+  if (!Number.isFinite(points) || points === 0) return c.json({ error: '金额需为非零数值（元，1 元 = 1 积分）' }, 400);
 
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
@@ -137,8 +137,8 @@ admin.post('/tags', async (c) => {
 
 admin.post('/codes', async (c) => {
   const body = await c.req.json<{ points_yuan?: number; count?: number; batch?: string }>().catch(() => ({}) as any);
-  const points = Math.round((Number(body.points_yuan) || 0) * 100);
-  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '面额需为正数（元）' }, 400);
+  const points = Math.round((Number(body.points_yuan) || 0) * 10000);
+  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '面额需为正数（元，1 元 = 1 积分）' }, 400);
   const count = Math.max(1, Math.min(200, Number(body.count) || 1));
   try {
     return c.json(await billing.adminCodes(c.env, points, count, body.batch?.trim().slice(0, 60) || undefined));
@@ -151,8 +151,8 @@ admin.post('/codes', async (c) => {
 admin.post('/orders/manual', async (c) => {
   const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
-  const points = Math.round((Number(body.points_yuan) || 0) * 100);
-  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '金额需为正数（元）' }, 400);
+  const points = Math.round((Number(body.points_yuan) || 0) * 10000);
+  if (!Number.isFinite(points) || points <= 0) return c.json({ error: '金额需为正数（元，1 元 = 1 积分）' }, 400);
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
   try {

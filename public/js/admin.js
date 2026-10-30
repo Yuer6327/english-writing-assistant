@@ -5,7 +5,7 @@
 // 兑换码为一次性明码展示，刷新即丢，请立即复制保存。
 // ============================================================
 
-import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261026d';
+import { api, toast, requireAuth, escapeHtml, formatBeijingTime } from './api.js?v=20261027c';
 
 let generation = 0;
 
@@ -125,7 +125,7 @@ export async function init() {
 }
 
 function fmtPoints(cents) {
-  return (cents / 100).toFixed(2);
+  return (cents / 10000).toFixed(2);
 }
 
 function bindAdmin(root, gen) {

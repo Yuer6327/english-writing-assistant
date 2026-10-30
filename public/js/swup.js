@@ -206,7 +206,7 @@ window.addEventListener('popstate', async () => {
 });
 
 // ── 初始化 ──
-import { getSession, loginHref } from './api.js?v=20261026d';
+import { getSession, loginHref } from './api.js?v=20261027c';
 
 // ── 导航栏会话态（navbar 持久化，查重防重复追加；本模块全站常驻）──
 //   登录：余额 pill + 管理链接（admin）
@@ -248,7 +248,7 @@ async function injectNavbarSession() {
     pill.className = 'badge badge-completed';
     pill.href = '/settings.html#billing';
     pill.style.cssText = 'font-variant-numeric:tabular-nums;text-decoration:none';
-    pill.textContent = `${(session.wallet.balance / 100).toFixed(2)} 积分`;
+    pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} 积分`;
     right.insertBefore(pill, settingsLink || right.lastElementChild);
   }
   if (session.role === 'admin' && !document.getElementById(ADMIN_LINK_ID)) {

@@ -7,8 +7,8 @@
 import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor,
-} from './api.js?v=20261026d';
-import { openExportModal, closeExportModal } from './export.js?v=20261026d';
+} from './api.js?v=20261027c';
+import { openExportModal, closeExportModal } from './export.js?v=20261027c';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
@@ -205,6 +205,47 @@ export async function init() {
   // 车道信息与作文数据相互独立：并行拉取，统一确认后再渲染
   await reload(id, gen, loadLaneInfo());
   bindDelegated();
+  resumePendingReview(id, gen);
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** 页面刷新后恢复在途批改：每 3s 拉一次详情，出现新结果即渲染 */
+async function resumePendingReview(essayId, gen) {
+  const keys = Object.keys(localStorage).filter(k => k.startsWith('pending-review:'));
+  for (const key of keys) {
+    let marker = null;
+    try { marker = JSON.parse(localStorage.getItem(key)); } catch { /* ignore */ }
+    const draftId = Number(key.split(':')[1]);
+    const draft = state?.drafts?.find(d => d.id === draftId);
+    if (!marker || !draft || gen !== generation) { localStorage.removeItem(key); continue; }
+    const opKey = `review:${draftId}`;
+    if (pendingOps.has(opKey)) continue;
+    pendingOps.add(opKey);
+    activeDraftId = draftId;
+    renderTabs(); renderDraftPanel(); renderReview();
+    try {
+      for (let i = 0; i < 60; i++) {
+        await sleep(3000);
+        if (gen !== generation) return;
+        const data = await api.getEssay(essayId);
+        if (gen !== generation) return;
+        const latest = (data.drafts.find(x => x.id === draftId)?.reviews || []).at(-1);
+        if (latest && latest.id !== marker.previous_review_id) {
+          state = data;
+          activeDraftId = draftId;
+          renderHeader(); renderTopic(); renderTabs(); renderDraftPanel(); renderReview();
+          toast('批改完成，结果已自动恢复', 'success');
+          localStorage.removeItem(key);
+          return;
+        }
+      }
+    } catch { /* 下一轮继续 */ }
+    finally {
+      pendingOps.delete(opKey);
+      if (gen === generation && activeDraftId === draftId) renderDraftPanel();
+    }
+  }
 }
 
 /** 顶部会话条：游客剩余次数 / 登录态剩余次数 */
@@ -420,8 +461,9 @@ function renderDraftPanel() {
     const wc = el.querySelector('#draft-wc');
     const updateWc = () => {
       const n = countWords(ta.value);
-      wc.textContent = `${n} 词（要求 200-500 词）`;
-      wc.className = 'wordcount-hint ' + (n >= 200 && n <= 500 ? 'ok' : n >= 160 ? 'bad' : '');
+      const soft = state.essay.word_limits || { minWords: 200, maxWords: 500, softMinWords: 200, softMaxWords: 500 };
+      wc.textContent = `${n} 词（考试要求 ${soft.minWords}-${soft.maxWords} 词）`;
+      wc.className = 'wordcount-hint ' + (n >= soft.softMinWords && n <= soft.softMaxWords ? 'ok' : 'bad');
     };
     ta.addEventListener('input', updateWc);
     updateWc();
@@ -530,6 +572,7 @@ function renderAnnotated(draft) {
   const normInfo = buildNormMap(text);
   const spans = [];
   rv.result.issues.forEach((issue, i) => {
+    if (issue.located === false) return;
     const loc = locateQuote(text, normInfo, issue.quote);
     if (loc) spans.push({ ...loc, issueIndex: i });
   });
@@ -593,8 +636,10 @@ async function runReview(e) {
   const selectEl = document.getElementById('review-model-select');
   const lane = selectEl ? selectEl.value : defaultLane();
   reviewLane = lane;   // 记忆本次选择（内存）
-  busyButton(btn, '批改中', '约 1 分钟');
+  busyButton(btn, '批改中', '可离开，结果会自动保存');
+  const markerKey = `pending-review:${d.id}`;
   try {
+    localStorage.setItem(markerKey, JSON.stringify({ started_at: Date.now(), previous_review_id: latestReview(d)?.id ?? null }));
     const res = await api.reviewDraft(d.id, lane);
     if (gen !== generation) return;
     if (res.quota) {
@@ -612,10 +657,11 @@ async function runReview(e) {
     if (reviewEl) reviewEl.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   } catch (err) {
     if (gen !== generation) return;
-    if (!handleBillingError(err)) toast(err.message, 'error');
+    if (!handleBillingError(err))     toast(err.message, 'error');
     idleButton(btn);
     setPanelControlsLocked(btn, false);
   } finally {
+    localStorage.removeItem(markerKey);
     pendingOps.delete(key);
     // 用户切 Tab 触发过重新渲染时，恢复新按钮；旧按钮已由 catch/reload 处理
     if (gen === generation && !btn.isConnected && activeDraftId === d.id) renderDraftPanel();
@@ -631,17 +677,16 @@ function renderReview() {
   // 旧记录 / 残缺数据兜底：字段缺失时按 0 渲染，避免整块批改结果渲染失败
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
   const sub = r.subscores || {};
-  const total = num(state.essay.genre_total) || 25;
 
   const bars = [
-    { name: '内容', val: num(sub.content), max: 10 },
-    { name: '语言', val: num(sub.language), max: 10 },
-    { name: '结构', val: num(sub.organization), max: 5 },
+    { name: '内容', val: num(sub.content), max: 9 },
+    { name: '语言', val: num(sub.language), max: 9 },
+    { name: '结构', val: num(sub.organization), max: 4 },
   ];
   const gradeInfo = gradeFor(r.score);
   // 本次批改的积分消耗（仅最新一次响应有值；0 = 免费/自备 Key）
   const chargeText = lastCharge && lastCharge.reviewId === rv.id
-    ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 100).toFixed(2)} 积分` : ' · 免费')
+    ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 10000).toFixed(2)} 积分` : ' · 免费')
     : '';
 
   let html = `
@@ -653,8 +698,8 @@ function renderReview() {
         <div class="label">等第 · ${gradeInfo.label}</div>
       </div>` : ''}
       <div class="score-main">
-        <div class="score-num">${num(r.score)}<small>/${total}</small></div>
-        <div class="label">总分</div>
+        <div class="score-num">${num(r.score)}<small>/22</small></div>
+        <div class="label">${num(r.score) >= 21 ? '系统内满分' : '总分'}</div>
       </div>
       <div class="score-bars">
         ${bars.map(b => `
@@ -664,6 +709,7 @@ function renderReview() {
             <span class="val">${b.val}/${b.max}</span>
           </div>`).join('')}
         ${r.word_count_assessment ? `<div style="font-size:12px;color:var(--text-light)">${escapeHtml(r.word_count_assessment)}</div>` : ''}
+        <div style="font-size:12px;color:var(--text-light)">保守阅卷口径：系统上限 22/25，真实阅卷可给 23-25</div>
       </div>
     </div>`;
 
@@ -688,6 +734,7 @@ function renderReview() {
         <div class="issue-head">
           <span class="issue-type-tag">${escapeHtml(iss.type)}</span>
           <span class="issue-quote">"${escapeHtml(iss.quote)}"</span>
+          ${iss.located === false ? '<span class="chip">原文中未找到，可能含特殊字符</span>' : ''}
         </div>
         <div class="issue-arrow">→ ${escapeHtml(iss.correction)}</div>
         <div class="issue-exp">${escapeHtml(iss.explanation)}</div>
@@ -914,8 +961,9 @@ function openDraftModal(mode, prefill) {
   const wcEl = modal.querySelector('#modal-wc');
   const updateWc = () => {
     const n = countWords(ta.value);
-    wcEl.textContent = `${n} 词（要求 200-500 词）`;
-    wcEl.className = 'wordcount-hint ' + (n >= 200 && n <= 500 ? 'ok' : n >= 160 ? 'bad' : '');
+    const soft = state.essay.word_limits || { minWords: 200, maxWords: 500, softMinWords: 200, softMaxWords: 500 };
+    wcEl.textContent = `${n} 词（考试要求 ${soft.minWords}-${soft.maxWords} 词）`;
+    wcEl.className = 'wordcount-hint ' + (n >= soft.softMinWords && n <= soft.softMaxWords ? 'ok' : 'bad');
   };
   ta.addEventListener('input', () => { textRevision++; updateWc(); });
   updateWc();
@@ -1044,7 +1092,7 @@ function openPolishModal(fragment) {
       });
       if (gen !== generation || modal !== wbModalEl) return;
       const chargeNote = res.points_charged > 0
-        ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 100).toFixed(2)} 积分</div>` : '';
+        ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 10000).toFixed(2)} 积分</div>` : '';
       renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
       idleButton(btn);
       btn.textContent = '重新精修';
@@ -1158,7 +1206,7 @@ async function runFullRewrite(e) {
 
   const r = res.result;
   const chargeNote = res.points_charged > 0
-    ? ` · 本次消耗 ${(res.points_charged / 100).toFixed(2)} 积分` : '';
+    ? ` · 本次消耗 ${(res.points_charged / 10000).toFixed(2)} 积分` : '';
   const modal = wbModal(`
     <div class="form-group">
       <div style="font-size:13px;color:var(--text-soft);line-height:1.8">${escapeHtml(r.summary || '')}${chargeNote ? `<span class="muted" style="font-size:12px">${chargeNote}</span>` : ''}</div>
