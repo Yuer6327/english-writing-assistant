@@ -68,9 +68,10 @@ export interface ReviewPractice {
 export interface ReviewResult {
   diagnosis: { content: string; language: string; organization: string };
   subscores: { content: number; language: number; organization: number };
-  score: number;                        // 0-25，= 三维度之和（评分纪律封顶 22：分项 9/9/4）
+  score: number;                        // 0-22，= 三维度之和 − 词数扣分（服务端硬扣）
   overall_comment: string;
-  word_count_assessment: string;
+  word_count: number;                   // 服务端统计的词数（空白分词）
+  word_count_penalty: number;           // 词数扣分：<100 词 −5、>500 词 −3、其余 0
   issues: ReviewIssue[];
   revised_essay: string;                // 修改后全文，改动处 **粗体**
   suggestions: string[];

@@ -689,8 +689,12 @@ function renderReview() {
     ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 10000).toFixed(2)} 积分` : ' · 免费')
     : '';
 
+  // 词数硬扣分（服务端判定；<100 词 −5、>500 词 −3，旧记录无该字段按 0）
+  const wordPenalty = typeof r.word_count_penalty === 'number' ? r.word_count_penalty : 0;
+  const penaltyText = wordPenalty > 0 ? ` · 词数扣 ${wordPenalty}` : '';
+
   let html = `
-    <div class="section-title">批改结果 <span class="muted">${escapeHtml(rv.model || '')}${chargeText}</span></div>
+    <div class="section-title">批改结果 <span class="muted">${escapeHtml(rv.model || '')}${chargeText}${penaltyText}</span></div>
     <div class="score-card">
       ${gradeInfo ? `
       <div class="score-main">

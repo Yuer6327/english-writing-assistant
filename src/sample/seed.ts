@@ -23,7 +23,8 @@ const REVIEW_1: ReviewResult = {
   subscores: { content: 6, language: 6, organization: 3 },
   score: 15,
   overall_comment: '主要问题在语言层：词汇停留在初中层（important/good 反复出现），句式以简单句为主，且 used to / suggest / progress / succeed 等多处语法硬伤在阅卷中会直接压档；内容上论据只有"学习"一个维度。先清零语法硬伤，再升级词汇与句式。',
-  word_count_assessment: '当前 200 词 / 要求 200-500 词 / 符合要求。',
+  word_count: 200,
+  word_count_penalty: 0,
   issues: [
     {
       quote: 'I was used to staying up late to play mobile phone',
@@ -115,7 +116,8 @@ const REVIEW_2: ReviewResult = {
   subscores: { content: 8, language: 7, organization: 4 },
   score: 19,
   overall_comment: '语法硬伤已基本清零，当前最大短板是内容：论据仍局限于学习单一维度，缺少第二个角度的例证；结尾 if 条件句正确但平淡。补足非学习维度的例证并升级收尾句式，即可向 21 分以上冲刺。',
-  word_count_assessment: '当前 200 词 / 要求 200-500 词 / 符合要求。',
+  word_count: 200,
+  word_count_penalty: 0,
   issues: [
     {
       quote: 'If we keep doing small things every day, success will come naturally.',

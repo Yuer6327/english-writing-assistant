@@ -42,6 +42,13 @@ const CONTENT_CAP_NO_EXAMPLES = 6;   // 无实例：内容 ≤6（刚过及格�
 const CONTENT_CAP_NO_SOLUTION = 7;   // 只摆问题不谈对策：内容 ≤7
 const LANGUAGE_CAP_NO_SOLUTION = 7;  // 同上：语言上限由 9 降到 7（不再扣结构，改用语言分体现差距）
 
+// ── 词数硬扣分（纯服务端判定，不看模型自评）──
+// 阈值与扣分固定写死：<100 词 → −5；>500 词 → −3。总分扣完不低于 0。
+const WORD_SHORT_UNDER = 100;
+const WORD_SHORT_PENALTY = 5;
+const WORD_LONG_OVER = 500;
+const WORD_LONG_PENALTY = 3;
+
 /**
  * 模型分 vs 服务端上限：上限是硬顶，折中不得抬分。
  * 模型更严 → 保留模型分；模型给高 → 以服务端为准。
@@ -91,7 +98,12 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
   if (content + modelLanguage < 15) organization = Math.min(organization, 3);
 
   const sum = content + language + organization;
-  const finalScore = sum;
+  // 词数扣分：硬阈值，服务端自算，模型不参与（分项保持模型判定的原始分，只在总分上扣）
+  const wordCount = countWords(essayText);
+  const wordPenalty = wordCount < WORD_SHORT_UNDER ? WORD_SHORT_PENALTY
+    : wordCount > WORD_LONG_OVER ? WORD_LONG_PENALTY
+    : 0;
+  const finalScore = Math.max(0, sum - wordPenalty);
 
   // quote 命中校验：先原文 substring，再空白归一比对
   const normEssay = normWs(essayText);
@@ -152,7 +164,8 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
     subscores: { content, language, organization },
     score: finalScore,
     overall_comment: overall,
-    word_count_assessment: str(parsed.word_count_assessment, 500),
+    word_count: wordCount,
+    word_count_penalty: wordPenalty,
     issues,
     revised_essay: revised,
     suggestions: strArray(parsed.suggestions, 8),
