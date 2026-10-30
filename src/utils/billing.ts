@@ -21,14 +21,16 @@ export class BillingError extends Error {
 async function call<T>(env: Env, path: string, init?: { method?: string; body?: unknown }): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (env.INTERNAL_TOKEN) headers['X-Internal-Token'] = env.INTERNAL_TOKEN;
+  const body = init?.body !== undefined ? JSON.stringify(init.body) : undefined;
   let resp: Response;
   try {
-    resp = await env.BILLING.fetch(`https://yuer-billing${path}`, {
-      method: init?.method ?? 'GET',
-      headers,
-      ...(init?.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
-    });
+    // 本地开发回退：wrangler 多 worker dev registry 在部分环境不稳（Network connection lost）。
+    // 配置 DEV_BILLING_URL 时直接 HTTP 调本地 billing（仅限本地 dev；生产不配置，恒走 Service Binding）。
+    resp = env.DEV_BILLING_URL
+      ? await fetch(env.DEV_BILLING_URL.replace(/\/$/, '') + path, { method: init?.method ?? 'GET', headers, body })
+      : await env.BILLING.fetch(`https://yuer-billing${path}`, { method: init?.method ?? 'GET', headers, body });
   } catch (err) {
+    console.error('[billing] BILLING.fetch 异常:', err instanceof Error ? err.message : err);
     throw new BillingError('计费服务暂不可用，请稍后重试', 503, 'billing_unreachable');
   }
   const data: any = await resp.json().catch(() => ({ error: '计费服务响应异常' }));

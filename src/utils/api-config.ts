@@ -17,6 +17,18 @@ export const AGNES_BASE_URLS = [
 ];
 export const AGNES_MODEL = 'agnes-3.0-flash';
 
+/**
+ * 免费档端点（env 感知）。仅当 ENABLE_DEV_SESSION=1（本地联调/攻防测试门禁）
+ * 且配置了 DEV_AGNES_BASE_URL 时，才把免费档指向本地 mock；生产两个变量都不配置，
+ * 恒走官方双端点。用于本地无外呼的 AI 链路测试。
+ */
+export function agnesBaseUrls(env: Env): string | string[] {
+  if ((env.ENABLE_DEV_SESSION || '') === '1' && env.DEV_AGNES_BASE_URL) {
+    return env.DEV_AGNES_BASE_URL;
+  }
+  return AGNES_BASE_URLS;
+}
+
 /** 用户可选车道（前端模型选择器的值 → billing 服务档位） */
 export type Lane = 'free' | 'deepseek' | 'byok';
 
@@ -52,6 +64,7 @@ export async function resolveLane(env: Env, userId: string, lane: Lane): Promise
   if (lane === 'free' && agnesGlobalRateHit()) throw new AgnesRateLimitError();
   const serviceId = LANE_SERVICE[lane];
   const cfg = await billing.config(env, userId, serviceId);
+  if (cfg.provider === 'agnes') cfg.baseUrl = agnesBaseUrls(env);
   return {
     provider: cfg.provider,
     key: cfg.key,

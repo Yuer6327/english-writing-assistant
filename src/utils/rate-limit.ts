@@ -50,13 +50,13 @@ export function rateLimitHit(key: string, limit: number, windowMs: number): bool
   return false;
 }
 
-/** 获取客户端 IP（Cloudflare 首选，其次转发头，最后兜底） */
+/** 获取客户端 IP：只信 Cloudflare 注入的 CF-Connecting-IP。
+ *  旧实现回落 X-Forwarded-For 的首跳 —— 那是客户端可随意伪造的头
+ *  （攻击者每个请求换一个假 IP 即可让 guest:ip 计数永不到顶）。
+ *  Cloudflare 边缘会覆盖入站 CF-Connecting-IP，伪造无效；取不到时统一 'unknown'，
+ *  所有未知来源共享一个桶（宁可误伤也不给刷子开后门）。 */
 export function clientIp(c: { req: { header(name: string): string | undefined } }): string {
-  return (
-    c.req.header('CF-Connecting-IP')
-    || c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    || 'unknown'
-  ) as string;
+  return c.req.header('CF-Connecting-IP') || 'unknown';
 }
 
 // ── AI 调用限流（挂在 authMiddleware 之后）──
@@ -93,8 +93,9 @@ export function isAgnesRateLimitError(err: unknown): boolean {
   return /每分钟约 20|rate limit|RPM/i.test(msg) || /\b429\b/.test(msg);
 }
 
-/** getUserApiKey/resolveLane 失败时的 HTTP 响应：BillingError 原样透传（409/404/503…），限流 429，其余 500 */
-export function aiConfigFail(err: unknown): { body: { error: string; code?: string; details?: string }; status: 400 | 402 | 404 | 409 | 429 | 500 | 503 } {
+/** getUserApiKey/resolveLane 失败时的 HTTP 响应：BillingError 原样透传（409/404/503…），限流 429，其余 500。
+ *  未知错误只回分类文案：原始 message 可能携带内部路径/上游报文（信息泄漏），仅进日志。 */
+export function aiConfigFail(err: unknown): { body: { error: string; code?: string }; status: 400 | 402 | 404 | 409 | 429 | 500 | 503 } {
   if (err instanceof BillingError) {
     return { body: { error: err.message, code: err.code }, status: err.status as 409 };
   }
@@ -102,6 +103,6 @@ export function aiConfigFail(err: unknown): { body: { error: string; code?: stri
     const msg = err instanceof Error ? err.message : '免费 API 调用过于频繁，请稍后再试';
     return { body: { error: msg }, status: 429 };
   }
-  const details = err instanceof Error ? err.message : String(err);
-  return { body: { error: 'AI 配置不可用', details }, status: 500 };
+  console.error('[ai-config] 配置解析失败（原始错误仅日志）:', err instanceof Error ? err.message : err);
+  return { body: { error: 'AI 配置不可用' }, status: 500 };
 }

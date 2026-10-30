@@ -22,6 +22,10 @@ export interface Env {
   BAIDU_OCR_SK?: string;
   /** 仅本地开发：置 '1' 才开放 /api/auth/dev-session 测试会话（生产绝不配置） */
   ENABLE_DEV_SESSION?: string;
+  /** 仅本地开发：把免费档 AI 指到本地 mock（须同时 ENABLE_DEV_SESSION=1；生产绝不配置） */
+  DEV_AGNES_BASE_URL?: string;
+  /** 仅本地开发：billing 走 HTTP 直连（dev registry 不可用时的回退；生产绝不配置） */
+  DEV_BILLING_URL?: string;
 }
 
 /** Hono 上下文变量（userId 为统一认证平台的用户 id，UUID 字符串；

@@ -13,7 +13,7 @@ import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedCon
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
 import {
-  checkReviewGate, quotaState, checkEssayGate, checkDraftGate, successStmt,
+  checkReviewGate, quotaState, checkEssayGate, checkDraftGate, successStmt, GUEST_DAILY_ESSAYS, beijingDay,
 } from '../utils/quota';
 import {
   GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock,
@@ -23,7 +23,7 @@ import {
   countWords, sanitizeReview, sanitizeFragmentPolish, sanitizeFullRewrite,
 } from '../utils/validate';
 import { seedSampleEssay } from '../sample/seed';
-import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens } from '../utils/limits';
+import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
 
 const api = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -47,14 +47,14 @@ function laneLabel(lane: Lane): 'free' | 'paid' | 'byok' {
   return lane === 'deepseek' ? 'paid' : lane;
 }
 
-/** 校验图片数组：每项必须是 data:image/ URL，数量/体积封顶 */
+/** 校验图片数组：每项必须是位图 data URL（拒 SVG 等可携带脚本的 MIME），数量/体积封顶 */
 function validImages(images: unknown): { ok: true; images: string[] } | { ok: false; error: string } {
   if (images === undefined || images === null) return { ok: true, images: [] };
   if (!Array.isArray(images)) return { ok: false, error: 'images 需为数组' };
   if (images.length > MAX_IMAGES) return { ok: false, error: `图片最多 ${MAX_IMAGES} 张` };
   for (const img of images) {
-    if (typeof img !== 'string' || !/^data:image\/[a-z0-9.+-]+;base64,/i.test(img)) {
-      return { ok: false, error: '图片需为 data URL 格式' };
+    if (typeof img !== 'string' || !/^data:image\/(png|jpe?g|webp|gif|bmp|heic|heif|avif);base64,/i.test(img)) {
+      return { ok: false, error: '图片格式不支持（需 jpg/png/webp 等位图）' };
     }
     if (img.length > MAX_IMAGE_CHARS) return { ok: false, error: '单张图片过大，请压缩后再上传' };
   }
@@ -88,6 +88,24 @@ function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, limit: 
   return rateLimitHit(`guest:ip:${clientIp(c)}`, limit, 24 * 3600_000);
 }
 
+/**
+ * 游客建作文的并发回收：先插入，再看今天名下已有几篇；超出 1 篇时只保留 id 最小的
+ * 那篇，其余由各请求自行删除自己的插入。三个并发请求同时通过预检（TOCTOU）时，
+ * 每个请求都看到全部插入、只删自己的（id 不是最小者），最终恰好收敛为 1 篇 ——
+ * 旧实现「先 count 后 insert」没有互斥，实测并发 3 请求能建出 3 篇。
+ * 返回 true = 本次插入被回收（应回 403）。
+ */
+async function reclaimGuestExtraEssays(db: Env['DB'], userId: string, insertedId: number): Promise<boolean> {
+  const day = beijingDay();
+  const rows = (await db.prepare(
+    "SELECT id FROM essays WHERE user_id = ? AND date(created_at, '+8 hours') = ? ORDER BY id ASC",
+  ).bind(userId, day).all<{ id: number }>()).results;
+  if (rows.length <= GUEST_DAILY_ESSAYS) return false;
+  if (rows[0].id === insertedId) return false;   // 我是最早的，留下；其余请求会自删
+  await db.prepare('DELETE FROM essays WHERE id = ? AND user_id = ?').bind(insertedId, userId).run();
+  return true;
+}
+
 // ============================================================
 // 作文 CRUD
 // ============================================================
@@ -116,6 +134,11 @@ api.post('/essays', userMiddleware, async (c) => {
     if (!valid.ok) return c.json({ error: valid.error }, 400);
   }
 
+  // 游客 IP 兜底：建作文同样受 IP 计数约束（清 cookie 轮换不能再无限灌作文/图片）
+  if (guestIpLimitHit(c, 15)) {
+    return c.json({ error: '今日请求次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
+  }
+
   // 游客：每天 1 篇（一稿/二稿/三稿共用那 3 次批改）
   const gate = await checkEssayGate(c.env.DB, userId, isGuest);
   if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
@@ -125,6 +148,15 @@ api.post('/essays', userMiddleware, async (c) => {
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).bind(userId, title.slice(0, 200), genre, topicText.slice(0, 8000),
     JSON.stringify(img.images), customPrompt).run();
+
+  // 并发预检绕过回收：预检（count）与插入之间无互斥，N 个并发请求都能通过；
+  // 插入后按「保留今日最早一篇」收敛，超出者自删并回 403。
+  if (isGuest) {
+    const reclaimed = await reclaimGuestExtraEssays(c.env.DB, userId, result.meta.last_row_id as number);
+    if (reclaimed) {
+      return c.json({ error: '游客每天只能写一篇作文，登录后不限篇数。', code: 'guest_essay_limit' }, 403);
+    }
+  }
 
   return c.json({ essay_id: result.meta.last_row_id as number });
 });
@@ -495,7 +527,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: Math.ceil(filled.length / 3) + estimateImageTokens(topicImages, cfg.provider, cfg.model),
+      estInputTokens: estimateTextTokens(filled) + estimateImageTokens(topicImages, cfg.provider, cfg.model),
       maxOutputTokens: maxOutput,
       skipQuota: lane === 'free',
     });
@@ -716,9 +748,8 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
   // ── 预扣费（片段 / 全文输出上限）──
   let holdInfo: billing.HoldInfo;
   try {
-    const estBase = isFragment
-      ? Math.ceil((essay.topic_text.length + (contextText || '').length + fragment.length) / 3)
-      : Math.ceil((essay.topic_text.length + (contextText || '').length) / 3);
+    const estBase = estimateTextTokens(
+      essay.topic_text + (contextText || '') + (isFragment ? fragment : ''));
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       estInputTokens: estBase,
       maxOutputTokens: maxOutput,

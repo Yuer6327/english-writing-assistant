@@ -9,9 +9,10 @@
 // ============================================================
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
-import { aiRateLimit, aiConfigFail } from '../utils/rate-limit';
+import { aiRateLimit, aiConfigFail, clientIp, rateLimitHit } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError } from '../utils/ai';
 import { getVisionConfig, defaultLane, type Lane } from '../utils/api-config';
 import * as billing from '../utils/billing';
@@ -19,16 +20,24 @@ import { tryAcquire, releaseSlot } from '../utils/inflight';
 import { checkGuestOcrGate, recordSuccess } from '../utils/quota';
 import { OCR_VLM_PROMPT } from '../utils/prompts';
 import { sanitizeOcrVlm } from '../utils/validate';
-import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens } from '../utils/limits';
+import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
 import { baiduOcr, BAIDU_ENDPOINT_LABELS } from '../utils/baidu-ocr';
 
 const ocr = new Hono<{ Bindings: Env; Variables: Vars }>();
 
+/** 游客 IP 级软兜底（与 essays.ts 同口径：清 cookie 重置后，IP 计数让刷额度变贵） */
+function guestIpLimitHit(c: Context<{ Bindings: Env; Variables: Vars }>, limit: number): boolean {
+  if (!c.get('isGuest')) return false;
+  return rateLimitHit(`guest:ip:${clientIp(c)}`, limit, 24 * 3600_000);
+}
+
 function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: false; error: string } {
   // 类型必须先判：非字符串直接 .match 会抛 TypeError → 500，暴露出栈信息
   if (typeof dataUrl !== 'string') return { ok: false, error: '图片数据格式无效，需为 data URL' };
-  const m = dataUrl.match(/^data:([a-z0-9+/.\-]+);base64,/);
-  if (!m) return { ok: false, error: '图片数据格式无效，需为 data URL' };
+  // 仅收位图 MIME：SVG 内可携带 <script>，虽然 <img> 引用不执行、直接导航也被浏览器拦，
+  // 但历史数据显示这属于「宁可少收」的输入面（见 docs/SECURITY.md）
+  const m = dataUrl.match(/^data:image\/(png|jpe?g|webp|gif|bmp|heic|heif|avif);base64,/i);
+  if (!m) return { ok: false, error: '图片格式不支持（需 jpg/png/webp 等位图）' };
   const base64 = dataUrl.slice(m[0].length);
   if (!/^[A-Za-z0-9+/=]+$/.test(base64)) return { ok: false, error: '图片数据无效' };
   return { ok: true, base64 };
@@ -44,6 +53,11 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   if (images.length > MAX_IMAGES) return c.json({ error: `图片最多 ${MAX_IMAGES} 张` }, 400);
 
   const mode = body.mode === 'baidu' ? 'baidu' : 'vlm';
+
+  // 游客 IP 兜底：OCR 打的是共享百度/AI 额度，清 cookie 轮换不能无限刷
+  if (guestIpLimitHit(c, 10)) {
+    return c.json({ error: '今日识别次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
+  }
 
   // 游客：仅百度通道、每天 3 次；大模型视觉识别需要登录
   const ocrGate = await checkGuestOcrGate(c.env.DB, userId, isGuest, mode);
@@ -134,8 +148,8 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
 
   // ── 大模型视觉 OCR（与批改同构：免费额度 / BYOK / 付费档）──
   for (const img of images) {
-    if (typeof img !== 'string' || !/^data:image\/[a-z0-9.+-]+;base64,/i.test(img)) {
-      return c.json({ error: '图片需为 data URL 格式' }, 400);
+    if (typeof img !== 'string' || !/^data:image\/(png|jpe?g|webp|gif|bmp|heic|heif|avif);base64,/i.test(img)) {
+      return c.json({ error: '图片格式不支持（需 jpg/png/webp 等位图）' }, 400);
     }
     if (img.length > MAX_IMAGE_CHARS) return c.json({ error: '单张图片过大，请压缩后再上传' }, 400);
   }
@@ -155,7 +169,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: Math.ceil(OCR_VLM_PROMPT.length / 3) + estimateImageTokens(images, cfg.provider, cfg.model),
+      estInputTokens: estimateTextTokens(OCR_VLM_PROMPT) + estimateImageTokens(images, cfg.provider, cfg.model),
       maxOutputTokens: maxOutput,
       skipQuota: vlmLane === 'free',
     });
@@ -221,7 +235,8 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
       }
     }
     await billing.releaseQuietly(c.env, holdInfo.holdId);
-    return c.json({ error: '手写识别失败', details: lastErr.slice(0, 300) }, 502);
+    console.error('[ocr] VLM 识别失败（原始错误仅日志）:', lastErr.slice(0, 300));
+    return c.json({ error: '手写识别失败，请稍后重试或更换识别引擎' }, 502);
   } catch (err: any) {
     if (holdInfo.mode === 'hold' && !settled) {
       await billing.releaseQuietly(c.env, holdInfo.holdId);
