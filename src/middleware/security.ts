@@ -85,7 +85,9 @@ export const withSecurityHeaders = createMiddleware<{ Bindings: Env; Variables: 
     }
   }
   for (const [name, value] of Object.entries(BASE_HEADERS)) {
-    if (!headers.has(name)) headers.set(name, value);
+    // X-Frame-Options 强制覆盖：Workers Assets 会自带 SAMEORIGIN，按「缺失才补」的
+    // 通用规则我们的 DENY 会被它顶掉（生产实测）。本站无同源 iframe 需求，DENY 更严。
+    if (name === 'X-Frame-Options' || !headers.has(name)) headers.set(name, value);
   }
   // 204/304 不允许带 body，其余原样透传（含流式响应）
   c.res = new Response(res.status === 204 || res.status === 304 ? null : res.body, {
