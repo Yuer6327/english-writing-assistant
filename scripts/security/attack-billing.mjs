@@ -14,10 +14,12 @@ function record(id, verdict, detail) {
   console.log(`[${{ PASS: '✓ PASS', FAIL: '✗ FAIL', INFO: '· INFO' }[verdict]}] ${id} — ${detail}`);
 }
 
+// fail-closed 后本地也要带口令（与两项目 .dev.vars 的 INTERNAL_TOKEN 一致）
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || 'local-dev-internal-token';
 async function req(method, path, body, headers = {}) {
   const resp = await fetch(BASE + path, {
     method,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_TOKEN, ...headers },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const ct = resp.headers.get('content-type') || '';
@@ -124,15 +126,19 @@ async function attackExpired() {
     return;
   }
   const b0 = await walletOf(U);
-  await fetch(BASE + '/cdn-cgi/local/scheduled');
-  await new Promise(r => setTimeout(r, 2000));
+  // dev 必须带 --test-scheduled 启动；POST /__scheduled 真正触发 cron
+  const cronResp = await fetch(BASE + '/__scheduled?cron=' + encodeURIComponent('*/5 * * * *'), { method: 'POST' });
+  await new Promise(r => setTimeout(r, 2500));
+  const statusAfter = d1(`SELECT status FROM holds WHERE id = '${h.holdId}'`);
+  const expired = statusAfter.includes('expired');
   const afterCron = await walletOf(U);
   const s = await req('POST', `/internal/holds/${h.holdId}/settle`, { promptTokens: 100, completionTokens: 100 });
   const r = await req('POST', `/internal/holds/${h.holdId}/release`);
   const final = await walletOf(U);
-  const ok = final === afterCron;
-  record('3 cron 过期释放后再 settle/release 零资金变动', ok ? 'PASS' : 'FAIL',
-    `cron 后=${afterCron}, settle.charged=${s.json?.charged}, release.refunded=${r.json?.refunded}, 终态=${final}（${ok ? '未动' : '动了 ' + (final - afterCron) + '!' }）`);
+  // b0 = 预扣后余额；cron 退款恰好一次 → afterCron = b0 + frozen；此后 settle/release 不得再动钱
+  const ok = expired && afterCron === b0 + h.frozen && final === afterCron;
+  record('3 cron 真实触发：过期释放生效且后续 settle/release 零资金变动', ok ? 'PASS' : 'FAIL',
+    `cronHTTP=${cronResp.status}, 已过期=${expired}, 退款恰一次=${afterCron === b0 + h.frozen}（b0=${b0}, frozen=${h.frozen}, cron后=${afterCron}）, settle.charged=${s.json?.charged}, release.refunded=${r.json?.refunded}, 终态=${final}`);
 }
 
 async function attackGarbage() {
@@ -193,8 +199,10 @@ async function attackRedeem() {
 
 async function attackBoundary() {
   console.log('\n═══ 6. 边界与信任边界 ═══');
-  const r1 = await req('POST', '/webhooks/recharge', { userId: U, points: 999, externalRef: 'evil-' + Date.now() });
-  record('6a webhook 未配置口令时拒绝（503）', r1.status === 503 || r1.status === 401 ? 'PASS' : 'FAIL', `status=${r1.status}`);
+  // 模拟外部攻击者：伪造（而非复用套件默认的）内部令牌
+  const r1 = await req('POST', '/webhooks/recharge', { userId: U, points: 999, externalRef: 'evil-' + Date.now() }, { 'X-Internal-Token': 'forged-attacker-token' });
+  // 单一信任路径后：webhook 回退 INTERNAL_TOKEN（已配置）→ 无令牌请求应为 401；未配置时为 503
+  record('6a webhook 无效口令被拒（401/503）', r1.status === 401 || r1.status === 503 ? 'PASS' : 'FAIL', `status=${r1.status}`);
 
   const r2 = await req('POST', '/internal/hold', { userId: U, project: 'nope', service: 'llm:deepseek-flash' });
   record('6b 未知 project 拒绝', r2.status === 404 ? 'PASS' : 'FAIL', `status=${r2.status}`);

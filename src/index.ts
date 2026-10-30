@@ -33,7 +33,14 @@ app.use('/api/*', sameOriginGuard);
 // ── 请求体大小闸门：按 Content-Length 在入口拒绝（旧实现 6MB JSON 也会被完整解析后才截断）──
 // /api/ocr 上限 14MB（3 张 ×4MB base64 + JSON 开销）；其余 API 2.5MB（题目 3 图前端压至 ≤300KB/张绰绰有余）
 app.use('/api/*', async (c, next) => {
-  const len = Number(c.req.header('content-length') || 0);
+  // chunked / 无 content-length 的请求一律 411：闸门只信显式长度，
+  // 否则「缺头按 0 放行」可被 Transfer-Encoding: chunked 绕过（实测 3MB 请求全量解析）
+  const raw = c.req.header('content-length');
+  if ((c.req.method === 'POST' || c.req.method === 'PUT' || c.req.method === 'PATCH')
+      && (raw === undefined || raw === '')) {
+    return c.json({ error: '缺少 Content-Length，不接受分块传输', code: 'length_required' }, 411);
+  }
+  const len = Number(raw || 0);
   const cap = c.req.path.startsWith('/api/ocr') ? 14 * 1024 * 1024 : 2.5 * 1024 * 1024;
   if (len > cap) return c.json({ error: '请求体过大', code: 'payload_too_large' }, 413);
   await next();

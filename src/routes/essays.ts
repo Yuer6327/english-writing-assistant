@@ -334,6 +334,7 @@ api.put('/essays/:id', userMiddleware, async (c) => {
 
 // ── 删除作文（级联删稿件/批改/精修）──
 api.delete('/essays/:id', userMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -348,6 +349,7 @@ api.delete('/essays/:id', userMiddleware, async (c) => {
 
 // ── 新增稿件（一稿/二稿/…；来源：photo/text/polish）──
 api.post('/essays/:id/drafts', userMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
   const essayId = parseId(c.req.param('id'));
@@ -418,6 +420,7 @@ api.post('/essays/:id/drafts', userMiddleware, async (c) => {
 
 // ── 修改稿件文本（保存后可重新批改）──
 api.put('/drafts/:id', userMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const userId = c.get('userId');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
@@ -441,6 +444,7 @@ api.put('/drafts/:id', userMiddleware, async (c) => {
 
 // ── 删除稿件（连带其批改记录）──
 api.delete('/drafts/:id', userMiddleware, async (c) => {
+  if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const userId = c.get('userId');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
