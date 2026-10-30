@@ -274,7 +274,9 @@ export async function getEffectivePrompt(
   if (customPrompt && customPrompt.trim()) {
     if (validatePromptTemplate(customPrompt).ok) return { prompt: customPrompt, source: 'custom' };
     console.warn('[prompt] 单篇自定义模板无效，回退内置默认模板');
-    return { prompt: DEFAULT_PROMPTS[genre] ?? DEFAULT_PROMPTS['sh-gaokao-essay'], source: 'default' };
+    // hasOwn：存量库若存有 '__proto__' genre（修复前写入），?? 防不住 Object.prototype 真值
+  const def = Object.hasOwn(DEFAULT_PROMPTS, genre) ? DEFAULT_PROMPTS[genre] : DEFAULT_PROMPTS['sh-gaokao-essay'];
+  return { prompt: def, source: 'default' };
   }
   const row = await db.prepare(
     'SELECT content FROM prompt_templates WHERE user_id = ? AND genre = ?',
@@ -283,5 +285,7 @@ export async function getEffectivePrompt(
     if (validatePromptTemplate(row.content).ok) return { prompt: row.content, source: 'user-template' };
     console.warn('[prompt] 用户模板无效，回退内置默认模板');
   }
-  return { prompt: DEFAULT_PROMPTS[genre] ?? DEFAULT_PROMPTS['sh-gaokao-essay'], source: 'default' };
+  // hasOwn：存量库若存有 '__proto__' genre（修复前写入），?? 防不住 Object.prototype 真值
+  const def = Object.hasOwn(DEFAULT_PROMPTS, genre) ? DEFAULT_PROMPTS[genre] : DEFAULT_PROMPTS['sh-gaokao-essay'];
+  return { prompt: def, source: 'default' };
 }

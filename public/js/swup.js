@@ -64,6 +64,10 @@ async function loadCurrentPage(preloaded = null) {
   if (!src) return; // 非 SPA 页，无需处理
   const mod = await (preloaded || preloadModule(src));
 
+  // 模块 fetch 期间用户可能已切走：旧页 init 跑在新页 DOM 上会造成跳页/错渲染
+  const pathNow = location.pathname + location.search;
+  if (pathNow !== currentPath) return;
+
   // cleanup 用具名导出：即使 init 仍在异步进行中（用户已切走），也能立即调用使其中止
   currentCleanup = mod.cleanup || null;
   if (mod.init) await mod.init();
