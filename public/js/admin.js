@@ -41,7 +41,7 @@ export async function init() {
           <input type="text" class="form-input" id="gift-username" required placeholder="username">
         </div>
         <div class="form-group" style="flex:1;min-width:110px;margin-bottom:8px">
-          <label class="form-label">金额（元，可负）</label>
+          <label class="form-label">积分（负数为扣减）</label>
           <input type="number" class="form-input" id="gift-yuan" step="0.01" required placeholder="1.00">
         </div>
         <div class="form-group" style="flex:2;min-width:140px;margin-bottom:8px">
@@ -70,7 +70,7 @@ export async function init() {
       <h3 style="margin-bottom:12px">生成兑换码</h3>
       <form id="f-codes" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
         <div class="form-group" style="margin-bottom:8px">
-          <label class="form-label">面额（元）</label>
+          <label class="form-label">面额（积分）</label>
           <select class="form-input" id="code-yuan">
             <option value="0.1">0.1</option>
             <option value="0.5">0.5</option>
@@ -99,7 +99,7 @@ export async function init() {
           <input type="text" class="form-input" id="manual-username" required placeholder="username">
         </div>
         <div class="form-group" style="flex:1;min-width:110px;margin-bottom:8px">
-          <label class="form-label">金额（元）</label>
+          <label class="form-label">积分</label>
           <input type="number" class="form-input" id="manual-yuan" step="0.01" required placeholder="1.00">
         </div>
         <div class="form-group" style="flex:2;min-width:140px;margin-bottom:8px">
@@ -224,7 +224,7 @@ function bindAdmin(root, gen) {
       const codesText = res.codes.join('\n');
       box.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-          <span class="muted" style="font-size:12px">面额 ${escapeHtml(yuan)} 元 · ${res.codes.length} 张 · 批次 ${escapeHtml(res.batch)}</span>
+          <span class="muted" style="font-size:12px">面额 ${escapeHtml(yuan)} 积分 · ${res.codes.length} 张 · 批次 ${escapeHtml(res.batch)}</span>
           <button type="button" class="btn btn-sm" id="btn-copy-codes" style="padding:4px 12px;font-size:12px">复制全部</button>
         </div>
         <textarea class="form-input" rows="${Math.min(10, res.codes.length)}" readonly
