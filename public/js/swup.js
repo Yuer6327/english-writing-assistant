@@ -62,11 +62,11 @@ async function loadCurrentPage(preloaded = null) {
   const main = document.getElementById('main');
   const src = main && main.dataset.pageModule;
   if (!src) return; // 非 SPA 页，无需处理
+  // 记录进入 loader 时的期望路径：await 期间若发生任何切页（currentPath 变化），
+  // 旧页 init 不得跑在新页 DOM 上——比较快照而非可变全局，消灭「新页已就位、比较值相等」的窄竞态
+  const expectedPath = currentPath;
   const mod = await (preloaded || preloadModule(src));
-
-  // 模块 fetch 期间用户可能已切走：旧页 init 跑在新页 DOM 上会造成跳页/错渲染
-  const pathNow = location.pathname + location.search;
-  if (pathNow !== currentPath) return;
+  if (currentPath !== expectedPath) return;
 
   // cleanup 用具名导出：即使 init 仍在异步进行中（用户已切走），也能立即调用使其中止
   currentCleanup = mod.cleanup || null;
