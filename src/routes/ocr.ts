@@ -47,7 +47,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   const aiDeadline = Date.now() + 90_000;
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
-  const body = await c.req.json<{ images?: string[]; mode?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ images?: string[]; mode?: string }>().catch(() => null)) ?? ({} as any));
   const images = Array.isArray(body.images) ? body.images : [];
   if (images.length === 0) return c.json({ error: '请至少上传一张图片' }, 400);
   if (images.length > MAX_IMAGES) return c.json({ error: `图片最多 ${MAX_IMAGES} 张` }, 400);

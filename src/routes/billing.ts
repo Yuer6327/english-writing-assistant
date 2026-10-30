@@ -37,7 +37,7 @@ billingRoutes.get('/me', authMiddleware, async (c) => {
 
 billingRoutes.post('/redeem', authMiddleware, async (c) => {
   const userId = c.get('userId');
-  const body = await c.req.json<{ code?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ code?: string }>().catch(() => null)) ?? ({} as any));
   const code = (typeof body.code === 'string' ? body.code : '').trim();
   if (!code) return c.json({ error: '请输入兑换码' }, 400);
   // 兑换码格式固定，限制长度避免超长串打到计费服务
@@ -91,7 +91,7 @@ async function userIdByUsername(env: Env, username: string): Promise<string | nu
 }
 
 admin.post('/gift', async (c) => {
-  const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => null)) ?? ({} as any));
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
   // 单笔上界 100 万元（1e10 微积分）：1e300 级输入会落成 SQLite REAL（实测账实核对失明）
@@ -122,7 +122,7 @@ admin.get('/user/:username', async (c) => {
 });
 
 admin.post('/tags', async (c) => {
-  const body = await c.req.json<{ username?: string; add?: string[]; remove?: string[] }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ username?: string; add?: string[]; remove?: string[] }>().catch(() => null)) ?? ({} as any));
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
@@ -139,7 +139,7 @@ admin.post('/tags', async (c) => {
 });
 
 admin.post('/codes', async (c) => {
-  const body = await c.req.json<{ points_yuan?: number; count?: number; batch?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ points_yuan?: number; count?: number; batch?: string }>().catch(() => null)) ?? ({} as any));
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
   // 单笔上界 100 万元（1e10 微积分）
   if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: '面额需为正数且单笔 ≤ 100 万元' }, 400);
@@ -154,7 +154,7 @@ admin.post('/codes', async (c) => {
 });
 
 admin.post('/orders/manual', async (c) => {
-  const body = await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => null)) ?? ({} as any));
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
   if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: '积分需为正数且单笔 ≤ 100 万元' }, 400);

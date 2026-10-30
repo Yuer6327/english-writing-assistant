@@ -44,7 +44,8 @@ prompts.get('/', authMiddleware, async (c) => {
 // ── 单模式（前端切换模式时按需刷新）──
 prompts.get('/:genre', authMiddleware, async (c) => {
   const genre = c.req.param('genre');
-  if (!GENRES[genre]) return c.json({ error: '未知模式' }, 404);
+  // Object.hasOwn：路径参数 '__proto__' 等原型键会被真值判定放过（DEFAULT_PROMPTS['__proto__'] 为真 → 后续 500）
+  if (!Object.hasOwn(GENRES, genre)) return c.json({ error: '未知模式' }, 404);
   const ov = await c.env.DB.prepare(
     'SELECT content, updated_at FROM prompt_templates WHERE user_id = ? AND genre = ?',
   ).bind(c.get('userId'), genre).first<{ content: string; updated_at: string }>();
@@ -64,9 +65,9 @@ prompts.put('/:genre', authMiddleware, async (c) => {
   if (memberWriteLimitHit(c)) return c.json({ error: '操作过于频繁，请稍后再试', code: 'write_rate_limited' }, 429);
   const userId = c.get('userId');
   const genre = c.req.param('genre');
-  if (!GENRES[genre]) return c.json({ error: '未知模式' }, 404);
+  if (!Object.hasOwn(GENRES, genre)) return c.json({ error: '未知模式' }, 404);
 
-  const body = await c.req.json<{ content?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ content?: string }>().catch(() => null)) ?? ({} as any));
   const content = (typeof body.content === 'string' ? body.content : '').trim();
 
   if (!content) {

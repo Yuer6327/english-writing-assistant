@@ -52,7 +52,7 @@ function checkModelName(raw: string | undefined): string | null {
 settings.post('/api-keys', authMiddleware, async (c) => {
   if (memberWriteLimitHit(c)) return c.json({ error: '操作过于频繁，请稍后再试', code: 'write_rate_limited' }, 429);
   const userId = c.get('userId');
-  const body = await c.req.json<SaveBody>().catch(() => ({}) as SaveBody);
+  const body = ((await c.req.json<SaveBody>().catch(() => null)) ?? ({} as SaveBody));
   const p = body.provider === 'agnes' ? 'agnes' : 'byok';
 
   // ── 端点/模型名校验：https（本地环回可用 http），并封顶长度 ──

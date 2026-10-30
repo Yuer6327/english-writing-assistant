@@ -125,17 +125,18 @@ async function reclaimGuestExtraEssays(db: Env['DB'], userId: string, insertedId
 api.post('/essays', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
-  const body = await c.req.json<{
+  const body = ((await c.req.json<{
     title?: string; genre?: string; topic_text?: string;
     topic_images?: string[]; custom_prompt?: string;
-  }>().catch(() => ({}) as any);
+  }>().catch(() => null)) ?? ({} as any));
 
   if (memberWriteLimitHit(c)) return writeLimitResponse(c);
   const title = strField(body.title).trim();
   const topicText = strField(body.topic_text).trim();
   if (!title) return c.json({ error: '标题不能为空' }, 400);
   if (!topicText) return c.json({ error: '题目内容不能为空' }, 400);
-  const genre = body.genre && GENRES[body.genre] ? body.genre : 'sh-gaokao-essay';
+  // Object.hasOwn 守卫：'__proto__' 等原型键会被真值判定放过，存库后每次批改 500（实测持久自伤 DoS）
+  const genre = body.genre && Object.hasOwn(GENRES, body.genre) ? body.genre : 'sh-gaokao-essay';
 
   const img = validImages(body.topic_images);
   if (!img.ok) return c.json({ error: img.error }, 400);
@@ -290,9 +291,9 @@ api.put('/essays/:id', userMiddleware, async (c) => {
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
   if (memberWriteLimitHit(c)) return writeLimitResponse(c);
-  const body = await c.req.json<{
+  const body = ((await c.req.json<{
     title?: string; topic_text?: string; topic_images?: string[]; custom_prompt?: string | null;
-  }>().catch(() => ({}) as any);
+  }>().catch(() => null)) ?? ({} as any));
 
   const essay = await c.env.DB.prepare(
     'SELECT id FROM essays WHERE id = ? AND user_id = ?',
@@ -356,9 +357,9 @@ api.post('/essays/:id/drafts', userMiddleware, async (c) => {
   const isGuest = c.get('isGuest');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
-  const body = await c.req.json<{
+  const body = ((await c.req.json<{
     text?: string; source?: string; handwriting_score?: number; ocr_images?: string[];
-  }>().catch(() => ({}) as any);
+  }>().catch(() => null)) ?? ({} as any));
 
   const essay = await c.env.DB.prepare(
     'SELECT id FROM essays WHERE id = ? AND user_id = ?',
@@ -426,7 +427,7 @@ api.put('/drafts/:id', userMiddleware, async (c) => {
   const userId = c.get('userId');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
-  const body = await c.req.json<{ text?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ text?: string }>().catch(() => null)) ?? ({} as any));
 
   const text = strField(body.text).replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
@@ -467,7 +468,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   const isGuest = c.get('isGuest');
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
-  const body = await c.req.json<{ model_id?: string }>().catch(() => ({}) as any);
+  const body = ((await c.req.json<{ model_id?: string }>().catch(() => null)) ?? ({} as any));
 
   const draft = await c.env.DB.prepare(
     'SELECT * FROM drafts WHERE id = ? AND user_id = ?',
@@ -715,9 +716,9 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
-  const body = await c.req.json<{
+  const body = ((await c.req.json<{
     mode?: string; fragment?: string; instruction?: string; draft_id?: number; model_id?: string;
-  }>().catch(() => ({}) as any);
+  }>().catch(() => null)) ?? ({} as any));
 
   // ── 入参校验一律前置到预扣费之前 ──
   // 旧实现把片段长度校验放在 hold 之后，早退时既没 settle 也没 release，
