@@ -13,7 +13,7 @@
 //   付费通道（DeepSeek/积分）与自备 Key：按量计费，不占免费次数。
 // ============================================================
 
-import type { D1Database } from '@cloudflare/workers-types';
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types';
 
 export const GUEST_DAILY_REVIEWS = 3;
 export const MEMBER_DAILY_REVIEWS = 10;
@@ -107,6 +107,15 @@ export async function recordSuccess(
   await db.prepare(
     'INSERT INTO quota_events (user_id, day, kind, essay_id, draft_id) VALUES (?, ?, ?, ?, ?)',
   ).bind(userId, beijingDay(), kind, essayId ?? null, draftId ?? null).run();
+}
+
+export function successStmt(
+  db: D1Database, userId: string, kind: QuotaKind,
+  essayId?: number | null, draftId?: number | null,
+): D1PreparedStatement {
+  return db.prepare(
+    'INSERT OR IGNORE INTO quota_events (user_id, day, kind, essay_id, draft_id) VALUES (?, ?, ?, ?, ?)',
+  ).bind(userId, beijingDay(), kind, essayId ?? null, draftId ?? null);
 }
 
 // ── 对外：门禁 ──

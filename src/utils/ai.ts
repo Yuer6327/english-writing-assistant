@@ -6,8 +6,10 @@
 // 业务提示词见 prompts.ts；结果校验见 validate.ts。
 // ============================================================
 
-/** 调用 AI 超时（毫秒）。批改/润色输出较长，放宽到 90s */
-const AI_TIMEOUT_MS = 90000;
+/** 单次 AI 请求超时（毫秒）；Cloudflare 客户端空闲超时约 100s，必须留出预算 */
+const AI_TIMEOUT_MS = 40000;
+/** 单个批改等请求的全局时间预算（含 failover / 等待） */
+const AI_TOTAL_BUDGET_MS = 90000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -98,10 +100,18 @@ export function friendlyAIError(err: unknown): string {
   if (isRateLimitMessage(raw)) {
     return '免费 AI 接口调用过于频繁（每分钟约 20 次），请稍等约 1 分钟再试';
   }
-  if (/abort|timed? ?out/i.test(raw)) {
+  if (/abort|timed? ?out|调用超时/i.test(raw)) {
     return 'AI 接口响应超时，请稍后重试';
   }
-  return raw ? raw.slice(0, 300) : 'AI 调用失败';
+  const status = raw.match(/^AI API error (\d{3})/)?.[1];
+  if (status === '400' || status === '401' || status === '403') {
+    return 'AI 配置无效或已被上游拒绝，请到「设置」检查模型、接口地址和 Key';
+  }
+  if (status === '500' || status === '502' || status === '503' || status === '504') {
+    return 'AI 接口暂时不可用，请稍后重试';
+  }
+  console.error('[ai] 未分类错误（仅日志保留原文）:', raw);
+  return 'AI 调用失败，请稍后重试';
 }
 
 /** contentPart 类型：文本 / 图片 data URL */
@@ -130,6 +140,7 @@ export async function callAI(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
+  deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
 ): Promise<AIResult> {
   // json 请求带 response_format 仅是"强制输出 JSON"的开关。部分端点不支持该参数
   // （Agnes 文档未列出该字段），失败后去掉重试一次即可——提示词本身已强制"输出纯 JSON"。
@@ -137,28 +148,29 @@ export async function callAI(
   const skipFormat = /^agnes-/i.test(model) || skipResponseFormatModels.has(responseFormatKey);
 
   if (json && skipFormat) {
-    return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature);
+    return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
   }
 
   // 其余 json 请求先带 response_format；失败后去掉该参数重试一次并缓存
   if (json) {
     try {
-      return await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, true, contentParts, maxTokens, temperature);
+      return await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, true, contentParts, maxTokens, temperature, deadline);
     } catch (firstErr: any) {
       const firstMsg = String(firstErr?.message ?? '');
-      // 429 / 1015 再打一轮只会加重限流，直接抛给上层
-      if (isRateLimitMessage(firstMsg) || isCloudflareEndpointBlock(firstMsg)) {
+      // 限流、鉴权、配置和服务端错误重试 response_format 没有意义。
+      if (isRateLimitMessage(firstMsg) || isCloudflareEndpointBlock(firstMsg)
+        || /^AI API error (401|403|404|5\d\d)/.test(firstMsg)) {
         throw firstErr;
       }
       console.error(`[callAI] 带 response_format 调用失败（${firstMsg || '未知错误'}），去掉该参数重试`);
-      const retry = await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature);
+      const retry = await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
       skipResponseFormatModels.add(responseFormatKey);
       return retry;
     }
   }
 
   // json=false（纯文本）：原样请求
-  return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature);
+  return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
 }
 
 /** 多端点调度：按"谁先解封"排班逐个尝试。全部端点被 1015 封住且最早解封超出
@@ -173,6 +185,7 @@ async function callAIEndpoints(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
+  deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
 ): Promise<AIResult> {
   const urls = orderEndpoints(baseUrl);
   if (urls.length === 0) throw new Error('未配置 AI 接口地址');
@@ -200,8 +213,9 @@ async function callAIEndpoints(
     let soonestOfRound: { url: string; sec: number } | null = null;
 
     for (const url of order) {
+      if (Date.now() >= deadline) throw new Error('AI 调用超时');
       try {
-        const result = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature);
+        const result = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
         if (result.content && result.content.trim()) return result;
         console.error(`[callAI] 端点 ${url} 返回空内容（HTTP 200），尝试下一端点`);
         lastError = new Error(`AI 返回空内容（${url}）`);
@@ -229,7 +243,7 @@ async function callAIEndpoints(
           const sec = aiRetryAfterSec(e);
           await sleep(sec === null ? 1000 : Math.min(sec * 1000 + 300, 5000));
           try {
-            const retry = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature);
+            const retry = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
             if (retry.content && retry.content.trim()) return retry;
           } catch (retryErr: any) {
             lastError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
@@ -243,11 +257,12 @@ async function callAIEndpoints(
 
     const soonestSec = soonestOfRound?.sec ?? null;
     waits++;
-    if (soonestSec === null || soonestSec * 1000 > EDGE_WAIT_BUDGET_MS || waits > EDGE_WAIT_MAX_TIMES) {
-      console.error('[callAI] 全部端点 1015，超出就地等待预算，快速失败交给前端倒计时');
-      break;
-    }
-    const delayMs = soonestSec * 1000 + 300 + Math.floor(Math.random() * 300);
+        if (soonestSec === null || soonestSec * 1000 > EDGE_WAIT_BUDGET_MS || waits > EDGE_WAIT_MAX_TIMES) {
+          console.error('[callAI] 全部端点 1015，超出就地等待预算，快速失败交给前端倒计时');
+          break;
+        }
+        const delayMs = soonestSec * 1000 + 300 + Math.floor(Math.random() * 300);
+        if (Date.now() + delayMs > deadline) throw new Error('AI 调用超时');
     console.error(`[callAI] 全部端点 1015，等 ${delayMs}ms 后重试（第 ${waits} 次）`);
     await sleep(delayMs);
   }
@@ -269,9 +284,11 @@ async function callAIFetch(
   contentParts?: ContentPart[],
   maxTokens?: number,
   temperature?: number,
+  deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
 ): Promise<AIResult> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+  const timeoutMs = Math.max(1000, Math.min(AI_TIMEOUT_MS, deadline - Date.now()));
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   // 多模态请求：content 为图片/文本 parts 数组
   const userContent: any = contentParts && contentParts.length > 0

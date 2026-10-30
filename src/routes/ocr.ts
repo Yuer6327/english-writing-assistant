@@ -19,12 +19,10 @@ import { tryAcquire, releaseSlot } from '../utils/inflight';
 import { checkGuestOcrGate, recordSuccess } from '../utils/quota';
 import { OCR_VLM_PROMPT } from '../utils/prompts';
 import { sanitizeOcrVlm } from '../utils/validate';
+import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens } from '../utils/limits';
 import { baiduOcr, BAIDU_ENDPOINT_LABELS } from '../utils/baidu-ocr';
 
 const ocr = new Hono<{ Bindings: Env; Variables: Vars }>();
-
-const MAX_IMAGES = 3;
-const MAX_IMAGE_CHARS = 400_000;   // data URL 长度上限（约 300KB 二进制）
 
 function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: false; error: string } {
   // 类型必须先判：非字符串直接 .match 会抛 TypeError → 500，暴露出栈信息
@@ -37,6 +35,7 @@ function parseDataUrl(dataUrl: unknown): { ok: true; base64: string } | { ok: fa
 }
 
 ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
+  const aiDeadline = Date.now() + 90_000;
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
   const body = await c.req.json<{ images?: string[]; mode?: string }>().catch(() => ({}) as any);
@@ -156,7 +155,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: Math.ceil(OCR_VLM_PROMPT.length / 3) + Math.ceil(images.join('').length / 4),
+      estInputTokens: Math.ceil(OCR_VLM_PROMPT.length / 3) + estimateImageTokens(images, cfg.provider, cfg.model),
       maxOutputTokens: maxOutput,
       skipQuota: vlmLane === 'free',
     });
@@ -167,7 +166,8 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
   }
 
-  if (holdInfo.mode !== 'byok' && !tryAcquire(userId)) {
+  const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;
+  if (holdInfo.mode !== 'byok' && lockToken === null) {
     await billing.releaseQuietly(c.env, holdInfo.holdId);
     return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
@@ -184,7 +184,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', '', true, contentParts, maxOutput, 0.1);
+        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', '', true, contentParts, maxOutput, 0.1, aiDeadline);
         lastUsage = raw.usage;
         const result = sanitizeOcrVlm(extractJSON(raw.content));
         if (!result.text.trim()) throw new Error('识别结果为空');
@@ -217,6 +217,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
         }
         lastErr = err?.message ?? String(err);
         console.error(`[ocr][vlm] 第 ${attempt + 1} 次尝试失败: ${lastErr}`);
+        if (/^AI API error \d{3}|abort|timed? ?out|fetch failed|超时/i.test(lastErr)) throw err;
       }
     }
     await billing.releaseQuietly(c.env, holdInfo.holdId);
@@ -227,7 +228,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     }
     return c.json({ error: friendlyAIError(err) }, 502);
   } finally {
-    if (locked) releaseSlot(userId);
+    if (locked) releaseSlot(userId, lockToken);
   }
 });
 

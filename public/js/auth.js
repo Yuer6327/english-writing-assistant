@@ -4,7 +4,7 @@
 // 导航栏余额 pill / 管理链接的注入在 swup.js（全站常驻模块）。
 // ============================================================
 
-import { gotoAuth } from './api.js?v=20261026d';
+import { gotoAuth } from './api.js?v=20261027c';
 
 // ── 登录/注册页桩：进入即跳认证平台（带 next 回跳）──
 if (document.getElementById('login-page')) gotoAuth('login');

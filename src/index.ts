@@ -19,10 +19,14 @@ const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 
 // ── 中间件（顺序即嵌套层级：安全头最外层，保证任何分支的响应都被覆盖）──
 app.use('*', withSecurityHeaders);
-app.use('*', logger());
+app.use('/api/*', logger());
 app.use('*', trimTrailingSlash());
 
 // ── CORS（白名单）+ 写操作同源校验：只作用于 API ──
+app.use('/api/*', async (c, next) => {
+  c.header('Cache-Control', 'no-store');
+  await next();
+});
 app.use('/api/*', corsMiddleware);
 app.use('/api/*', sameOriginGuard);
 

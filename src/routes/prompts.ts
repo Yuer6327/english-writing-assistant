@@ -10,7 +10,7 @@
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
 import { authMiddleware } from '../middleware/auth';
-import { DEFAULT_PROMPTS, GENRES, PLACEHOLDER_DOC } from '../utils/prompts';
+import { DEFAULT_PROMPTS, GENRES, PLACEHOLDER_DOC, validatePromptTemplate } from '../utils/prompts';
 
 const prompts = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -72,11 +72,8 @@ prompts.put('/:genre', authMiddleware, async (c) => {
       .bind(userId, genre).run();
     return c.json({ ok: true, restored: true, genre, is_custom: false, updated_at: null });
   }
-  if (content.length > 20000) return c.json({ error: '提示词过长（≤20000 字符）' }, 400);
-  // 必须包含核心占位符，否则批改时作文文本无法注入
-  if (!content.includes('{essay}')) {
-    return c.json({ error: '提示词必须包含 {essay} 占位符（学生作文注入点）' }, 400);
-  }
+  const valid = validatePromptTemplate(content);
+  if (!valid.ok) return c.json({ error: valid.error }, 400);
 
   await c.env.DB.prepare(
     `INSERT INTO prompt_templates (user_id, genre, content, updated_at) VALUES (?, ?, ?, datetime('now'))

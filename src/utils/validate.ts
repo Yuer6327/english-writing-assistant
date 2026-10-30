@@ -33,7 +33,28 @@ function normWs(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-const ISSUE_TYPES = ['语法', '词汇', '搭配', '拼写', '标点', '逻辑', '中式表达'];
+const ISSUE_TYPES = ['语法', '词汇', '搭配', '拼写', '标点', '逻辑', '中式表达', '论证'];
+
+// ── 论证硬性上限（提示词 + 服务端双保险）──
+// 模型在 argumentation 里自报「有无实例 / 有无对策」，服务端据此钳制内容分，
+// 防止模型口头遵守、打分放水。字段缺失视为未知 → 不钳制（老记录 / 模型漏填）。
+const CONTENT_CAP_NO_EXAMPLES = 6;   // 无实例：内容 ≤6（刚过及格线，仍不给高分）
+const CONTENT_CAP_NO_SOLUTION = 7;   // 只摆问题不谈对策：内容 ≤7
+const LANGUAGE_CAP_NO_SOLUTION = 7;  // 同上：语言上限由 9 降到 7（不再扣结构，改用语言分体现差距）
+
+/**
+ * 模型分 vs 服务端上限：上限是硬顶，折中不得抬分。
+ * 模型更严 → 保留模型分；模型给高 → 以服务端为准。
+ * （「相差 ≤1 取中间值」在硬顶前提下四舍五入后恒等于上限，故直接取较小值。）
+ */
+function reconcileScore(model: number, cap: number): number {
+  return Math.min(model, cap);
+}
+
+/** 只认真正的布尔值；字符串 "true" / undefined 一律视为未知 */
+function boolFlag(v: unknown): boolean | null {
+  return typeof v === 'boolean' ? v : null;
+}
 
 /**
  * 校验并净化批改结果。
@@ -49,16 +70,28 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
   const sub = parsed.subscores ?? {};
 
   // 评分纪律封顶（与提示词一致）：分项 ≤9/≤9/≤4 → 总分 ≤22；结构另受定档规则约束
-  const content = safeScore(sub.content, 0, 9);
-  const language = safeScore(sub.language, 0, 9);
-  // 结构加分规则：内容+语言 <15 → 结构最多 3 分
+  const arg = parsed.argumentation ?? {};
+  const hasExamples = boolFlag(arg.has_examples);
+  const hasSolution = boolFlag(arg.has_solution);
+
+  const modelContent = safeScore(sub.content, 0, 9);
+  let content = modelContent;
+  if (hasExamples === false) content = reconcileScore(content, CONTENT_CAP_NO_EXAMPLES);
+  if (hasSolution === false) content = reconcileScore(content, CONTENT_CAP_NO_SOLUTION);
+
+  const modelLanguage = safeScore(sub.language, 0, 9);
+  // 无对策不压结构、改压语言：语言上限 9 → 7
+  const language = hasSolution === false
+    ? reconcileScore(modelLanguage, LANGUAGE_CAP_NO_SOLUTION)
+    : modelLanguage;
+  // 结构加分规则：内容+语言 <15 → 结构最多 3 分。
+  // 定档用「服务端压过的内容分 + 模型原始语言分」：内容下调反映论证缺陷，应连锁结构；
+  // 语言下调只是本规则下的追加惩罚，不再二次连锁，否则无对策的惩罚会从 -2 变成 -3。
   let organization = safeScore(sub.organization, 0, 4);
-  if (content + language < 15) organization = Math.min(organization, 3);
+  if (content + modelLanguage < 15) organization = Math.min(organization, 3);
 
   const sum = content + language + organization;
-  const score = safeScore(parsed.score, 0, 25, sum);
-  // score 与分项不一致时以分项之和为准
-  const finalScore = score === sum ? score : sum;
+  const finalScore = sum;
 
   // quote 命中校验：先原文 substring，再空白归一比对
   const normEssay = normWs(essayText);
@@ -69,17 +102,20 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
       const quote = str(raw.quote, 600).trim();
       if (quote.length < 2) continue;
       const hit = essayText.includes(quote) || normEssay.includes(normWs(quote));
-      if (!hit) continue;   // 定位失败的条目直接丢弃（前端只展示能定位的）
       const type = ISSUE_TYPES.includes(raw.type) ? raw.type : '其他';
       issues.push({
         quote,
         type,
         explanation: str(raw.explanation, 1500),
         correction: str(raw.correction, 1500),
+        located: hit,
       });
       if (issues.length >= 10) break;
     }
   }
+
+  // 可定位的问题优先展示；未定位项保留诊断内容但不绘制高亮。
+  issues.sort((a, b) => Number(b.located !== false) - Number(a.located !== false));
 
   // 巩固练习：条目需中文句 + 参考答案；无有效条目则整段丢弃（旧记录无此字段）
   let practice: ReviewPractice | undefined;
@@ -121,6 +157,12 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
     revised_essay: revised,
     suggestions: strArray(parsed.suggestions, 8),
     practice,
+    argumentation: hasExamples === null && hasSolution === null ? undefined : {
+      has_examples: hasExamples,
+      has_solution: hasSolution,
+      model_content: modelContent,   // 模型原始内容分（审计：看被服务端压了多少）
+      model_language: modelLanguage, // 模型原始语言分（同上）
+    },
   };
 
   if (expectsImprovement || (parsed.improvement && typeof parsed.improvement === 'object')) {

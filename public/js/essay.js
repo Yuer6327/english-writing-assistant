@@ -708,8 +708,6 @@ function renderReview() {
             <div class="score-bar-track"><div class="score-bar-fill" style="width:${(b.val / b.max) * 100}%"></div></div>
             <span class="val">${b.val}/${b.max}</span>
           </div>`).join('')}
-        ${r.word_count_assessment ? `<div style="font-size:12px;color:var(--text-light)">${escapeHtml(r.word_count_assessment)}</div>` : ''}
-        <div style="font-size:12px;color:var(--text-light)">保守阅卷口径：系统上限 22/25，真实阅卷可给 23-25</div>
       </div>
     </div>`;
 
@@ -728,7 +726,7 @@ function renderReview() {
   }
 
   if (r.issues && r.issues.length) {
-    html += `<div class="section-title">问题清单 <span class="muted">共 ${r.issues.length} 处 · 点标注跳转</span></div>`;
+    html += `<div class="section-title">问题清单 <span class="muted">共 ${r.issues.length} 处</span></div>`;
     html += r.issues.map((iss, i) => `
       <div class="issue-card" data-issue-card="${i}">
         <div class="issue-head">

@@ -6,11 +6,11 @@
 
 import type { ReviewResult, FragmentPolishResult } from '../types';
 
-const TOPIC_TEXT = `Directions: Write an English composition in 120-150 words on the topic "The Power of Habits". Your school newspaper is inviting students to share their views on how good habits shape our lives. Include specific examples from your own experience or observations.`;
+const TOPIC_TEXT = `Directions: Write an English composition in 200-500 words on the topic "The Power of Habits". Your school newspaper is inviting students to share their views on how good habits shape our lives. Include specific examples from your own experience or observations.`;
 
 const DRAFT_1 = `Good habits are very important in our life. As a student, I have deep experience about it.
 
-Two years ago, I was used to staying up late to play mobile phone. So I always felt tired in class and my grade dropped quickly. My teacher talked with me and suggested me to make a study plan. Since then, I go to bed before 11 o'clock and read English every morning. Gradually, my spirit becomes better and I make a great progress in study.
+Two years ago, I was used to staying up late to play mobile phone. So I always felt tired in class and my grade dropped quickly. My teacher talked with me and suggested me to make a study plan. Since then, I go to bed before 11 o'clock and read English every morning. Gradually, my spirit becomes better and I make a great progress in study. Besides, I started to review my notes for twenty minutes before dinner and kept my phone in another room while studying. At first, I found it difficult to sit still, but after a month I could finish my homework earlier and even had time to read a short English story. These small changes taught me that a habit is not a sudden decision but a daily choice, and real progress comes from repeating that choice even when I do not feel like it.
 
 In conclude, good habits can help us become a better person. It is never too late to start a good habit. If we keep doing small things every day, we will success one day.`;
 
@@ -23,7 +23,7 @@ const REVIEW_1: ReviewResult = {
   subscores: { content: 6, language: 6, organization: 3 },
   score: 15,
   overall_comment: '主要问题在语言层：词汇停留在初中层（important/good 反复出现），句式以简单句为主，且 used to / suggest / progress / succeed 等多处语法硬伤在阅卷中会直接压档；内容上论据只有"学习"一个维度。先清零语法硬伤，再升级词汇与句式。',
-  word_count_assessment: '约 127 词，符合 120-150 词要求。',
+  word_count_assessment: '当前 200 词 / 要求 200-500 词 / 符合要求。',
   issues: [
     {
       quote: 'I was used to staying up late to play mobile phone',
@@ -64,7 +64,7 @@ const REVIEW_1: ReviewResult = {
   ],
   revised_essay: `Good habits **play a significant role in shaping our lives**, and my own experience **is a good case in point**.
 
-Two years ago, I **used to stay up late scrolling on my phone**, which **left me exhausted in class and caused my grades to decline**. After a talk with my teacher, I **made a study plan and stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**.
+Two years ago, I **used to stay up late scrolling on my phone**, which **left me exhausted in class and caused my grades to decline**. After a talk with my teacher, I **made a study plan and stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**. **Besides, I set aside twenty minutes before dinner to review my notes and kept my phone out of reach while working.** **At first, sitting still felt unbearable, but within a month I was finishing my homework earlier and even had time to read a short English novel in the evening.** **These small changes taught me that a habit is not a sudden decision but a daily choice, and that real progress comes from repeating that choice even when motivation fades.**
 
 **In conclusion**, good habits are the **stepping stones to a better self**. It is never too late to start. **As long as we keep doing small things consistently**, we will **succeed** one day.`,
   suggestions: [
@@ -102,7 +102,7 @@ Two years ago, I **used to stay up late scrolling on my phone**, which **left me
 
 const DRAFT_2 = `Good habits play a significant role in shaping our lives, and my own experience is a good case in point.
 
-Two years ago, I used to stay up late scrolling on my phone, which left me exhausted in class and caused my grades to decline. After a talk with my teacher, I made a study plan and stuck to it: going to bed before 11 and reading English every morning. Gradually, not only did I become more energetic, but I also made great progress in my studies.
+Two years ago, I used to stay up late scrolling on my phone, which left me exhausted in class and caused my grades to decline. After a talk with my teacher, I made a study plan and stuck to it: going to bed before 11 and reading English every morning. Gradually, not only did I become more energetic, but I also made great progress in my studies. Besides, I set aside twenty minutes before dinner to review my notes and kept my phone out of reach while working. At first, sitting still felt unbearable, but within a month I was finishing my homework earlier and even had time to read an English novel. That simple routine slowly became almost automatic. These small changes taught me that a habit is not a sudden decision but a daily choice, and real progress comes from repeating that choice even when motivation fades.
 
 In conclusion, good habits are the stepping stones to a better self. It is never too late to start. If we keep doing small things every day, success will come naturally.`;
 
@@ -115,7 +115,7 @@ const REVIEW_2: ReviewResult = {
   subscores: { content: 8, language: 7, organization: 4 },
   score: 19,
   overall_comment: '语法硬伤已基本清零，当前最大短板是内容：论据仍局限于学习单一维度，缺少第二个角度的例证；结尾 if 条件句正确但平淡。补足非学习维度的例证并升级收尾句式，即可向 21 分以上冲刺。',
-  word_count_assessment: '约 121 词，符合 120-150 词要求。',
+  word_count_assessment: '当前 200 词 / 要求 200-500 词 / 符合要求。',
   issues: [
     {
       quote: 'If we keep doing small things every day, success will come naturally.',
@@ -132,7 +132,7 @@ const REVIEW_2: ReviewResult = {
   ],
   revised_essay: `Good habits **play a significant role in shaping our lives**, and my own experience is **a case in point**.
 
-Two years ago, I **used to stay up late scrolling on my phone**, which left me exhausted in class and caused my grades to decline. After a talk with my teacher, I made a study plan and **stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**. **Beyond academics, a habit of jogging every weekend has kept me both healthy and refreshed.**
+Two years ago, I **used to stay up late scrolling on my phone**, which left me exhausted in class and caused my grades to decline. After a talk with my teacher, I made a study plan and **stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**. **Beyond academics, a habit of jogging every weekend has kept me both healthy and refreshed.** **Meanwhile, I set aside twenty minutes before dinner to review my notes and kept my phone out of reach while working.** **At first, sitting still felt unbearable, but within a month I was finishing my homework earlier and even had time to read an English novel.** **That simple routine slowly became almost automatic, and these small changes taught me that real progress comes from repeating a daily choice even when motivation fades.**
 
 **In conclusion**, good habits are the **stepping stones to a better self**. It is never too late to start. **As long as we keep doing small things consistently, we will naturally succeed one day.**`,
   suggestions: [
@@ -246,9 +246,5 @@ export async function seedSampleEssay(db: D1Database, userId: string): Promise<v
     ).bind(essayId, draft2Id, userId, POLISH_FRAGMENT, JSON.stringify(POLISH_RESULT)).run();
   } catch (err: any) {
     console.error(`[sample-essay] 预置示例作文失败（不影响注册）: ${err?.message ?? err}`);
-    try {
-      await db.prepare('DELETE FROM essays WHERE user_id = ? AND title = ?')
-        .bind(userId, '示例：The Power of Habits').run();
-    } catch { /* ignore */ }
   }
 }

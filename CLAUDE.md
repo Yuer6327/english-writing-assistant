@@ -2,6 +2,8 @@
 
 面向 AI 编码助手（Claude Code / ZCode 等）的项目地图。本项目为 [english-reading-assistant](../english-reading-assistant) 的姊妹项目，架构与基础设施（加密 / 限流 / AI 调用层 / SPA 前端）复用自该项目的成熟实现，业务层围绕"作文批改教学"重写。
 
+> **待办任务清单见 [`docs/AUDIT.md`](docs/AUDIT.md)**（2026-10-27 全站审查：P0×5 / P1×12 / P2×7 + 功能建议 + 明确不做清单）。动手改提示词、计费、并发写入前先看那里的 P0 条目与「不可违反的既有约束」。
+
 ## 线上地址与部署形态
 
 - **https://writing.yuer6327.top/**（zone 内 Workers 路由 `writing.yuer6327.top/*`，见 wrangler.toml `routes`）
@@ -14,7 +16,7 @@
 面向上海高中生的英语作文批改教学网页应用。**不登录也能用**（游客试用），核心流程：
 
 0. **游客试用（未登录）**：每天 1 篇、最多 3 稿（一稿/二稿/三稿）、每稿只能成功批改 1 次（= 每天 3 次批改）；只能用免费通道 + 百度 OCR；精修/润色/按模式自定义提示词/导出设置需登录。身份 = cookie `wg`（随机 32 hex，90 天），user_id 记为 `guest:<id>`；**登录后首次请求自动接管该设备的游客数据**
-1. **新建作文**：题目文本 + 可选题目图片（图画/图表作文），题型 v1 仅 `sh-gaokao-essay`（上海高考大作文，内容 10 + 语言 10 + 结构 5 = 25 分，120-150 词）
+1. **新建作文**：题目文本 + 可选题目图片（图画/图表作文），题型 v1 仅 `sh-gaokao-essay`（上海高考大作文，内容 10 + 语言 10 + 结构 5 = 25 分，200-500 词）
 2. **写稿件**：拍照/上传手写稿 → OCR（默认大模型视觉逐字转写 + 书写质量分；可切百度 OCR）→ **可编辑确认页**（保留学生原始错误）→ 保存；或直接输入
 3. **批改**：按生效提示词（`essays.custom_prompt` > `prompt_templates`（按 user+**genre**）> `src/utils/prompts.ts` 内置默认）调用 LLM → 结构化 JSON → 前端渲染分数卡 + 原文错误高亮（quote substring / 空白归一定位）+ 诊断 + 修改全文（**粗体**升级点）+ 建议
 4. **二稿迭代**：一稿预填编辑或重拍；批改自动注入上一稿反馈摘要 → `improvement` 进步对比（分差 / 已解决 / 遗留 / 新引入）
@@ -67,7 +69,7 @@
 │   ├── utils/
 │   │   ├── quota.ts           # ★ 批改次数额度（成功计数 / 游客规则 / 每日 10 次）
 │   │   ├── ai.ts              # ★ callAI 调用层：多端点 failover、response_format 回退、
-│   │   │                      #   90s 超时、extractJSON 容错、friendlyAIError 中文化
+│   │   │                      #   40s 单次超时 + 90s 总预算、extractJSON 容错、friendlyAIError 中文化
 │   │   ├── prompts.ts         # ★ 全部提示词：上海高考大作文默认模板（用户框架）、
 │   │   │                      #   VLM 手写转写、片段精修、全文润色 + fillTemplate/getEffectivePrompt
 │   │   ├── validate.ts        # ★ AI 结果校验净化：safeScore 收敛、quote 命中原文、
@@ -92,7 +94,7 @@
 - `users` / `api_keys`（api_keys 含 `provider`（byok/agnes）+ 可选 `vision_*` 三列：主模型不支持图片时单独指定视觉模型，空则视觉=主模型；BYOK 已迁 billing，该表仅历史备份）
 - `essays`：title, genre, topic_text, topic_images(JSON data URL), custom_prompt（user_id 可为 `guest:<id>`）
 - `drafts`：essay_id, version（1=一稿，删除中间稿不重排）, text, source(photo/text/polish), word_count, handwriting_score, ocr_images
-- `reviews`：draft_id, result(JSON=ReviewResult), model, **reviewed_text（批改时稿件快照，稿件后改不影响已出报告）**, created_at
+- `reviews`：draft_id, result(JSON=ReviewResult), model, **reviewed_text（批改时稿件快照，稿件后改不影响已出报告）**, meta(耗时/attempts/token/未定位问题统计), created_at
 - `polishes`：mode(fragment/full), fragment, instruction, result
 - `prompt_templates`：PRIMARY KEY(user_id, **genre**) —— 每个模式一行、独立保存与恢复；内置默认在代码里
 - `quota_events`（0002）：user_id, day(北京日期), kind(review/ocr), essay_id, draft_id —— **成功**才写一行，额度状态/门禁都由它算
@@ -103,7 +105,7 @@
 - **限流**：`aiRateLimit` 中间件（Agnes 用户 18 RPM/人）+ `agnesGlobalRateHit()` 全局桶；1015（Cloudflare 挡端点）按 retry-after 排班，预算内（≤12s）就地等，超预算快速失败回传秒数。
 - **图片**：客户端 `compressImageFile`（长边≤1600、≤300KB/张、≤3 张）→ data URL；服务端 `validImages` 复验。
 - **批改调用**：题目带图时走 `getVisionConfig` + contentParts（text + images）；调用后 `sanitizeReview` 校验，失败附错误信息**严格重试一次**，仍失败 502 带 details。
-- **额度与计费**：批改前 `checkReviewGate`（免费档才判次数），成功后 `recordSuccess`；`billing.hold` 对免费档传 `skipQuota: true`（付费档照常预扣）。重试/失败的中间成本不计次。
+- **额度与计费**：批改前 `checkReviewGate`（免费档才判次数）；成功结果与 `quota_events` 计次必须同一 `DB.batch` 事务提交，游客同稿由唯一索引拦住并发重复。`billing.hold` 对免费档传 `skipQuota: true`（付费档照常预扣）。重试/失败的中间成本不计次。
 - **响应格式**：`response_format: json_object`，Agnes 模型自动跳过（不支持该参数，失败一次后缓存跳过）。
 - **提示词占位符**：`{topic} {essay} {word_count} {previous_feedback}`，`fillTemplate` 替换；`{essay}` 为必填项（保存模板时强校验）。
 

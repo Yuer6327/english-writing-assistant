@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>英语作文批改助手 · 优化审查报告 2026-10-27</title>
+<style>
+  :root{
+    --bg:#141517; --panel:#1b1d20; --line:#2e3237;
+    --text:#e6e6e3; --muted:#9a9a95; --dim:#7a7a75;
+    --p0:#ff6b6b; --p1:#ffa94d; --p2:#6ab0f3; --ok:#51cf66; --accent:#7c8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.75 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:40px 20px 80px}
+  .wrap{max-width:1000px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:26px}
+  h2{font-size:17px;margin:38px 0 12px;padding-left:10px;border-left:3px solid var(--accent)}
+  h2 .cnt{color:var(--dim);font-weight:400;font-size:13px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 18px;margin:11px 0}
+  .card.p0{border-left:3px solid var(--p0)}
+  .card.p1{border-left:3px solid var(--p1)}
+  .card.p2{border-left:3px solid var(--p2)}
+  .t{font-weight:600;font-size:14.8px;margin-bottom:3px}
+  .loc{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:var(--accent);
+    background:#22252a;padding:1px 6px;border-radius:4px;word-break:break-all}
+  .row{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap}
+  .tag{font-size:11px;padding:1px 7px;border-radius:99px;font-weight:600;letter-spacing:.3px}
+  .tag.p0{background:rgba(255,107,107,.14);color:var(--p0)}
+  .tag.p1{background:rgba(255,169,77,.14);color:var(--p1)}
+  .tag.p2{background:rgba(106,176,243,.14);color:var(--p2)}
+  .tag.s{background:#2b2f35;color:#b9c2cc}
+  .body{margin-top:7px;font-size:13.8px;color:#d2d2ce}
+  .body p{margin:5px 0}
+  .body b{color:#fff;font-weight:600}
+  .fix{background:#1f2a22;border-left:2px solid #2f6b3f;padding:7px 12px;margin-top:9px;
+    border-radius:0 6px 6px 0;font-size:13.2px;color:#cfe8d5}
+  .fix em{color:#8fd6a2;font-style:normal;font-weight:600}
+  code{font-family:ui-monospace,Consolas,monospace;font-size:12.3px;
+    background:#26292e;padding:1px 5px;border-radius:4px;color:#e0dcb8}
+  .lead{background:linear-gradient(180deg,#1e2330,#1b1d20);border:1px solid #2c3444;
+    border-radius:12px;padding:20px 22px;margin-bottom:6px}
+  .lead ul{margin:8px 0 0;padding-left:20px}
+  .lead li{margin:6px 0}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:10px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px;letter-spacing:.4px}
+  .no{color:var(--p0);font-weight:600}
+  footer{margin-top:46px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .grp{color:var(--dim);font-size:12px;margin:20px 0 -2px;letter-spacing:.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>英语作文批改助手 — 优化审查</h1>
+<div class="sub">2026-10-27 · 审查面：src/ 4,169 行 + public/ 4,680 行 + migrations + CLAUDE.md　·　基线 <code>npm run check</code> 通过</div>
+<div class="fix"><em>最终执行口径（2026-10-27 已落地）</em>：词数采用 <b>200-500 词</b>（不采纳本报告原 P0-1 的 120-150）；图片 token 通用按 1600/张，<b>DeepSeek 模型按官方文档 1024/张</b>。</div>
+
+<div class="lead">
+  <div style="font-weight:600;margin-bottom:8px">一句话结论</div>
+  <div style="color:#c9c9c4;font-size:14.5px">
+    工程质量明显高于典型个人项目——CSP 走哈希、配额与计费分层、AI 输出净化、游客数据接管都考虑到了，
+    真正的坑集中在<b>三处方向性错配</b>：评分口径与官方题干不一致；长耗时链路没有对抗基础设施超时，且关键写入不原子；
+    "批改完就结束"没有形成学习闭环。前两类会让真实学生立刻撞墙，第三类决定有没有复购价值。
+  </div>
+  <ul>
+    <li><span style="color:var(--p0)">教学正确性</span>：默认提示词要求 <b>200-500 词</b>，上海卷官方题干是 <b>120-150 词</b>——合规作文会被判"词数严重不足"。</li>
+    <li><span style="color:var(--p0)">可用性</span>：带题目图的付费批改会因图片 token 估算虚高 50-100 倍被 402 拒绝。</li>
+    <li><span style="color:var(--p0)">可靠性</span>：结算/计次写在结果落库之前，落库失败 = 钱扣了、次数减了、报告没有。</li>
+  </ul>
+</div>
+
+<h2>P0 — 会产生错误结论或直接失败 <span class="cnt">5 条</span></h2>
+
+<div class="card p0">
+  <div class="row"><span class="tag p0">P0-1</span><div class="t">默认提示词的词数口径写错，且与自家示例数据互相打脸</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/prompts.ts:56</span><span class="loc">src/utils/prompts.ts:172</span><span class="loc">src/utils/prompts.ts:16</span><span class="loc">src/sample/seed.ts:9</span></div>
+  <div class="body">
+    <p><b>现状</b>：<code>SH_GAOKAO_ESSAY_PROMPT</code> 写"词数要求 200-500 词；词数不足或超出过多应扣分"，全文润色也要求"控制在 200-500 词"，<code>GENRES.desc</code> 同样写 200-500。但 <code>seed.ts</code> 的示例作文是 127 词 / 121 词，assessment 写的是"符合 120-150 词要求"，CLAUDE.md 也写 120-150。</p>
+    <p><b>后果</b>：上海高考 Guided Writing 官方题干原文是 <i>"Write an English composition in 120-150 words"</i>（2024 真题，多源一致）。一篇完全合规的 130 词作文进来会被判词数不足、扣内容分；修改稿和润色稿会被扩写到 250-300 词，学生照抄等于在考场写超标作文。<b>这不是体验问题，是教错方向</b>，而且同一系统内示例（127 词"符合要求"）与规则（200-500）自相矛盾，学生点开示例再交自己的作文，信任当场崩。</p>
+  </div>
+  <div class="fix"><em>改法</em>：三处统一 120-150（建议 130±15，≤115 或 ≥170 才判词数问题）；<code>word_count_assessment</code> 固定输出"当前词数 / 要求区间 / 差值"；<code>seed.ts</code> 两条文案跟着对齐。仓库里不能再同时存在两个词数区间。</div>
+</div>
+
+<div class="card p0">
+  <div class="row"><span class="tag p0">P0-2</span><div class="t">图片 token 按 base64 字符数折算，虚高 50-100 倍，带图付费批改直接 402</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:35-37</span><span class="loc">src/routes/essays.ts:467</span><span class="loc">src/routes/ocr.ts:159</span></div>
+  <div class="body">
+    <p><b>现状</b>：<code>estimateImageTokens = images.join('').length / 4</code>。单张 data URL 上限 400,000 字符 → 单张估算 <b>100,000 tokens</b>，三张 300,000。deepseek 档 inputPer1k = 0.4 分，一张图即冻结 ≈40 分，而真实多模态输入通常 1-2k tokens/图。</p>
+    <p><b>后果</b>：billing 的 <code>debit()</code> 余额校验是硬的（<code>balance &gt;= amount</code> 否则抛 402）。带题目图片 + 积分档会以"积分余额不足，请充值"被拒——用户余额明明够。同一公式也用在 VLM 手写识别。</p>
+  </div>
+  <div class="fix"><em>改法</em>：图片按固定估值（如 <code>perImage = 1600</code> tokens）或按长边像素分段累加，与文字 token 分开算。把口径写进 <code>docs/billing-handoff.md</code>，避免下次又按字符数折算。</div>
+</div>
+
+<div class="card p0">
+  <div class="row"><span class="tag p0">P0-3</span><div class="t">结算与计次都在结果落库之前，落库一失败就是"钱扣了、次数减了、报告没有"</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:516-527</span><span class="loc">src/routes/essays.ts:538-545</span><span class="loc">src/routes/essays.ts:560</span></div>
+  <div class="body">
+    <p><b>现状</b>：顺序是 <code>settle</code> → <code>recordSuccess</code> → <code>INSERT INTO reviews</code>。若 INSERT 抛错（D1 5xx、行超 2MB），外层 catch 因 <code>settled = true</code> 不再 release，返回 502。用户积分实扣、免费次数 -1、库里零记录。</p>
+    <p><b>后果</b>：这正是你在计费侧专门规避过的那类问题（"没批改却少了额度"），只是换到了批改侧。而且重试一次会再扣一次。</p>
+  </div>
+  <div class="fix"><em>改法</em>：<code>db.batch([insertReview, insertQuotaEvent])</code>（D1 batch 即事务），顺序反转为先落结果再计次；batch 失败时把已拿到的 result 照常返回给用户（结果是对的，别丢），后台记 error 告警。</div>
+</div>
+
+<div class="card p0">
+  <div class="row"><span class="tag p0">P0-4</span><div class="t">三处并发写入没有唯一约束兜底：同稿批两次、版本重号、示例灌两份</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/quota.ts:125</span><span class="loc">src/routes/essays.ts:319-322</span><span class="loc">src/routes/essays.ts:138-153</span></div>
+  <div class="body">
+    <p><b>（a）游客门禁是 TOCTOU</b>：<code>checkReviewGate</code> 读"未批改过" → 隔 30-90 秒 AI 调用 → <code>recordSuccess</code> 写行，中间无互斥。<code>quota_events</code> 只有普通索引，双标签页 / 超时重试 / 多 isolate 都能让同一稿批两次、计次 +2。BYOK 车道连 inflight 锁都不占。</p>
+    <p><b>（b）版本号 MAX+1</b>：<code>drafts</code> 无 <code>UNIQUE(essay_id, version)</code>，并发写出两个"二稿"；游客 3 稿门禁用的就是预读 version，可写第 4 稿。前端 Tab 按 version 渲染（明确不重排），重号后展示与批改引用全串。</p>
+    <p><b>（c）示例播种</b>：先读 flag、再 count、再 seed、最后写 flag。新用户首屏并发两次 <code>GET /api/essays</code> 会各灌一份示例，同一篇示例出现两次；<code>seed.ts</code> 的失败兜底按 title 删除，可能误删用户自己写的同名作文。</p>
+  </div>
+  <div class="fix"><em>改法</em>：三条唯一约束一次加齐 —— <code>UNIQUE INDEX uq_quota_draft ON quota_events(user_id,draft_id,kind) WHERE draft_id IS NOT NULL</code>（配合 <code>INSERT OR IGNORE</code> + <code>meta.changes===0</code> 判重返 409）、<code>UNIQUE(essay_id, version)</code> + <code>INSERT ... SELECT MAX+1</code>、播种改成"先抢 flag 再 seed"。约 40 行 SQL/TS，是后续所有幂等改造的地基。</div>
+</div>
+
+<div class="card p0">
+  <div class="row"><span class="tag p0">P0-5</span><div class="t">"最高 22 分"是刻意设计，但界面按 /25 展示，学生只会以为系统坏了</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/prompts.ts:44</span><span class="loc">src/utils/prompts.ts:113</span><span class="loc">src/utils/validate.ts:52-61</span></div>
+  <div class="body">
+    <p><b>现状</b>：提示词硬性规定"内容≤9、语言≤9、结构≤4，总分≤22，无论多优秀"，<code>sanitizeReview</code> 也用 9/9/4 收敛并强制 <code>finalScore = sum</code>（<code>parsed.score</code> 因此是死代码）。压分纪律本身合理（防 AI 放水），问题在<b>呈现</b>：前端一律 <code>/25</code>，从未告知上限；二稿反馈块还写死了 <code>上一稿得分：x/25</code>，模型看到的基准也跟着失真（19/25 像"还行"，19/22 像"接近封顶"）。</p>
+    <p><b>后果</b>：写得极好的学生拿到 22/25，会认定判错；几次之后对分数彻底失去信任——而分数是这类产品唯一的量化反馈。</p>
+  </div>
+  <div class="fix"><em>改法</em>：分数卡加固定注记"本系统采用保守阅卷口径，上限 22/25，真实阅卷可给 23-25"，21-22 标为"系统内满分"；<code>buildPreviousFeedbackBlock</code> 的分母跟着改；<code>parsed.score</code> 从输出 schema 删掉，减少模型无谓输出。更彻底的做法是把 9/9/4 提到 <code>GENRES</code> 参数化（CLAUDE.md「新增题型」已预告这个坑）。</div>
+</div>
+
+<h2>P1 — 用户可感知的失败 / 明显浪费 <span class="cnt">12 条</span></h2>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-1</span><div class="t">AI 重试不区分错误类型，最坏 6 分钟，且会超过 Cloudflare 100s 空闲超时</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/ai.ts:10</span><span class="loc">src/routes/essays.ts:491-509</span><span class="loc">src/routes/ocr.ts:185-221</span></div>
+  <div class="body"><p>除 429/1015 外任何异常都进第二次 attempt：BYOK key 失效（401）、模型名错（400）、90s 超时都会再打一遍，叠上双端点 failover 与 1015 就地等待 12s，最坏 ≈ 2×90s×2。而 Cloudflare 对客户端连接的空闲超时约 100 秒，超出返回 524（HTML 错误页）——前端 <code>api.js:21</code> 直接 <code>resp.json()</code>，解析 HTML 抛 "Unexpected token &lt;"，用户看到兜底文案而非"超时"。更糟：billing hold 5 分钟过期，超时请求 settle 时 hold 已 expired，<code>charged=0</code>，等于免费白用一次。</p></div>
+  <div class="fix"><em>改法</em>：只对「JSON 解析失败 / sanitize 校验失败」重试，<code>4xx</code>（非 429）和 abort 立即失败；给 <code>callAI</code> 传 deadline，剩余预算不够一个新端点就不再换端点；单次超时降到 40s，总预算硬顶 90s。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-2</span><div class="t">30-90 秒的同步请求，既不能取消也不能恢复</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">public/js/api.js:21</span><span class="loc">public/js/essay.js:596</span></div>
+  <div class="body"><p>前端 fetch 无 <code>AbortController</code>、无超时、无重试。用户切到微信回消息、锁屏、手滑刷新，页面状态就没了。服务端其实已经把结果写进 <code>reviews</code>——数据没丢，但用户不知道"刷新就有"，只会再点一次（额度还够的话）。</p></div>
+  <div class="fix"><em>改法</em>：<b>job 化</b>。POST 立即返回 <code>202 + job_id</code>，前端 2s 轮询 <code>GET /api/drafts/:id/review-status</code>；进页面先查有无进行中的 job 并恢复状态。D1 加一列 <code>reviews.status</code>（pending/done/failed）即可，不需要队列。一次改动同时解决 P1-1 的 524、刷新失忆、无法取消。成本 M，收益最大。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-3</span><div class="t">单篇自定义提示词不校验 <code>{essay}</code>：作文根本不进 prompt，照样扣一次额度</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:116</span><span class="loc">src/routes/essays.ts:267</span><span class="loc">src/routes/prompts.ts:77</span></div>
+  <div class="body"><p>创建/更新作文的 <code>custom_prompt</code> 只 trim + slice，唯一强校验在模板接口。<code>fillTemplate</code> 会把未知占位符清空，于是 AI 手里没有作文却仍然返回一份"批改"，<code>checkReviewGate</code> 已放行、<code>recordSuccess</code> 照扣。这是"AI 没看我的作文却收了我一次额度"——最容易被写成差评的静默错误。</p></div>
+  <div class="fix"><em>改法</em>：抽 <code>validatePromptTemplate()</code>（长度 + 必须含 <code>{essay}</code>），essays 的 POST/PUT 与 prompts.ts 共用；<code>fillTemplate</code> 前断言一次，缺失则回退内置默认并 log。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-4</span><div class="t">作文详情把前端从不使用的稿件原图一起返回，一次可达数 MB</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:191-207</span><span class="loc">src/routes/essays.ts:219</span><span class="loc">public/js/essay.js:936</span></div>
+  <div class="body"><p><code>SELECT d.*</code> 把每稿 <code>ocr_images</code>（≤3 张 × ≤400K 字符）原样塞进响应。全仓库只有 <code>essay.js:936</code> 一处碰这个字段，是写入、<b>从不读取</b>。三稿就白带 ≈3.6MB；D1 单行上限 2MB，再宽一点会写失败，正好触发 P0-3 的资损链路。</p></div>
+  <div class="fix"><em>改法</em>：详情接口换成 <code>ocr_image_count</code>，另开 <code>GET /drafts/:id/images</code> 按需拉；<code>/api/*</code> 统一加 <code>Cache-Control: no-store</code>（现在没有，用户数据可能被浏览器缓存）。<code>MAX_IMAGES</code>/<code>MAX_IMAGE_CHARS</code> 现在 essays.ts 与 ocr.ts 各写一份，提公共常量。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-5</span><div class="t">并发锁没有 TTL，一次异常就让该用户在这个 isolate 里永久 429</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/inflight.ts:9-17</span><span class="loc">src/routes/essays.ts:478</span></div>
+  <div class="body"><p><code>tryAcquire</code> 只写 <code>set(userId, true)</code>，只有 <code>finally</code> 里的 release 会删。请求若在 finally 前被平台终止（isolate 回收、CPU 超限、连接中断），键永久残留 → 该用户所有批改都 429「已有批改任务进行中」。另外文件头注释写"免费/BYOK 不锁"，代码是 <code>mode !== 'byok'</code>——免费档恰恰也锁，而它是主路径。</p></div>
+  <div class="fix"><em>改法</em>：存 <code>{ts, token}</code>，超过 3 分钟直接抢占；<code>releaseSlot(userId, token)</code> 只在 token 匹配时删；修正注释。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-6</span><div class="t">定位失败的 issue 被静默丢弃，学生看到的错误清单比 AI 指出的少</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/validate.ts:66-82</span></div>
+  <div class="body"><p><code>if (!hit) continue;</code> —— quote 差一个标点、大小写、弯引号就整条丢掉，前端完全不知道少了什么；<code>issues</code> 还封顶 10 条，若前几条恰好定位失败，学生只拿到 7 条。这是"批改好像漏了"的直接来源。</p></div>
+  <div class="fix"><em>改法</em>：保留条目并加 <code>located: false</code>，前端把未定位项放列表末尾、不画原文高亮但仍展示说明与改法；把未命中率记进日志，超 30% 说明提示词该收紧 quote 规则。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-7</span><div class="t">限流与并发锁全是进程内 Map，多 isolate 下两个方向都错</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/rate-limit.ts:17,34-51</span><span class="loc">src/routes/essays.ts:89-92</span></div>
+  <div class="body"><p><code>guest:ip:*</code> 是"清 cookie 重置次数"的唯一兜底，但它只活在一个 isolate，换代即清零；<code>ai:agnes:global</code> 18 RPM 同理——多 isolate 时实际是 18×N（打爆共享额度），单 isolate 热点时又会误拒正常用户。D1 里的 <code>quota_events</code> 不受影响，所以真正受损的是 Agnes 共享额度和防滥用。</p></div>
+  <div class="fix"><em>改法</em>：这两类计数落 D1（<code>rate_events(key, day, n)</code> 日桶，<code>ON CONFLICT DO UPDATE SET n = n + 1 RETURNING n</code>），或改用 Cloudflare Rate Limiting 规则；内存层降级为"最快路径预筛"。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-8</span><div class="t">OCR 畸变无法在保存前复核，错字会一路传导成"学生的拼写错误"</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/ocr.ts:39</span><span class="loc">src/utils/prompts.ts:119-132</span></div>
+  <div class="body"><p>结果进"可编辑确认页"，但学生很难看出 model 把 <code>through</code> 读成 <code>throuqh</code>。这个畸变会被当成本人的拼写错误写进 issues，反过来"教"他去改一个自己没写错的词。这是手写识别类产品最伤信任的失效模式，而手写稿 OCR 恰恰是本产品的入口。</p></div>
+  <div class="fix"><em>改法</em>：OCR 出来后做一次本地词表比对（5k 高频词 + 简单规则即可），疑似畸变的词在确认页高亮黄底并提示"可能是识别错误，请核对"。零 AI 成本，挡掉大部分明显畸变。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-9</span><div class="t">巩固练习只出题、不判题，闭环断在这里</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/prompts.ts:97</span><span class="loc">src/utils/validate.ts:84-99</span></div>
+  <div class="body"><p><code>practice</code> 已出 3-4 题中译英，但学生写完没有对答案的入口，只能眼对参考译文，无法判断"我这句算不算对"。出题花的 token 白费了一半，也是"批改完就结束"的一部分。</p></div>
+  <div class="fix"><em>改法</em>：先做零成本的"自己对照"模式（学生答案与参考答案并排、标出未覆盖的目标词），验证有人用再加轻量 AI 判分（只比对本组 3-4 句，成本约批改的 1/5）。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-10</span><div class="t">精修/润色的失败路径没有 attempt 日志，502 还会把上游原文回吐给用户</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:684-690</span><span class="loc">src/routes/essays.ts:743-749</span><span class="loc">src/utils/ai.ts:104</span></div>
+  <div class="body"><p>精修/润色吞掉 <code>lastErr</code> 直接 throw，attempt 序号、模型、lane、耗时全丢；而 <code>friendlyAIError</code> 对未知错误 <code>return raw.slice(0,300)</code>，BYOK 的 401/400 报文（含 endpoint、模型名、key 前缀）会直接进前端 toast——<code>ocr.ts:131</code> 已明确反其道"不透传上游原始报文"，两处策略不一致。</p></div>
+  <div class="fix"><em>改法</em>：抽 <code>runStructuredCall({label, cfg, prompt, sanitize})</code> 统一封装 attempt 循环，每次失败打结构化日志，四处复用（顺带消掉约 200 行重复）；对外只给分类文案 + traceId，原文进日志。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-11</span><div class="t">除了全量请求日志，没有任何关键路径埋点</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/index.ts:22</span><span class="loc">src/routes/essays.ts:542</span></div>
+  <div class="body"><p><code>app.use('*', logger())</code> 对每个静态资源都打两行（observability 已开 persist，既存储又计费），真正需要的慢请求/失败样本被淹没。同时 <code>callAI</code> 拿到了 <code>usage</code> 却只用于 settle，<code>reviews</code> 只存 <code>model</code> 字符串：哪次慢、哪次重试、quote 命中率多少、改了提示词质量是升是降——全靠手感。</p></div>
+  <div class="fix"><em>改法</em>：<code>logger()</code> 只保留 <code>/api/*</code>（或仅 DEV）；<code>reviews</code> 加 <code>meta TEXT</code>（elapsed_ms / attempts / usage / issues_dropped / prompt_source），出口打一条 <code>{evt:'review.end', reqId, userId, lane, durMs, status}</code>。数据量极小，从此可以回答"这周失败率多少"。</div>
+</div>
+
+<div class="card p1">
+  <div class="row"><span class="tag p1">P1-12</span><div class="t">PDF 导出要抓 8-9MB 中文字体，且只在内存缓存</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">public/js/export.js:15</span><span class="loc">public/js/export.js:40</span></div>
+  <div class="body"><p><code>NotoSansSC-Regular.otf</code> 全字库走 CDN，缓存只存 <code>_libs.notoFont</code> 内存变量，刷新即失。学生 4G 导一份 PDF 先花近 10MB，CDN 一慢就卡在"生成 PDF"。DOCX 路径没这问题。</p></div>
+  <div class="fix"><em>改法</em>：字体放 <code>public/fonts/</code>（Workers Assets 不计入 Worker 包体），配 <code>Cache-Control: immutable</code> 走浏览器缓存，<code>font-src 'self'</code> 已有；字体本身可换 GB2312 子集（约 2-3MB），CJK 扩展字基本用不到。</div>
+</div>
+
+<h2>P2 — 打磨与可维护性 <span class="cnt">7 条</span></h2>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-1</span><div class="t">essays.ts 787 行职责过载，四个 handler 各抄一遍 hold→attempt→settle→release→finally</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:465-567</span><span class="loc">src/routes/essays.ts:637-784</span></div>
+  <div class="body"><p>精修与全文润色几乎逐行重复。抽 <code>withHold()</code> + <code>runStructuredCall()</code> 后文件可降到 ~450 行，最大好处是避免"只在一处修了 bug"（P1-1、P1-10 都是四处重复带来的）。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-2</span><div class="t">模板占位符用 split/join 顺序替换，作文正文里的 <code>{topic}</code> 会被吃掉</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/utils/prompts.ts:201-211</span></div>
+  <div class="body"><p>先换 topic 再换 essay，正文若含 <code>{word_count}</code> 会在后续轮被替换成数字，末尾还有一条正则清残留。改成单次 <code>replace(/\{(topic|essay|...)\}/g, (m,k)=&gt;vars[k]??'')</code> 一行解决。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-3</span><div class="t">没有任何过期/清理策略，polishes.draft_id 还缺外键</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">migrations/0002_quota_events.sql</span><span class="loc">migrations/0001_init.sql:76</span><span class="loc">wrangler.toml</span></div>
+  <div class="body"><p><code>quota_events</code> 只增不减；<code>polishes</code> 全量永久保留（<code>LIMIT 20</code> 只限读取）；<code>polishes.draft_id</code> 无 FK，删稿后留孤儿行；wrangler.toml 没有 <code>[triggers] crons</code>。加一个 cron：清 &gt;90 天的 quota_events、清 draft_id 已不存在的 polishes。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-4</span><div class="t">列表接口为拿一个 score，把整份批改 JSON 取回来再丢掉</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:155-161</span></div>
+  <div class="body"><p>子查询 <code>SELECT r.result</code>（含 <code>revised_essay</code>、<code>issues</code> 全文）之后只用 <code>score</code>，列表也无 LIMIT。改 <code>json_extract(result,'$.score')</code> 或把 score 落独立列，加 <code>LIMIT 200</code>。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-5</span><div class="t">429 语义混用，前端只能靠 code 白名单猜</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:402</span><span class="loc">src/routes/essays.ts:480</span><span class="loc">src/routes/essays.ts:504</span><span class="loc">public/js/essay.js:154</span></div>
+  <div class="body"><p><code>guest_ip_limit</code> / <code>concurrent_limit</code> / <code>rate_limited</code>（这条连 code 都没有）都是 429 但语义完全不同。统一成 <code>{ code, retry_after }</code>，前端才能给出"等 N 秒再试"而不是笼统的"太频繁"。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-6</span><div class="t">损坏的 JSON 被静默吞掉</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">src/routes/essays.ts:70-73</span></div>
+  <div class="body"><p><code>parseJsonField</code> catch 后返回 fallback，批改结果损坏时前端渲染空白且无日志。catch 分支加上 review id 一起 warn。</p></div>
+</div>
+
+<div class="card p2">
+  <div class="row"><span class="tag p2">P2-7</span><div class="t">文档与代码漂移 + dev-session 后门只靠一个环境变量</div></div>
+  <div class="row" style="margin-top:4px"><span class="loc">CLAUDE.md:17</span><span class="loc">src/routes/auth.ts:61-71</span></div>
+  <div class="body"><p>CLAUDE.md 写 120-150 词 / 25 分，代码写 200-500 并封顶 22——给 AI 编码助手看的文档一旦和代码打架，下次改动会继续放大分歧。另外 <code>ENABLE_DEV_SESSION=1</code> + 固定 cookie 值即可发会话，若该变量被误写进 <code>[vars]</code> 就是后门；建议再要求一个独立 token 比对，或直接删路由改本地 CLI 注入。</p></div>
+</div>
+
+<h2>功能层：最值得补的三件事 <span class="cnt">按性价比排序</span></h2>
+
+<table>
+  <thead><tr><th style="width:24%">功能</th><th style="width:10%">成本</th><th>为什么值得做 / 最小版本</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>错误画像</b><br><span style="color:var(--dim);font-size:12px">跨篇聚合"我老犯的错"</span></td>
+      <td><span class="tag s">S</span></td>
+      <td>现在每次批改都是一次性报告，学生看不到"我这十篇里有 7 篇都在主谓一致上丢分"。数据已经在 <code>reviews.result.issues[].type</code> 里躺着，一条聚合 SQL + 一个条形榜就够。这是唯一能让产品"越用越值钱"的轻功能，也是学生真正会回来看的页面。</td>
+    </tr>
+    <tr>
+      <td><b>批改质量反馈</b><br><span style="color:var(--dim);font-size:12px">"这条判错了吗"</span></td>
+      <td><span class="tag s">S</span></td>
+      <td>每条 issue 旁一个 👎 + 三选一原因（改错了 / 不是我的错 / 太笼统），D1 加一张 <code>issue_feedback</code>。没有它，提示词迭代全靠猜；有了它，两周就能攒出真实失败样本集——这也是 P0-1 这类口径错误能被及时发现的前提。</td>
+    </tr>
+    <tr>
+      <td><b>老师/家长版一页纸</b><br><span style="color:var(--dim);font-size:12px">分数趋势 + 三条必改</span></td>
+      <td><span class="tag s">S/M</span></td>
+      <td>现有导出是完整报告（长、密），但学生真正要给老师看的是"比上次好在哪、还有哪三条没解决"。复用 <code>export.js</code> 的 docx 管道做一页 A4 摘要，成本很低，场景很实（家长会、周记）。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>看起来该做、其实先别做</h2>
+<table>
+  <thead><tr><th style="width:28%">想法</th><th>不做的理由</th></tr></thead>
+  <tbody>
+    <tr><td class="no">班级 / 多人协作</td><td>有了第二个人就要处理权限、共享、教师端、通知一整套，D1 + Workers 的单租户形态也撑不住多租户演进。现在最大价值是"一个人的私教"，去做第二件事会把第一件做浅。</td></tr>
+    <tr><td class="no">多题型一起上</td><td><code>GENRES</code> 扩展位留得好，但每个题型都要独立评分锚点、独立 validate 区间（9/9/4 现在还是硬编码）、独立调优。先让上海大作文做到"学生信这个分数"，再谈第二个。</td></tr>
+    <tr><td class="no">流式输出批改</td><td>结果是结构化 JSON，流式只是把"等 60 秒"变成"看字符爬"，对信任帮助很小，反而增加解析复杂度。该解决的是 P1-2 的"可中断可恢复"，不是流式。</td></tr>
+    <tr><td class="no">语音 / 口语评分</td><td>与"作文批改"的用户心智不在一处，另需音频链路与评分标准，纯属稀释。</td></tr>
+  </tbody>
+</table>
+
+<h2>如果只能改 3 件事</h2>
+<div class="lead">
+  <ul>
+    <li><b>1. 修词数口径（P0-1）</b>——半小时的活，但它决定这个工具是在教学生写对还是写错。任何 UX 打磨，在有系统性错误的评分面前都无意义。</li>
+    <li><b>2. 批改原子化 + 唯一约束（P0-3 + P0-4）</b>——一个 <code>db.batch</code> 加两条唯一索引，约 40 行，直接消灭"扣钱没报告""同稿批两次""版本重号"三类最伤信任的问题，也是后面所有幂等改造的地基。</li>
+    <li><b>3. 批改 job 化（P1-2 + P1-1）</b>——一次投入同时解决 524 超时、刷新失忆、无法取消，是所有交互体验的地基。</li>
+  </ul>
+  <div style="margin-top:12px;color:var(--muted);font-size:13.5px">
+    只做一件的话选 1；只做两件的话选 1 + 3（学生能真正用下去优先于后台绝对正确）。
+  </div>
+</div>
+
+<footer>
+  审查方法：三个并行通道（后端健壮性 / 前端 UX / 产品与教学价值）各自通读源码，结论逐条回到代码人工核对，重复项合并；
+  行号对应 2026-10-27 仓库状态。词数口径已用 2024 上海高考真题题干原文交叉验证（"in 120-150 words"）。
+  基线检查 <code>npm run check</code>（tsc --noEmit + CSP 哈希）当前通过。
+</footer>
+
+</div>
+</body>
+</html>

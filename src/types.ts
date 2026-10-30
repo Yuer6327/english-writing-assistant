@@ -40,9 +40,10 @@ export interface Vars {
 /** 批改结果（AI 输出 JSON 的结构，前端渲染契约） */
 export interface ReviewIssue {
   quote: string;            // 原文逐字片段（用于高亮定位）
-  type: string;             // 语法/词汇/搭配/拼写/标点/逻辑/中式表达
+  type: string;             // 语法/词汇/搭配/拼写/标点/逻辑/中式表达/论证
   explanation: string;      // 问题分析（中文）
   correction: string;       // 修改后的句子
+  located?: boolean;        // false = quote 未命中原文，只展示问题卡片、不高亮
 }
 
 export interface ReviewImprovement {
@@ -75,6 +76,13 @@ export interface ReviewResult {
   suggestions: string[];
   practice?: ReviewPractice;            // 巩固练习（旧记录可能没有）
   improvement?: ReviewImprovement;      // 二稿及以上才有
+  /** 论证自评（服务端据此钳制内容分；null = 模型未填，未钳制） */
+  argumentation?: {
+    has_examples: boolean | null;
+    has_solution: boolean | null;
+    model_content: number;              // 模型原始内容分（审计用）
+    model_language: number;             // 模型原始语言分（审计用）
+  };
 }
 
 /** 片段精修结果 */

@@ -35,3 +35,7 @@ Thumbs.db
 
 # ── WorkBuddy / AI 助手本地工作区（记忆、快照等，不入库）──
 .workbuddy/
+
+# 冒烟测试输出（本地）
+.ai-smoke-last.json
+.ai-smoke-16points.json

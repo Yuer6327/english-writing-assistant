@@ -33,11 +33,13 @@ async function request(path, options = {}) {
     throw err;
   }
 
+  const contentType = resp.headers.get('content-type') || '';
   let data;
   try {
+    if (!contentType.includes('application/json')) throw new Error('non-json');
     data = await resp.json();
   } catch {
-    const err = new Error(resp.ok ? '服务器响应格式错误，请稍后重试' : `网络错误（HTTP ${resp.status}）`);
+    const err = new Error(resp.ok || resp.status >= 500 ? '服务超时或响应异常，请稍后重试' : `网络错误（HTTP ${resp.status}）`);
     err.code = 'invalid_response';
     err.status = resp.status;
     throw err;
