@@ -82,9 +82,11 @@ settings.post('/api-keys', authMiddleware, async (c) => {
       key,
       baseUrl,
       model,
-      visionKey: typeof body.vision_api_key === 'string' ? body.vision_api_key.trim() || undefined : undefined,
-      visionBaseUrl: body.vision_api_base_url?.trim() || undefined,
-      visionModel: body.vision_model_name?.trim() || undefined,
+      // 表单三字段恒以字符串下发（settings.js 预填现有值）：清空输入 = 显式清除 vision 配置；
+      // 字段整体缺失（undefined）= billing 侧保留旧 vision 配置。两种语义不可混淆。
+      visionKey: typeof body.vision_api_key === 'string' ? body.vision_api_key.trim() : undefined,
+      visionBaseUrl: typeof body.vision_api_base_url === 'string' ? body.vision_api_base_url.trim() : undefined,
+      visionModel: typeof body.vision_model_name === 'string' ? body.vision_model_name.trim() : undefined,
     });
     return c.json({ ok: true, message: 'API Key 已保存' });
   } catch (err) {

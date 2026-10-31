@@ -228,9 +228,11 @@ async function initApiSection(gen = generation) {
       api_key: document.getElementById('api-key').value.trim() || undefined,
       api_base_url: document.getElementById('api-base-url').value.trim() || undefined,
       model_name: document.getElementById('model-name').value.trim() || undefined,
-      vision_model_name: document.getElementById('vision-model-name').value.trim() || undefined,
-      vision_api_base_url: document.getElementById('vision-api-base-url').value.trim() || undefined,
-      vision_api_key: document.getElementById('vision-api-key').value.trim() || undefined,
+      // 三字段恒以字符串下发（'' = 显式清除；undefined 会被 JSON.stringify 丢弃、
+      // billing 侧按「保留旧值」处理，表单清空输入的意图就无法触达了）
+      vision_model_name: document.getElementById('vision-model-name').value.trim(),
+      vision_api_base_url: document.getElementById('vision-api-base-url').value.trim(),
+      vision_api_key: document.getElementById('vision-api-key').value.trim(),
     };
     if (!payload.api_key && !configured) { toast('API Key 不能为空', 'error'); return; }
 
