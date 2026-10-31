@@ -316,8 +316,8 @@ interface ServiceDef {
 8. **`src/utils/rate-limit.ts`**：`aiRateLimit` 现按 api_keys.provider 决定是否拦——改为**对所有用户**应用用户级 18/min；全局 Agnes 桶 `agnesGlobalRateHit()` 维持在 api-config 解析路径生效；删除对 `api_keys` 表的查询（该表将废弃）。
 9. **`src/routes/essays.ts`**
    - `POST /drafts/:id/review`（~L308）与 `POST /essays/:id/polish`（~L424）：body 增加可选 `model_id: 'free'|'deepseek'|'byok'`。
-   - **hold 插入点**：cfg 解析成功后、callAI 循环前。`billing.hold(userId, 'writing', serviceId, {estInputTokens, maxOutputTokens})`——estInputTokens = `ceil((systemPrompt + userPrompt).length / 3)`，maxOutputTokens 用调用同值（4096/3000）。mode='hold' 时获取**并发锁**（模块级 `Map<userId, true>`，已占用 → 429「已有批改任务进行中」；finally 释放）；mode='byok'/'free' 不锁。
-   - **settle 插入点**：sanitize 成功、INSERT 之前。响应 JSON 增加 `points_charged`（分，前端 ÷100 显示）与 `lane`（free/paid/byok）。
+   - **hold 插入点**：cfg 解析成功后、callAI 循环前。`billing.hold(userId, 'writing', serviceId, {estInputTokens, maxOutputTokens})`——estInputTokens = `ceil((systemPrompt + userPrompt).length / 3)`，maxOutputTokens 用调用同值（4096/3000）。mode='hold' 时获取**并发锁**（模块级 `Map<userId, true>`，已占用 → 429「已有批改任务进行中」；finally 释放）。**2026-10-31 修订**：free 车道同样加锁（免费档也要保住「同用户在飞 1 笔」——AI 上游是共享配额，并发会加倍撞限流；免费额度计数发生在 hold 内，并发还会重复扣当日次数），仅 byok 不锁。
+   - **settle 插入点**：sanitize 成功、INSERT 之前。响应 JSON 增加 `points_charged`（**微积分**，前端 ÷10000 显示为积分；决策 #14 已被 0004 单位迁移取代，1 积分 = 10 000 微积分）与 `lane`（free/paid/byok）。
    - **release 插入点**：所有失败路径（429 短路、502、外层 catch）——`try/catch` 包住"hold 之后"的全部逻辑，catch 里先 release 再返回。
    - 402 直接透传：`c.json({error, code: 'insufficient_balance'}, 402)`。
 10. **`src/routes/ocr.ts`** `POST /api/ocr`：baidu 分支入口 hold（service='ocr:baidu'，免费额度 5 次/日内 mode=free，超出 frozen=1 分）、settle（calls=1）在成功 return 前；vlm 分支与 review 同构（est 按 images 体积 + 提示词估）。失败路径 release。
@@ -378,7 +378,7 @@ interface ServiceDef {
 5. admin 生成兑换码 → 用户兑换成功 → 余额/订单/账本三处一致；重复兑换同一码 409；兑换接口连打触发限流 429；
 6. 余额为 0 + 额度用尽 + 无 BYOK → 批改返回 **402**，前端弹「余额不足」；兑换后流程恢复；
 7. 连点「开始批改」→ 第二笔被并发锁拦下（429 文案），无双重扣费；
-8. DeepSeek 选项不出现在模型选择器（disabled）；`model_id='deepseek'` 直打 API 返回 409 model_disabled。
+8. ~~DeepSeek 选项不出现在模型选择器（disabled）~~ **2026-10-31 起付费档已启用**（生产已配 DEEPSEEK_API_KEY，目录 enabled:true）：DeepSeek 选项出现在模型选择器且可计费批改；`model_id` 非法值仍返回 404/409。
 另：两个仓库 `tsc --noEmit` 干净；账本 `SUM(delta)` = wallets.balance 抽查一致。
 
 ## 9. 延后项档案

@@ -9,7 +9,10 @@
 //   - 逐个按文件名序执行 migrations/*.sql，每步都通过 wrangler d1 execute --json 执行并解析返回码。
 //   - 跳过重复执行造成的既有错误（表/列已存在、重复列），视为幂等；其余错误直接终止。
 //   - 复用本地 wrangler 可执行文件（bin/wrangler.js），Windows / CI(Linux) 通用。
-//   - 运行结果写入 .wrangler/migration-state.json，用于跳过已完成步骤（本地；remote 由幂等容错兜底）。
+//   - 状态记录：local → .wrangler/migration-state.json；remote → D1 表 d1_migration_state
+//     （2026-10-31 引入：CI 每次是全新环境，本地状态文件不可用；此前远程靠「报错白名单」
+//     全量重放，若某迁移文件中途在已应用语句上报错，文件尾部的未应用语句会被永久静默跳过）。
+//     引入前的存量迁移（0001-0003）已人工补录进该表，勿删表重放。
 // ============================================================
 
 const { execFileSync } = require('node:child_process');
@@ -24,6 +27,7 @@ const WRANGLER_BIN = path.join(ROOT, 'node_modules', 'wrangler', 'bin', 'wrangle
 const isRemote = process.argv.includes('--remote');
 const mode = isRemote ? 'remote' : 'local';
 const stateFile = path.join(ROOT, '.wrangler', 'migration-state.json');
+const REMOTE_STATE_TABLE = 'd1_migration_state';
 
 // 幂等容错：这些是"重复执行/重复迁移"时的既有错误，跳过不视为失败
 const IGNORABLE_ERROR_MARKERS = [
@@ -59,6 +63,34 @@ function parseWranglerJson(out) {
   } catch {
     return null;
   }
+}
+
+/** 执行一条任意 SQL（建状态表 / 读写迁移状态），返回解析后的 JSON 或 null */
+function execD1Sql(sql) {
+  const args = [
+    WRANGLER_BIN,
+    'd1', 'execute', DB_NAME,
+    ...(isRemote ? ['--remote'] : ['--local']),
+    '--json',
+    `--command=${sql}`,
+  ];
+  let out;
+  try {
+    out = execFileSync(process.execPath, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    const buf = (err && err.stdout) ? String(err.stdout) : '';
+    if (!buf.trim()) {
+      console.error(`  ✗ 状态表操作失败：${(err && err.message) || err}`);
+      process.exit(1);
+    }
+    out = buf;
+  }
+  return parseWranglerJson(out);
+}
+
+function firstResults(parsed) {
+  const arr = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  return arr[0]?.results ?? [];
 }
 
 function runMigration(file) {
@@ -127,6 +159,17 @@ function runMigration(file) {
   console.log(`  ✓ 完成（幂等跳过已有对象：${errors.join('; ')}）`);
 }
 
+// 文件名由正则约束，拼进 SQL 无注入面
+function markApplied(file) {
+  const parsed = execD1Sql(
+    `INSERT INTO ${REMOTE_STATE_TABLE} (name) VALUES ('${file}') ON CONFLICT(name) DO NOTHING`,
+  );
+  if (parsed === null) {
+    console.error(`  ✗ 无法写入迁移状态（${REMOTE_STATE_TABLE}），中止：避免下次全量重放`);
+    process.exit(1);
+  }
+}
+
 function main() {
   const files = fs.readdirSync(MIGRATIONS_DIR)
     .filter((f) => /^[0-9]+_.*\.sql$/.test(f))
@@ -137,10 +180,20 @@ function main() {
     process.exit(1);
   }
 
-  // 本地：用 state 文件跳过已完成步骤（remote 直接执行，靠幂等容错兜底）
-  const state = loadState();
-  const applied = new Set(state.applied);
-  const pending = files.filter((f) => !applied.has(`${mode}:${f}`));
+  let pending;
+  if (isRemote) {
+    // 远程状态记录在 D1 里（跨机器一致，CI 全新环境也能续上）
+    execD1Sql(
+      `CREATE TABLE IF NOT EXISTS ${REMOTE_STATE_TABLE} (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+    );
+    const rows = firstResults(execD1Sql(`SELECT name FROM ${REMOTE_STATE_TABLE}`)).map((r) => r.name);
+    const applied = new Set(rows);
+    pending = files.filter((f) => !applied.has(f));
+  } else {
+    const state = loadState();
+    const applied = new Set(state.applied);
+    pending = files.filter((f) => !applied.has(`${mode}:${f}`));
+  }
 
   if (pending.length === 0) {
     console.log(`数据库已是最新（${mode}，无待执行迁移）`);
@@ -151,8 +204,12 @@ function main() {
   for (const file of pending) {
     runMigration(file);
     if (mode === 'local') {
+      const state = loadState();
+      const applied = new Set(state.applied);
       applied.add(`${mode}:${file}`);
       saveState({ applied: [...applied] });
+    } else {
+      markApplied(file);
     }
   }
   console.log('\n✓ 全部迁移执行完毕');

@@ -885,6 +885,8 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
           return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
         }
         lastErr = err?.message ?? String(err);
+        // 与批改/精修同口径：配置/网络/超时类失败立即终止，不白跑第二轮（多等 40-80s）
+        if (/^AI API error \d{3}|abort|timed? ?out|fetch failed|超时/i.test(lastErr)) throw err;
       }
     }
     if (!parsedResult) {

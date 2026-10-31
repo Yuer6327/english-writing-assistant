@@ -216,9 +216,13 @@ async function resumePendingReview(essayId, gen) {
   for (const key of keys) {
     let marker = null;
     try { marker = JSON.parse(localStorage.getItem(key)); } catch { /* ignore */ }
+    if (!marker || gen !== generation) { localStorage.removeItem(key); continue; }
+    // marker 记录发起页的 essayId：其它作文的在途批改【不删】，回到那页再恢复；
+    // （旧版 marker 无 essayId，按当前页处理——只为兼容刷新前遗留的标记）
+    if (marker.essayId && marker.essayId !== essayId) continue;
     const draftId = Number(key.split(':')[1]);
     const draft = state?.drafts?.find(d => d.id === draftId);
-    if (!marker || !draft || gen !== generation) { localStorage.removeItem(key); continue; }
+    if (!draft) { localStorage.removeItem(key); continue; }
     const opKey = `review:${draftId}`;
     if (pendingOps.has(opKey)) continue;
     pendingOps.add(opKey);
@@ -639,20 +643,40 @@ async function runReview(e) {
   busyButton(btn, '批改中', '可离开，结果会自动保存');
   const markerKey = `pending-review:${d.id}`;
   try {
-    localStorage.setItem(markerKey, JSON.stringify({ started_at: Date.now(), previous_review_id: latestReview(d)?.id ?? null }));
+    localStorage.setItem(markerKey, JSON.stringify({ started_at: Date.now(), previous_review_id: latestReview(d)?.id ?? null, essayId }));
     const res = await api.reviewDraft(d.id, lane);
     if (gen !== generation) return;
     if (res.quota) {
       sessionQuota = res.quota;
       renderSessionBanner();
     }
+    // 落库失败时后端不回 5xx，而是 200 + {persisted:false, result}（结果已生成、已计费、但未入库）
+    const notPersisted = res.persisted === false && res.result;
     lastCharge = {
-      reviewId: res.review_id,
+      reviewId: res.review_id ?? (notPersisted ? -1 : null),
       points: res.points_charged ?? 0,
       lane: res.lane || (lane === 'deepseek' ? 'paid' : lane),
     };
-    toast('批改完成', 'success');
     await reload(essayId, gen);
+    if (notPersisted) {
+      // 结果只存在于本次响应里：注入内存展示，避免「已扣费但页面上什么都不出现」；
+      // 不入 localStorage/DB，刷新后消失是已知妥协（提示用户截图保存、勿重复批改）。
+      const dd = state?.drafts?.find(x => x.id === d.id);
+      if (dd) {
+        dd.reviews = dd.reviews || [];
+        dd.reviews.push({
+          id: -1,
+          result: res.result,
+          model: res.model || '',
+          created_at: new Date().toISOString(),
+        });
+        activeDraftId = dd.id;
+        renderTabs(); renderDraftPanel(); renderReview();
+      }
+      toast('批改完成，但结果保存失败（已展示本次结果，请截图保存）；请勿重复批改，重复会再次计费', 'error');
+    } else {
+      toast('批改完成', 'success');
+    }
     const reviewEl = document.getElementById('wb-review');
     if (reviewEl) reviewEl.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   } catch (err) {
@@ -1438,6 +1462,9 @@ function closeWbModal(expected = null, immediate = false) {
 // ── 导出报告数据（export.js 消费）──
 function buildReportPayload() {
   const e = state.essay;
+  // 残缺/损坏的旧批改记录兜底（与 renderReview 同口径）：
+  // result JSON 损坏时后端会回退为 {}，直接取子字段会让 docx/PDF 导出整体抛异常
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
   return {
     kind: 'report',
     title: e.title,
@@ -1445,22 +1472,31 @@ function buildReportPayload() {
     total: e.genre_total,
     topic: e.topic_text,
     topic_images: e.topic_images || [],
-    drafts: state.drafts.map(d => ({
-      version: d.version,
-      text: d.text,
-      word_count: d.word_count,
-      handwriting_score: d.handwriting_score,
-      review: latestReview(d) ? {
-        score: latestReview(d).result.score,
-        subscores: latestReview(d).result.subscores,
-        overall_comment: latestReview(d).result.overall_comment,
-        diagnosis: latestReview(d).result.diagnosis,
-        issues: latestReview(d).result.issues,
-        revised_essay: latestReview(d).result.revised_essay,
-        suggestions: latestReview(d).result.suggestions,
-        practice: latestReview(d).result.practice || null,
-        improvement: latestReview(d).result.improvement || null,
-      } : null,
-    })),
+    drafts: state.drafts.map(d => {
+      const rv = latestReview(d);
+      const r = rv?.result || {};
+      const sub = r.subscores || {};
+      return {
+        version: d.version,
+        text: d.text,
+        word_count: d.word_count,
+        handwriting_score: d.handwriting_score,
+        review: rv ? {
+          score: num(r.score),
+          subscores: {
+            content: num(sub.content),
+            language: num(sub.language),
+            organization: num(sub.organization),
+          },
+          overall_comment: r.overall_comment ?? null,
+          diagnosis: r.diagnosis ?? null,
+          issues: Array.isArray(r.issues) ? r.issues : [],
+          revised_essay: r.revised_essay ?? null,
+          suggestions: Array.isArray(r.suggestions) ? r.suggestions : null,
+          practice: r.practice || null,
+          improvement: r.improvement || null,
+        } : null,
+      };
+    }),
   };
 }

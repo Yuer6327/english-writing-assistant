@@ -6,8 +6,9 @@
 //                     免费测试额度约 200 次（一次性）
 //   2. accurate_basic 通用文字识别（高精度版）：个人认证 1000 次/月，超出 ~0.015 元/次
 //   3. general        通用文字识别（标准版）：兜底（兄弟项目长期在用的端点）
-// 额度/未开通的错误码：17（每天请求量超限）、18（QPS 超限）、19（请求总量超限）
-// → 标记该端点本进程内耗尽，降级到下一端点；其余错误直接抛出。
+// 额度/未开通的错误码：17（每天请求量超限）、19（请求总量超限）
+// → 标记该端点本进程内耗尽，降级到下一端点；18（QPS 超限）是秒级瞬时窗口：
+//   等 1s 同端点重试一次，仍失败只本次降级、不拉黑。其余错误直接抛出。
 // 鉴权：AK/SK 换 access_token（30 天有效，进程内缓存 + 并发去重，110/111 自动刷新）
 // 请求：application/x-www-form-urlencoded，image 字段为去掉 data: 头的 base64
 // 限制：base64 urlencode 后 ≤4MB，最短边 ≥15px，最长边 ≤4096px
@@ -27,6 +28,8 @@ export const BAIDU_ENDPOINT_LABELS: Record<string, string> = {
 
 /** 进程内已耗尽额度的端点（17/19 是日/总量限制，isolate 生命周期内不再尝试） */
 const exhausted = new Set<string>();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** access_token 缓存（有效期 30 天，提前 24h 视为过期以留缓冲）*/
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -61,9 +64,12 @@ export async function baiduOcr(
 ): Promise<{ text: string; endpoint: string }> {
   let token = await getAccessToken(ak, sk);
   let lastErr: any = null;
+  let attempted = 0;
+  let qpsSkipped = 0;
 
   for (const endpoint of ENDPOINTS) {
     if (exhausted.has(endpoint)) continue;
+    attempted++;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -79,10 +85,23 @@ export async function baiduOcr(
           token = await getAccessToken(ak, sk);
           continue;
         }
-        // 17=每天请求量超限 18=QPS超限 19=请求总量超限（未开通/额度用尽同为此类）
-        if (code === 17 || code === 18 || code === 19) {
+        // 17=每天请求量超限 19=请求总量超限：持久性额度问题 → 本 isolate 内不再尝试该端点
+        if (code === 17 || code === 19) {
           exhausted.add(endpoint);
-          console.error(`[baidu-ocr] 端点 ${endpoint} 额度受限（code ${code}），降级到下一端点`);
+          console.error(`[baidu-ocr] 端点 ${endpoint} 额度耗尽（code ${code}），降级到下一端点`);
+          break;
+        }
+        // 18=QPS 超限：秒级瞬时窗口，不是额度耗尽。等 1s 同端点重试一次；
+        // 重试仍 18 → 本次调用降级到下一端点，但【不】拉黑——否则一次 QPS 尖峰会把
+        // 最优端点在本 isolate 生命周期内永久跳过（极端时三端点全入黑名单，
+        // 之后所有请求连发都不发就报错，用户重试也无效）。
+        if (code === 18) {
+          if (attempt === 0) {
+            await sleep(1100);
+            continue;
+          }
+          qpsSkipped++;
+          console.error(`[baidu-ocr] 端点 ${endpoint} QPS 超限（重试后仍失败），本次降级到下一端点（不拉黑）`);
           break;
         }
         lastErr = err;
@@ -92,6 +111,13 @@ export async function baiduOcr(
   }
 
   if (lastErr) throw lastErr;
+  if (attempted === 0) {
+    // 三个端点全部因 17/19 在册：报真实原因，避免用户对着「未识别到文字」反复重传
+    throw new Error('百度 OCR 免费额度已用尽，请改用大模型识别');
+  }
+  if (qpsSkipped > 0 && qpsSkipped === attempted) {
+    throw new Error('百度 OCR 触发限流（QPS），请稍等几秒后重试');
+  }
   throw new Error('百度 OCR：全部端点均未识别到文字');
 }
 

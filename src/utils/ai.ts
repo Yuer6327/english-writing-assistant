@@ -23,11 +23,24 @@ function sleep(ms: number): Promise<void> {
 // ⚠️ 1015 的请求本身会加剧封堵（retry-after 会从 12s 恶化到 852s），
 //    所以必须尽量少打被封的端点，而不是轮着猛冲。
 
-/** 端点封堵到期时间（进程内，多 isolate 各记一份，够用且零依赖） */
+/** 端点封堵到期时间（进程内，多 isolate 各记一份，够用且零依赖）。
+ *  key 含任意 BYOK baseUrl，带容量上限防长命 isolate 缓慢膨胀（正常个位数）。 */
 const endpointBanUntil = new Map<string, number>();
 
 function banEndpoint(url: string, sec: number) {
   endpointBanUntil.set(url, Date.now() + sec * 1000);
+  // 容量守卫：先清过期项，仍超限则丢弃最早的记录（封堵早已失效，丢了无害）
+  if (endpointBanUntil.size > 100) {
+    const now = Date.now();
+    for (const [k, until] of endpointBanUntil) {
+      if (until <= now) endpointBanUntil.delete(k);
+    }
+    while (endpointBanUntil.size > 100) {
+      const oldest = endpointBanUntil.keys().next().value;
+      if (oldest === undefined) break;
+      endpointBanUntil.delete(oldest);
+    }
+  }
 }
 
 function banRemainingSec(url: string): number {
@@ -164,6 +177,8 @@ export async function callAI(
       }
       console.error(`[callAI] 带 response_format 调用失败（${firstMsg || '未知错误'}），去掉该参数重试`);
       const retry = await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
+      // 容量守卫：key 含任意 BYOK model@baseUrl，长命 isolate 下防缓慢膨胀
+      if (skipResponseFormatModels.size >= 200) skipResponseFormatModels.clear();
       skipResponseFormatModels.add(responseFormatKey);
       return retry;
     }
@@ -206,7 +221,15 @@ async function callAIEndpoints(
         err.retryAfterSec = soonest;
         throw err;
       }
-      await sleep(soonest * 1000 + 300);
+      // 入口就地等待同样受 deadline 与等待次数约束：否则「入口短睡 → 全 1015 → 尾部短睡 →
+      // 入口短睡…」的节奏会让 deadline 检查被跳过，最坏在 90s 预算外再多睡一轮，
+      // 响应总时长越过 ~100s 边缘空闲超时 → 用户拿到网关错误页而非本应回传的 429 JSON。
+      const waitMs = soonest * 1000 + 300;
+      if (Date.now() + waitMs > deadline) throw new Error('AI 调用超时');
+      waits++;
+      if (waits > EDGE_WAIT_MAX_TIMES) break;
+      console.error(`[callAI] 所有端点均在封堵期，就地等 ${waitMs}ms（第 ${waits} 次等待）`);
+      await sleep(waitMs);
     }
 
     let allEdgeBlocked = true;

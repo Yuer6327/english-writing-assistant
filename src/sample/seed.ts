@@ -212,41 +212,45 @@ const POLISH_RESULT: FragmentPolishResult = {
 
 /** 为新用户预置示例作文（完整批改流程演示）；失败仅记日志，不影响注册 */
 export async function seedSampleEssay(db: D1Database, userId: string): Promise<void> {
+  const title = '示例：The Power of Habits';
+  // 父行定位子查询：essays 用 (user_id, title)（seed 仅在用户 0 篇作文时执行，判定唯一），
+  // drafts 用 (essay_id, version)（0003 起 UNIQUE(essay_id, version)，判定确定）
+  const essayIdSub = '(SELECT id FROM essays WHERE user_id = ? AND title = ?)';
+  const draftIdSub = (v: number) =>
+    `(SELECT id FROM drafts WHERE essay_id = ${essayIdSub} AND version = ${v})`;
   try {
-    const result = await db.prepare(
-      `INSERT INTO essays (user_id, title, genre, topic_text, topic_images, custom_prompt)
-       VALUES (?, ?, 'sh-gaokao-essay', ?, NULL, NULL)`,
-    ).bind(userId, '示例：The Power of Habits', TOPIC_TEXT).run();
-    const essayId = result.meta.last_row_id as number;
-    if (!essayId) throw new Error('作文插入未返回 id');
-
-    const d1 = await db.prepare(
-      `INSERT INTO drafts (essay_id, user_id, version, text, source, word_count, handwriting_score)
-       VALUES (?, ?, 1, ?, 'text', ?, NULL)`,
-    ).bind(essayId, userId, DRAFT_1, DRAFT_1.trim().split(/\s+/).length).run();
-    const draft1Id = d1.meta.last_row_id as number;
-
-    await db.prepare(
-      `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
-       VALUES (?, ?, ?, ?, '示例数据（注册预置）', ?)`,
-    ).bind(draft1Id, essayId, userId, JSON.stringify(REVIEW_1), DRAFT_1).run();
-
-    const d2 = await db.prepare(
-      `INSERT INTO drafts (essay_id, user_id, version, text, source, word_count, handwriting_score)
-       VALUES (?, ?, 2, ?, 'text', ?, NULL)`,
-    ).bind(essayId, userId, DRAFT_2, DRAFT_2.trim().split(/\s+/).length).run();
-    const draft2Id = d2.meta.last_row_id as number;
-
-    await db.prepare(
-      `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
-       VALUES (?, ?, ?, ?, '示例数据（注册预置）', ?)`,
-    ).bind(draft2Id, essayId, userId, JSON.stringify(REVIEW_2), DRAFT_2).run();
-
-    await db.prepare(
-      `INSERT INTO polishes (essay_id, draft_id, user_id, mode, fragment, instruction, result)
-       VALUES (?, ?, ?, 'fragment', ?, '让结尾更有力量', ?)`,
-    ).bind(essayId, draft2Id, userId, POLISH_FRAGMENT, JSON.stringify(POLISH_RESULT)).run();
+    // 全部行同一 batch（D1 batch = 单事务、顺序执行）：此前 5 条顺序写，isolate 中途被回收
+    // 会留下永久半成品（seeded 标记已提交、示例作文缺批改/润色且永不重试）
+    await db.batch([
+      db.prepare(
+        `INSERT INTO essays (user_id, title, genre, topic_text, topic_images, custom_prompt)
+         VALUES (?, ?, 'sh-gaokao-essay', ?, NULL, NULL)`,
+      ).bind(userId, title, TOPIC_TEXT),
+      db.prepare(
+        `INSERT INTO drafts (essay_id, user_id, version, text, source, word_count, handwriting_score)
+         VALUES (${essayIdSub}, ?, 1, ?, 'text', ?, NULL)`,
+      ).bind(userId, title, userId, DRAFT_1, DRAFT_1.trim().split(/\s+/).length),
+      db.prepare(
+        `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
+         VALUES (${draftIdSub(1)}, ${essayIdSub}, ?, ?, '示例数据（注册预置）', ?)`,
+      ).bind(userId, title, userId, title, userId, JSON.stringify(REVIEW_1), DRAFT_1),
+      db.prepare(
+        `INSERT INTO drafts (essay_id, user_id, version, text, source, word_count, handwriting_score)
+         VALUES (${essayIdSub}, ?, 2, ?, 'text', ?, NULL)`,
+      ).bind(userId, title, userId, DRAFT_2, DRAFT_2.trim().split(/\s+/).length),
+      db.prepare(
+        `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text)
+         VALUES (${draftIdSub(2)}, ${essayIdSub}, ?, ?, '示例数据（注册预置）', ?)`,
+      ).bind(userId, title, userId, title, userId, JSON.stringify(REVIEW_2), DRAFT_2),
+      db.prepare(
+        `INSERT INTO polishes (essay_id, draft_id, user_id, mode, fragment, instruction, result)
+         VALUES (${essayIdSub}, ${draftIdSub(2)}, ?, 'fragment', ?, '让结尾更有力量', ?)`,
+      ).bind(userId, title, userId, title, userId, POLISH_FRAGMENT, JSON.stringify(POLISH_RESULT)),
+    ]);
   } catch (err: any) {
     console.error(`[sample-essay] 预置示例作文失败（不影响注册）: ${err?.message ?? err}`);
+    // batch 是原子的（要么全成要么全无）：清掉 seeded 标记让下次访问重试，不留永久半成品
+    await db.prepare("DELETE FROM user_flags WHERE user_id = ? AND flag = 'seeded'")
+      .bind(userId).run().catch(() => {});
   }
 }

@@ -72,10 +72,11 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     // 先校验图片格式/体积（避免预扣后才失败）
     const parsedImages: string[] = [];
     for (const img of images) {
-      // 百度限制：base64 urlencode 后不超过 4MB
+      // 百度限制：base64 **urlencode 后** ≤4MB（+/= 会被 URLSearchParams 编码成 3 字节，按编码后口径校验）
       const parsed = parseDataUrl(img);
       if (!parsed.ok) return c.json({ error: parsed.error }, 400);
-      if (parsed.base64.length > 4 * 1024 * 1024) {
+      const urlencodeExtra = (parsed.base64.match(/[+/=]/g) || []).length * 2;
+      if (parsed.base64.length + urlencodeExtra > 4 * 1024 * 1024) {
         return c.json({ error: '图片过大（Base64 超过 4MB），请压缩后再试' }, 400);
       }
       parsedImages.push(parsed.base64);
