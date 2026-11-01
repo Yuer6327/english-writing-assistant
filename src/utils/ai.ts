@@ -168,7 +168,7 @@ export async function callAI(
   // json 请求带 response_format 仅是"强制输出 JSON"的开关。部分端点不支持该参数
   // （Agnes 文档未列出该字段），失败后去掉重试一次即可——提示词本身已强制"输出纯 JSON"。
   const responseFormatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
-  const skipFormat = /^agnes-/i.test(model) || skipResponseFormatModels.has(responseFormatKey);
+  const skipFormat = /^(agnes-|deepseek-ai\/)/i.test(model) || skipResponseFormatModels.has(responseFormatKey);
 
   if (json && skipFormat) {
     return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
@@ -325,8 +325,12 @@ export async function callAIStreaming(
   temperature?: number,
   deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
 ): Promise<AIResult> {
+  // Agnes 免费通道：apihub 流式支持未验证 → 直接委托非流式（保持既有行为）
+  if (/^agnes-/i.test(model)) {
+    return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+  }
   const formatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
-  const useFormat = json && !/^agnes-/i.test(model) && !skipResponseFormatModels.has(formatKey);
+  const useFormat = json && !skipResponseFormatModels.has(formatKey);
 
   const streamOnce = async (endpointUrl: string, withFormat: boolean): Promise<AIResult> => {
     const controller = new AbortController();
@@ -421,6 +425,8 @@ export async function callAIStreaming(
       lastError = err instanceof Error ? err : new Error(msg);
       // 参数不支持（常见于代理/模型不认 response_format 或 stream）：记忆并回退非流式
       if (/^AI API error (400|415|422)/.test(msg)) {
+        // 仅流式可用模型（中转推理模型非流式 content=null）：不回退，原样上抛
+        if (/^deepseek-ai\//i.test(model)) throw err;
         skipResponseFormatModels.add(formatKey);
         console.error(`[callAI] 流式参数不被支持（${msg.slice(0, 80)}），回退非流式`);
         return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);

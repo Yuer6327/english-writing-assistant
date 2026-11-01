@@ -30,11 +30,12 @@ export function agnesBaseUrls(env: Env): string | string[] {
 }
 
 /** 用户可选车道（前端模型选择器的值 → billing 服务档位） */
-export type Lane = 'free' | 'deepseek' | 'byok';
+export type Lane = 'free' | 'deepseek' | 'deepseek-relay' | 'byok';
 
 export const LANE_SERVICE: Record<Lane, string> = {
   free: 'llm:agnes-flash',
   deepseek: 'llm:deepseek-flash',
+  'deepseek-relay': 'llm:deepseek-relay',
   byok: 'byok',
 };
 
@@ -77,7 +78,7 @@ export async function resolveLane(env: Env, userId: string, lane: Lane): Promise
 }
 
 function normalizeLane(v: string | undefined | null): Lane | null {
-  return v === 'free' || v === 'deepseek' || v === 'byok' ? v : null;
+  return v === 'free' || v === 'deepseek' || v === 'deepseek-relay' || v === 'byok' ? v : null;
 }
 
 /** 请求体里的 model_id → 车道（非法/缺省 → 用户默认车道） */

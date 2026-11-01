@@ -33,7 +33,17 @@ const api = new Hono<{ Bindings: Env; Variables: Vars }>();
 const MAX_ESSAY_CHARS = 20_000;
 
 /** deepseek-flash 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大 */
-const maxOutputFor = (lane: Lane, base: number): number => (lane === 'deepseek' ? Math.max(base * 2, 8192) : base);
+/** deepseek-flash / deepseek-v4.1-flash 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大
+ *  （中转推理通道生成更慢更长，预算给得比 deepseek 档更宽） */
+const maxOutputFor = (lane: Lane, base: number): number => {
+  if (lane === 'deepseek') return Math.max(base * 2, 8192);
+  if (lane === 'deepseek-relay') return Math.max(base * 3, 16384);
+  return base;
+};
+
+/** 车道时间预算（毫秒）：推理通道思考+生成更慢，心跳保活下放宽到 5 分钟 */
+const aiBudgetFor = (lane: Lane, startedAt: number): number =>
+  startedAt + (lane === 'deepseek-relay' ? 300_000 : 180_000);
 
 /** billing 错误 → HTTP 响应（402 等直接透传，code 供前端分流） */
 function billingFail(err: unknown): { body: { error: string; code?: string }; status: number } {
@@ -46,7 +56,7 @@ function billingFail(err: unknown): { body: { error: string; code?: string }; st
 
 /** 车道 → 对外标签（前端显示与响应 lane 字段） */
 function laneLabel(lane: Lane): 'free' | 'paid' | 'byok' {
-  return lane === 'deepseek' ? 'paid' : lane;
+  return lane === 'deepseek' || lane === 'deepseek-relay' ? 'paid' : lane;
 }
 
 /** 校验图片数组：每项必须是位图 data URL（拒 SVG 等可携带脚本的 MIME），数量/体积封顶 */
@@ -496,13 +506,14 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, (c) => {
 
 async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promise<Response> {
   const startedAt = Date.now();
-  // 流式 + 心跳下不再受 ~100s 边缘空闲限制，预算放宽到 3 分钟（长文 8k-token 生成实测 33-90s）
-  const aiDeadline = startedAt + 180_000;
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
+  const body = ((await c.req.json<{ model_id?: string }>().catch(() => null)) ?? ({} as any));
+  const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
+  // 流式 + 心跳下不再受 ~100s 边缘空闲限制；预算按车道放宽（推理通道 5 分钟）
+  const aiDeadline = aiBudgetFor(lane, startedAt);
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
-  const body = ((await c.req.json<{ model_id?: string }>().catch(() => null)) ?? ({} as any));
 
   const draft = await c.env.DB.prepare(
     'SELECT * FROM drafts WHERE id = ? AND user_id = ?',
@@ -525,7 +536,6 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   if (guestIpLimitHit(c, 'review', 15)) {
     return c.json({ error: '今日批改次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
   }
-  const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
   const gate = await checkReviewGate(c.env.DB, userId, isGuest, { lane, draftId });
   if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
 

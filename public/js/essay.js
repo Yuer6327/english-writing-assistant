@@ -7,7 +7,7 @@
 import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor, refreshBalancePill,
-} from './api.js?v=20261101f';
+} from './api.js?v=20261101g';
 import { openExportModal, closeExportModal } from './export.js?v=20261101f';
 
 let generation = 0;
@@ -50,7 +50,7 @@ function setPanelControlsLocked(anchor, locked) {
 }
 
 // ── 模型车道（free / deepseek / byok）：可用选项由 billing 决定 ──
-const laneInfo = { paidEnabled: false, byokConfigured: false, loaded: false };
+const laneInfo = { paidEnabled: false, relayEnabled: false, byokConfigured: false, loaded: false };
 let reviewLane = null;       // 批改上次选择（内存记忆）
 let polishLane = null;       // 精修上次选择
 let lastCharge = null;       // { reviewId, points, lane } 本次批改消耗（renderReview 展示）
@@ -62,6 +62,7 @@ async function loadLaneInfo() {
   try {
     const me = await api.billing.me();
     laneInfo.paidEnabled = !!me.paid_enabled;
+    laneInfo.relayEnabled = !!me.relay_enabled;
     laneInfo.byokConfigured = !!me.byok_configured;
     laneInfo.loaded = true;
   } catch { /* billing 不可用时仅显示免费通道 */ }
@@ -85,12 +86,14 @@ function modelSelectHtml(id, remembered) {
       <option value="free">免费通道 · ${escapeHtml(remainingLabel())}</option>
     </select>`;
   }
-  const value = ['free', 'deepseek', 'byok'].includes(remembered)
+  const value = ['free', 'deepseek', 'deepseek-relay', 'byok'].includes(remembered)
     ? remembered : defaultLane();
   const opts = [
     `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（今日剩余 ${sessionQuota ? sessionQuota.remaining : '—'} 次）</option>`,
     laneInfo.paidEnabled
       ? `<option value="deepseek"${value === 'deepseek' ? ' selected' : ''}>DeepSeek（积分）</option>` : '',
+    laneInfo.relayEnabled
+      ? `<option value="deepseek-relay"${value === 'deepseek-relay' ? ' selected' : ''}>DeepSeek V4.1（半价）</option>` : '',
     laneInfo.byokConfigured
       ? `<option value="byok"${value === 'byok' ? ' selected' : ''}>我的 Key（自备）</option>` : '',
   ].join('');
@@ -99,10 +102,16 @@ function modelSelectHtml(id, remembered) {
 
 /** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
 const PAID_HINT = '约 0.02~0.05 积分/次 · 按上游实际用量结算';
+const RELAY_HINT = '约 0.01~0.025 积分/次 · 官方半价 · 推理模型生成较慢（1~3 分钟）';
 
 function bindPaidHint(selectEl, hintEl) {
   if (!selectEl || !hintEl) return;
-  const sync = () => { hintEl.style.display = selectEl.value === 'deepseek' ? 'inline' : 'none'; };
+  const sync = () => {
+    const v = selectEl.value;
+    const show = v === 'deepseek' || v === 'deepseek-relay';
+    hintEl.style.display = show ? 'inline' : 'none';
+    if (show) hintEl.textContent = v === 'deepseek-relay' ? RELAY_HINT : PAID_HINT;
+  };
   selectEl.addEventListener('change', sync);
   sync();
 }
