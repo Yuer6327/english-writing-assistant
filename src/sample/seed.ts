@@ -15,90 +15,71 @@ Two years ago, I was used to staying up late to play mobile phone. So I always f
 In conclude, good habits can help us become a better person. It is never too late to start a good habit. If we keep doing small things every day, we will success one day.`;
 
 const REVIEW_1: ReviewResult = {
-  diagnosis: {
-    content: '主题明确（好习惯的力量），有个人经历作论据，但论据单一：只有"学习习惯"一个维度，未涉及习惯对生活其他方面（健康、情绪、自律）的影响，观点展开不够充分。',
-    language: '词汇偏基础（important / good / better 反复出现），距四级水平有差距；存在多处语法与搭配错误：was used to（应为 used to）、suggested me to（应为 suggested that I ...）、make a great progress（progress 不可数）、In conclude（应为 In conclusion）、will success（success 是名词，应为 succeed）；句式以简单句为主，缺少从句、非谓语等加分结构。',
-    organization: '三段式结构清晰（引入—事例—总结），Since then / Gradually 等衔接使用得当，但段际过渡手段仍显单一。',
+  basis: {
+    content: '有实例（个人经历：熬夜→上课疲惫→成绩下滑→制定计划后的转变），有对策（制定学习计划、睡前复习、手机放另一个房间）；但论据只覆盖学习一个维度，展开不够充分 → 定档 6。',
+    language: '不影响理解的错误约 6 处（was used to / suggested me to / a great progress / In conclude / will success / experience about），无影响理解的错误；词汇停留在初中层（important / good / better 反复出现）→ 定档 6。',
+    organization: '三段完整、有 Since then / Gradually / In conclusion 等过渡 → 3（衔接手段仍偏单一）。',
   },
   subscores: { content: 6, language: 6, organization: 3 },
   score: 15,
-  overall_comment: '主要问题在语言层：词汇停留在初中层（important/good 反复出现），句式以简单句为主，且 used to / suggest / progress / succeed 等多处语法硬伤在阅卷中会直接压档；内容上论据只有"学习"一个维度。先清零语法硬伤，再升级词汇与句式。',
+  highlight: '第二段 "a habit is not a sudden decision but a daily choice" 的抽象-具象对照是全文最亮的一句，保留这种表达意识。',
+  priority: '先清零 will success、In conclude 这类语法硬伤——阅卷中它们直接压档，比词汇升级更急。',
   word_count: 200,
   word_count_penalty: 0,
   issues: [
     {
       quote: 'I was used to staying up late to play mobile phone',
       type: '语法',
-      explanation: '"was used to doing" 意为"已习惯于做某事"（状态），此处表达"过去常常做"应用 "used to do"；"play mobile phone" 是中式直译。',
+      severity: 'minor',
+      explanation: '"was used to doing" 意为"已习惯于做某事"（状态），表达"过去常常做"应用 "used to do"；"play mobile phone" 是中式直译。',
       correction: 'I used to stay up late scrolling on my phone.',
     },
     {
       quote: 'suggested me to make a study plan',
       type: '搭配',
-      explanation: 'suggest 不接 "sb to do" 结构，应用 "suggest that sb (should) do" 或改用 advise。',
+      severity: 'minor',
+      explanation: 'suggest 不接 "sb to do" 结构，应用 "suggest that sb (should) do"，或直接改用 advise。',
       correction: 'My teacher advised me to make a study plan.',
     },
     {
       quote: 'I make a great progress in study',
       type: '语法',
-      explanation: 'progress 是不可数名词，不能用 "a" 修饰；"in study" 表达生硬，常用 "in my studies"。',
+      severity: 'minor',
+      explanation: 'progress 是不可数名词，不能用 "a" 修饰；"in study" 生硬，常用 "in my studies"。',
       correction: 'I have made great progress in my studies.',
     },
     {
       quote: 'In conclude',
       type: '词汇',
+      severity: 'minor',
       explanation: 'conclude 是动词，"总之"应为介词短语 "In conclusion"。',
       correction: 'In conclusion, good habits can help us become better people.',
     },
     {
       quote: 'we will success one day',
       type: '语法',
+      severity: 'minor',
       explanation: 'success 是名词，作谓语应用动词 succeed，或改写为 "success will come"。',
       correction: 'we will succeed one day.',
     },
     {
       quote: 'I have deep experience about it',
       type: '搭配',
-      explanation: '"experience about" 搭配不当，且此处"深有体会"用词过于直译。',
+      severity: 'minor',
+      explanation: '"experience about" 搭配不当，且"深有体会"直译痕迹重。',
       correction: 'I have learned this from my own experience.',
     },
   ],
   revised_essay: `Good habits **play a significant role in shaping our lives**, and my own experience **is a good case in point**.
 
-Two years ago, I **used to stay up late scrolling on my phone**, which **left me exhausted in class and caused my grades to decline**. After a talk with my teacher, I **made a study plan and stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**. **Besides, I set aside twenty minutes before dinner to review my notes and kept my phone out of reach while working.** **At first, sitting still felt unbearable, but within a month I was finishing my homework earlier and even had time to read a short English novel in the evening.** **These small changes taught me that a habit is not a sudden decision but a daily choice, and that real progress comes from repeating that choice even when motivation fades.**
+Two years ago, I **used to stay up late scrolling on my phone**, which **left me exhausted in class and caused my grades to decline**. After a talk with my teacher, I **made a study plan and stuck to it**: going to bed before 11 and reading English every morning. Gradually, **not only did I become more energetic, but I also made great progress in my studies**. **Besides, I set aside twenty minutes before dinner to review my notes and kept my phone out of reach while working.** **At first, sitting still felt unbearable, but within a month I was finishing my homework earlier and even had time to read a short English story.** **These small changes taught me that a habit is not a sudden decision but a daily choice, and that real progress comes from repeating that choice even when motivation fades.**
 
 **In conclusion**, good habits are the **stepping stones to a better self**. It is never too late to start. **As long as we keep doing small things consistently**, we will **succeed** one day.`,
   suggestions: [
     '词汇升级：把 important/good/better 替换为四级词汇，如 significant / beneficial / rewarding。',
-    '句式多样化：至少使用一处倒装（Not only did I ...）、一处非谓语（..., which left me ...）和一处强调句。',
-    '内容展开：除学习外，再从健康或自律角度补充一句例证，让"习惯的力量"更有说服力。',
-    '消灭硬伤：used to do / succeed（动词）/ In conclusion 三个考点要整理进错题本。',
+    '句式多样化：至少一处倒装（Not only did I ...）加一处非谓语（..., which left me ...）。',
+    '消灭硬伤：used to do / succeed（动词）/ In conclusion 三个考点整理进错题本。',
   ],
-  practice: {
-    intro: '针对一稿暴露的语法与搭配硬伤，先把这几个考点练稳。',
-    items: [
-      {
-        chinese: '两年前我常常熬夜玩手机，上课总是很疲惫。',
-        answer: 'Two years ago, I used to stay up late playing with my phone, and I was always tired in class.',
-        target: 'used to do（过去常常）与 be used to doing（习惯于）的区别，对应原文 "was used to staying up late" 的错误。',
-      },
-      {
-        chinese: '老师建议我制定一份学习计划。',
-        answer: 'My teacher advised me to make a study plan. / My teacher suggested that I (should) make a study plan.',
-        target: 'suggest 不接 sb to do，应用 suggest that sb (should) do 或改用 advise sb to do。',
-      },
-      {
-        chinese: '经过一个学期的努力，我在学习上取得了很大进步。',
-        answer: 'After a term of hard work, I have made great progress in my studies.',
-        target: 'progress 不可数，不能用 a 修饰；"在学习上"用 in my studies。',
-      },
-      {
-        chinese: '总之，只要我们坚持做小事，终有一天会成功。',
-        answer: 'In conclusion, as long as we keep doing small things, we will succeed one day.',
-        target: 'In conclusion（介词短语）与 succeed（动词）的用法，对应原文 "In conclude / will success"。',
-      },
-    ],
-  },
 };
 
 const DRAFT_2 = `Good habits play a significant role in shaping our lives, and my own experience is a good case in point.
@@ -108,27 +89,30 @@ Two years ago, I used to stay up late scrolling on my phone, which left me exhau
 In conclusion, good habits are the stepping stones to a better self. It is never too late to start. If we keep doing small things every day, success will come naturally.`;
 
 const REVIEW_2: ReviewResult = {
-  diagnosis: {
-    content: '立意不变，叙事更完整（补充了"grades decline → plan → result"的因果链），但仍可增加一个非学习维度的例证（如运动、阅读）使论证更立体。',
-    language: '词汇明显升级（significant / decline / energetic / stepping stones），倒装句 "not only did I" 与非限制性定语从句运用自然；剩余问题较少，个别表达仍有提升空间。',
-    organization: '三段结构完整，衔接词使用得当，结尾呼应主题。',
+  basis: {
+    content: '有实例（熬夜→成绩下滑→制定计划→转变的完整因果链），有对策（学习计划、睡前复习、手机管理）；仍缺一个非学习维度的例证 → 定档 8。',
+    language: '不影响理解的错误 0 处，不影响理解的润色级建议 2 处；词汇升级到四级+（significant / decline / energetic），倒装与非谓语运用自然 → 定档 7。',
+    organization: '三段完整、衔接得当、结尾呼应主题 → 4。',
   },
   subscores: { content: 8, language: 7, organization: 4 },
   score: 19,
-  overall_comment: '语法硬伤已基本清零，当前最大短板是内容：论据仍局限于学习单一维度，缺少第二个角度的例证；结尾 if 条件句正确但平淡。补足非学习维度的例证并升级收尾句式，即可向 21 分以上冲刺。',
+  highlight: '"not only did I become more energetic" 的倒装用得准确自然，句式意识已经上线。',
+  priority: '补一个非学习维度的例证（运动、阅读均可），把内容分从 8 顶到 9。',
   word_count: 200,
   word_count_penalty: 0,
   issues: [
     {
       quote: 'If we keep doing small things every day, success will come naturally.',
       type: '句式',
-      explanation: '表达正确，但作为全文结尾可再凝练有力，例如用 As long as 引导的强调性结尾。',
+      severity: 'polish',
+      explanation: '表达正确，但作为全文结尾可再凝练有力，例如用 As long as 收束。',
       correction: 'As long as we keep doing small things consistently, we will naturally succeed one day.',
     },
     {
       quote: 'a good case in point',
       type: '词汇',
-      explanation: '使用得当；可尝试更地道的 is a case in point 直接作表语，去掉 good 避免语义重复。',
+      severity: 'polish',
+      explanation: '使用得当；可去掉 good 避免语义重复，直接用 is a case in point 作表语。',
       correction: '...and my own experience is a case in point.',
     },
   ],
@@ -138,30 +122,10 @@ Two years ago, I **used to stay up late scrolling on my phone**, which left me e
 
 **In conclusion**, good habits are the **stepping stones to a better self**. It is never too late to start. **As long as we keep doing small things consistently, we will naturally succeed one day.**`,
   suggestions: [
-    '冲刺更高档：补充一个非学习维度例证（运动/阅读/时间管理），体现习惯对生活整体的塑造。',
+    '补充一个非学习维度例证（运动/阅读/时间管理），体现习惯对生活整体的塑造。',
     '结尾句用 As long as ... 收束，比 if 条件句更有力量。',
     '保持已掌握的倒装、非谓语结构，考场上先写对再写难。',
   ],
-  practice: {
-    intro: '二稿语言已较扎实，本组练习聚焦内容多维展开与高级收尾句式。',
-    items: [
-      {
-        chinese: '除了学习，周末跑步的习惯让我保持健康、精力充沛。',
-        answer: 'Beyond academics, the habit of jogging at weekends keeps me healthy and energetic.',
-        target: '非学习维度例证的表达，补足内容维度"论据单一"的问题。',
-      },
-      {
-        chinese: '只有坚持每天练习，我们才能最终尝到成功的滋味。',
-        answer: 'Only by practicing every day can we eventually taste the sweetness of success.',
-        target: 'Only + 状语置于句首引起部分倒装（can we），高分收尾句式。',
-      },
-      {
-        chinese: '正是这些微小的日常习惯为我们日后的成功铺平了道路。',
-        answer: 'It is these small daily habits that pave the way to our future success.',
-        target: '强调句 It is ... that ...，替换平淡陈述，强化结尾。',
-      },
-    ],
-  },
   improvement: {
     score_delta: 4,
     fixed: [

@@ -6,9 +6,9 @@
 
 import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
-  compressImageFile, gradeFor,
-} from './api.js?v=20261027c';
-import { openExportModal, closeExportModal } from './export.js?v=20261027c';
+  compressImageFile, gradeFor, refreshBalancePill,
+} from './api.js?v=20261031a';
+import { openExportModal, closeExportModal } from './export.js?v=20261101a';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
@@ -98,7 +98,7 @@ function modelSelectHtml(id, remembered) {
 }
 
 /** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
-const PAID_HINT = '约 0.05~0.5 积分/次 · 多退少补';
+const PAID_HINT = '约 0.02~0.05 积分/次 · 按上游实际用量结算';
 
 function bindPaidHint(selectEl, hintEl) {
   if (!selectEl || !hintEl) return;
@@ -677,6 +677,8 @@ async function runReview(e) {
     } else {
       toast('批改完成', 'success');
     }
+    // 付费批改已结算：同步导航栏余额（游客无 pill，函数自会跳过）
+    refreshBalancePill();
     const reviewEl = document.getElementById('wb-review');
     if (reviewEl) reviewEl.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   } catch (err) {
@@ -701,11 +703,12 @@ function renderReview() {
   // 旧记录 / 残缺数据兜底：字段缺失时按 0 渲染，避免整块批改结果渲染失败
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
   const sub = r.subscores || {};
+  const basis = r.basis || {};
 
   const bars = [
-    { name: '内容', val: num(sub.content), max: 9 },
-    { name: '语言', val: num(sub.language), max: 9 },
-    { name: '结构', val: num(sub.organization), max: 4 },
+    { name: '内容', val: num(sub.content), max: 9, basis: basis.content },
+    { name: '语言', val: num(sub.language), max: 9, basis: basis.language },
+    { name: '结构', val: num(sub.organization), max: 4, basis: basis.organization },
   ];
   const gradeInfo = gradeFor(r.score);
   // 本次批改的积分消耗（仅最新一次响应有值；0 = 免费/自备 Key）
@@ -731,68 +734,58 @@ function renderReview() {
       </div>
       <div class="score-bars">
         ${bars.map(b => `
-          <div class="score-bar-row">
-            <span class="name">${b.name}</span>
-            <div class="score-bar-track"><div class="score-bar-fill" style="width:${(b.val / b.max) * 100}%"></div></div>
-            <span class="val">${b.val}/${b.max}</span>
+          <div class="score-bar-group">
+            <div class="score-bar-row">
+              <span class="name">${b.name}</span>
+              <div class="score-bar-track"><div class="score-bar-fill" style="width:${(b.val / b.max) * 100}%"></div></div>
+              <span class="val">${b.val}/${b.max}</span>
+            </div>
+            ${b.basis ? `<div class="basis-line">${escapeHtml(b.basis)}</div>` : ''}
           </div>`).join('')}
       </div>
     </div>`;
 
-  if (r.overall_comment) {
-    html += `<div class="card" style="margin-top:14px"><b>总评</b><div style="margin-top:6px;line-height:1.8">${escapeHtml(r.overall_comment)}</div></div>`;
+  // 两句结论：最优先改进点 + 一个具体亮点（旧记录无此字段则不渲染）
+  if (r.priority) {
+    html += `<div class="verdict-banner focus"><b>最该改</b>${escapeHtml(r.priority)}</div>`;
   }
-
-  if (r.diagnosis && (r.diagnosis.content || r.diagnosis.language || r.diagnosis.organization)) {
-    html += `
-      <div class="section-title">逐项诊断</div>
-      <div class="diagnosis-grid">
-        <div class="cell"><b>内容</b>${escapeHtml(r.diagnosis.content || '—')}</div>
-        <div class="cell"><b>语言</b>${escapeHtml(r.diagnosis.language || '—')}</div>
-        <div class="cell"><b>结构</b>${escapeHtml(r.diagnosis.organization || '—')}</div>
-      </div>`;
+  if (r.highlight) {
+    html += `<div class="verdict-banner good"><b>亮点</b>${escapeHtml(r.highlight)}</div>`;
   }
 
   if (r.issues && r.issues.length) {
-    html += `<div class="section-title">问题清单 <span class="muted">共 ${r.issues.length} 处</span></div>`;
-    html += r.issues.map((iss, i) => `
-      <div class="issue-card" data-issue-card="${i}">
-        <div class="issue-head">
-          <span class="issue-type-tag">${escapeHtml(iss.type)}</span>
-          <span class="issue-quote">"${escapeHtml(iss.quote)}"</span>
-          ${iss.located === false ? '<span class="chip">原文中未找到，可能含特殊字符</span>' : ''}
-        </div>
-        <div class="issue-arrow">→ ${escapeHtml(iss.correction)}</div>
-        <div class="issue-exp">${escapeHtml(iss.explanation)}</div>
-      </div>`).join('');
+    // 严重度计数徽标：色点 + 数量，代替文字说明
+    const sevOf = (iss) => (iss.severity === 'critical' || iss.severity === 'minor' || iss.severity === 'polish') ? iss.severity : 'minor';
+    const sevCount = { critical: 0, minor: 0, polish: 0 };
+    r.issues.forEach(iss => { sevCount[sevOf(iss)]++; });
+    const sevLabels = { critical: '硬伤', minor: '错误', polish: '润色' };
+    const chips = ['critical', 'minor', 'polish']
+      .filter(k => sevCount[k])
+      .map(k => `<span class="sev-chip sev-${k}">${sevLabels[k]} ${sevCount[k]}</span>`)
+      .join('');
+    html += `<div class="section-title">问题清单 <span class="muted">共 ${r.issues.length} 处</span> <span class="chip-row" style="display:inline-flex;margin-left:6px">${chips}</span></div>`;
+    // 竞品式三列对照：原句 | 问题点 | 建议修改（窄屏自动堆叠，见 style.css；
+    // data-issue-card 保留：作文原文中的高亮标记点击后仍按序号跳转到对应行）
+    html += `<div class="issue-table">
+      <div class="issue-thead"><span>原句</span><span>问题点</span><span>建议修改</span></div>
+      ${r.issues.map((iss, i) => `
+      <div class="issue-trow sev-${sevOf(iss)}" data-issue-card="${i}" style="--row-i:${Math.min(i, 8)}">
+        <div class="issue-cell c-quote"><span class="cell-label">原句</span><span class="issue-quote">"${escapeHtml(iss.quote)}"</span></div>
+        <div class="issue-cell c-problem"><span class="cell-label">问题点</span><span class="issue-type-tag">${escapeHtml(iss.type)}</span>${iss.type === '识别存疑' ? '<span class="chip doubt">可能是识别错误</span>' : ''}${iss.located === false ? '<span class="chip">原文中未找到</span>' : ''}<p class="issue-exp">${escapeHtml(iss.explanation) || '—'}</p></div>
+        <div class="issue-cell c-fix"><span class="cell-label">建议修改</span><p class="issue-arrow">${escapeHtml(iss.correction) || '—'}</p></div>
+      </div>`).join('')}
+    </div>`;
   }
 
   if (r.revised_essay) {
     html += `
-      <div class="section-title">修改后的全文 <span class="muted">粗体为升级点</span></div>
+      <div class="section-title">修改后的全文 <span class="muted">粗体为改动点</span></div>
       <div class="revised-essay">${renderBold(r.revised_essay)}</div>`;
   }
 
   if (r.suggestions && r.suggestions.length) {
     html += `<div class="section-title">提升建议</div><ul style="margin-left:20px;line-height:2">${
       r.suggestions.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul>`;
-  }
-
-  if (r.practice && r.practice.items && r.practice.items.length) {
-    const p = r.practice;
-    html += `
-      <div class="section-title">巩固练习 <span class="muted">先译再看答案</span></div>
-      ${p.intro ? `<div class="practice-intro">${escapeHtml(p.intro)}</div>` : ''}
-      ${p.items.map((it, i) => `
-        <div class="practice-card">
-          <div class="practice-head">
-            <span class="practice-num">${i + 1}</span>
-            <div class="practice-zh">${escapeHtml(it.chinese)}</div>
-          </div>
-          ${it.target ? `<div class="practice-target">考点：${escapeHtml(it.target)}</div>` : ''}
-          <button type="button" class="practice-toggle" data-index="${i}" aria-expanded="false">显示参考答案</button>
-          <div class="practice-answer" data-index="${i}" hidden>${escapeHtml(it.answer)}</div>
-        </div>`).join('')}`;
   }
 
   if (r.improvement) {
@@ -814,17 +807,22 @@ function renderReview() {
 
   el.innerHTML = html;
 
-  // 巩固练习：展开/收起参考答案
-  el.querySelectorAll('.practice-toggle').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const ans = el.querySelector(`.practice-answer[data-index="${btn.dataset.index}"]`);
-      if (!ans) return;
-      const show = ans.hasAttribute('hidden');
-      if (show) ans.removeAttribute('hidden'); else ans.setAttribute('hidden', '');
-      btn.textContent = show ? '收起参考答案' : '显示参考答案';
-      btn.setAttribute('aria-expanded', show ? 'true' : 'false');
-    });
-  });
+  // 分数滚动：只在批改刚完成的这一次渲染播一次（切 Tab 回看保持静态），
+  // ease-out 无过冲；reduced-motion 直接静态显示
+  if (lastCharge && lastCharge.reviewId === rv.id && !reducedMotion.matches) {
+    const scoreEl = el.querySelector('.score-num');
+    const target = num(r.score);
+    if (scoreEl && scoreEl.firstChild && target > 0) {
+      const t0 = performance.now();
+      const dur = 550;
+      const step = (t) => {
+        const p = Math.min(1, (t - t0) / dur);
+        scoreEl.firstChild.nodeValue = String(Math.round(target * (1 - Math.pow(1 - p, 3))));
+        if (p < 1) requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    }
+  }
 }
 
 // ============================================================
@@ -1122,6 +1120,7 @@ function openPolishModal(fragment) {
       renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
       idleButton(btn);
       btn.textContent = '重新精修';
+      refreshBalancePill();
     } catch (err) {
       if (gen === generation && modal === wbModalEl && !handleBillingError(err)) toast(err.message, 'error');
     } finally {
@@ -1233,6 +1232,7 @@ async function runFullRewrite(e) {
   const r = res.result;
   const chargeNote = res.points_charged > 0
     ? ` · 本次消耗 ${(res.points_charged / 10000).toFixed(2)} 积分` : '';
+  refreshBalancePill();
   const modal = wbModal(`
     <div class="form-group">
       <div style="font-size:13px;color:var(--text-soft);line-height:1.8">${escapeHtml(r.summary || '')}${chargeNote ? `<span class="muted" style="font-size:12px">${chargeNote}</span>` : ''}</div>
@@ -1472,6 +1472,7 @@ function buildReportPayload() {
     total: e.genre_total,
     topic: e.topic_text,
     topic_images: e.topic_images || [],
+    word_limits: e.word_limits ?? null,
     drafts: state.drafts.map(d => {
       const rv = latestReview(d);
       const r = rv?.result || {};
@@ -1488,12 +1489,13 @@ function buildReportPayload() {
             language: num(sub.language),
             organization: num(sub.organization),
           },
-          overall_comment: r.overall_comment ?? null,
-          diagnosis: r.diagnosis ?? null,
+          basis: r.basis ?? null,
+          highlight: r.highlight ?? null,
+          priority: r.priority ?? null,
+          word_count_penalty: typeof r.word_count_penalty === 'number' ? r.word_count_penalty : 0,
           issues: Array.isArray(r.issues) ? r.issues : [],
           revised_essay: r.revised_essay ?? null,
           suggestions: Array.isArray(r.suggestions) ? r.suggestions : null,
-          practice: r.practice || null,
           improvement: r.improvement || null,
         } : null,
       };

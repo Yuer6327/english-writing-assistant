@@ -5,7 +5,7 @@
 // ============================================================
 
 import type {
-  ReviewResult, ReviewIssue, ReviewPractice, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
+  ReviewResult, ReviewIssue, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
 } from '../types';
 
 /** 分数收敛到 [min, max] 的整数 */
@@ -33,7 +33,8 @@ function normWs(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-const ISSUE_TYPES = ['语法', '词汇', '搭配', '拼写', '标点', '逻辑', '中式表达', '论证'];
+const ISSUE_TYPES = ['语法', '词汇', '搭配', '拼写', '标点', '逻辑', '中式表达', '论证', '识别存疑'];
+const ISSUE_SEVERITIES = ['critical', 'minor', 'polish'] as const;
 
 // ── 论证硬性上限（提示词 + 服务端双保险）──
 // 模型在 argumentation 里自报「有无实例 / 有无对策」，服务端据此钳制内容分，
@@ -64,6 +65,40 @@ function boolFlag(v: unknown): boolean | null {
 }
 
 /**
+ * 按 argumentation 自评 + 服务端钳制规则收敛一组分项分。
+ * 供 sanitizeReview 与独立打分采样（essays.ts 3 采样取中位数）共用，保证口径一致。
+ */
+export function clampSubscores(
+  arg: any,
+  sub: any,
+): { content: number; language: number; organization: number } {
+  const hasExamples = boolFlag(arg?.has_examples);
+  const hasSolution = boolFlag(arg?.has_solution);
+
+  let content = safeScore(sub?.content, 0, 9);
+  if (hasExamples === false) content = reconcileScore(content, CONTENT_CAP_NO_EXAMPLES);
+  if (hasSolution === false) content = reconcileScore(content, CONTENT_CAP_NO_SOLUTION);
+
+  let language = safeScore(sub?.language, 0, 9);
+  if (hasSolution === false) language = reconcileScore(language, LANGUAGE_CAP_NO_SOLUTION);
+
+  // 结构定档用钳制前的内容分 + 钳制前的语言分（语义同 sanitizeReview：追加惩罚不二次连锁）
+  let organization = safeScore(sub?.organization, 0, 4);
+  if (content + safeScore(sub?.language, 0, 9) < 15) organization = Math.min(organization, 3);
+
+  return { content, language, organization };
+}
+
+/**
+ * 分数采样聚合：奇数个取中位数；偶数个取均值后向下取整（方向偏严，符合「压低」口径）。
+ */
+export function medianScore(values: number[]): number {
+  const v = [...values].sort((a, b) => a - b);
+  const mid = v.length >> 1;
+  return v.length % 2 ? v[mid] : Math.floor((v[mid - 1] + v[mid]) / 2);
+}
+
+/**
  * 校验并净化批改结果。
  * @param parsed    AI 返回的 JSON
  * @param essayText 学生作文原文（quote 命中校验基准）
@@ -73,29 +108,15 @@ function boolFlag(v: unknown): boolean | null {
 export function sanitizeReview(parsed: any, essayText: string, expectsImprovement: boolean): ReviewResult {
   if (!parsed || typeof parsed !== 'object') throw new Error('AI 返回不是 JSON 对象');
 
-  const diag = parsed.diagnosis ?? {};
-  const sub = parsed.subscores ?? {};
+  const basis = parsed.basis ?? {};
 
   // 评分纪律封顶（与提示词一致）：分项 ≤9/≤9/≤4 → 总分 ≤22；结构另受定档规则约束
   const arg = parsed.argumentation ?? {};
   const hasExamples = boolFlag(arg.has_examples);
   const hasSolution = boolFlag(arg.has_solution);
-
-  const modelContent = safeScore(sub.content, 0, 9);
-  let content = modelContent;
-  if (hasExamples === false) content = reconcileScore(content, CONTENT_CAP_NO_EXAMPLES);
-  if (hasSolution === false) content = reconcileScore(content, CONTENT_CAP_NO_SOLUTION);
-
-  const modelLanguage = safeScore(sub.language, 0, 9);
-  // 无对策不压结构、改压语言：语言上限 9 → 7
-  const language = hasSolution === false
-    ? reconcileScore(modelLanguage, LANGUAGE_CAP_NO_SOLUTION)
-    : modelLanguage;
-  // 结构加分规则：内容+语言 <15 → 结构最多 3 分。
-  // 定档用「服务端压过的内容分 + 模型原始语言分」：内容下调反映论证缺陷，应连锁结构；
-  // 语言下调只是本规则下的追加惩罚，不再二次连锁，否则无对策的惩罚会从 -2 变成 -3。
-  let organization = safeScore(sub.organization, 0, 4);
-  if (content + modelLanguage < 15) organization = Math.min(organization, 3);
+  const modelContent = safeScore(parsed.subscores?.content, 0, 9);
+  const modelLanguage = safeScore(parsed.subscores?.language, 0, 9);
+  const { content, language, organization } = clampSubscores(arg, parsed.subscores);
 
   const sum = content + language + organization;
   // 词数扣分：硬阈值，服务端自算，模型不参与（分项保持模型判定的原始分，只在总分上扣）
@@ -115,66 +136,53 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
       if (quote.length < 2) continue;
       const hit = essayText.includes(quote) || normEssay.includes(normWs(quote));
       const type = ISSUE_TYPES.includes(raw.type) ? raw.type : '其他';
+      const severity = ISSUE_SEVERITIES.includes(raw.severity) ? raw.severity : 'minor';
       issues.push({
         quote,
         type,
+        severity,
         explanation: str(raw.explanation, 1500),
         correction: str(raw.correction, 1500),
         located: hit,
       });
-      if (issues.length >= 10) break;
+      if (issues.length >= 50) break;  // 纯安全阀：提示词已约束「只列有把握的」，防异常输出刷爆结果
     }
   }
 
-  // 可定位的问题优先展示；未定位项保留诊断内容但不绘制高亮。
+  // 可定位的问题优先展示；未定位项保留说明但不绘制高亮。
   issues.sort((a, b) => Number(b.located !== false) - Number(a.located !== false));
 
-  // 巩固练习：条目需中文句 + 参考答案；无有效条目则整段丢弃（旧记录无此字段）
-  let practice: ReviewPractice | undefined;
-  const prac = parsed.practice;
-  if (prac && typeof prac === 'object' && Array.isArray(prac.items)) {
-    const items = prac.items
-      .filter((it: any) => it && typeof it === 'object'
-        && typeof it.chinese === 'string' && it.chinese.trim()
-        && typeof it.answer === 'string' && it.answer.trim())
-      .slice(0, 5)
-      .map((it: any) => ({
-        chinese: str(it.chinese, 600),
-        answer: str(it.answer, 1200),
-        target: str(it.target, 400),
-      }));
-    if (items.length) practice = { intro: str(prac.intro, 300), items };
-  }
-
-  const overall = str(parsed.overall_comment, 2000);
   const revised = str(parsed.revised_essay, 20000);
+  const highlight = str(parsed.highlight, 300);
+  const priority = str(parsed.priority, 300);
 
-  // 整体合法性：总评与修改全文至少有一项非空，分项诊断至少一项非空
-  const hasDiag = !!(diag.content || diag.language || diag.organization);
-  if (!overall && !revised && !hasDiag) {
-    throw new Error('批改结果为空（缺少总评/诊断/修改全文）');
+  // 整体合法性：修改全文 / 分项依据 / 问题清单 / 亮点·优先点至少有一项非空
+  const hasBasis = !!(basis.content || basis.language || basis.organization);
+  if (!revised && !hasBasis && issues.length === 0 && !highlight && !priority) {
+    throw new Error('批改结果为空（缺少依据/问题清单/修改全文）');
   }
 
   const result: ReviewResult = {
-    diagnosis: {
-      content: str(diag.content, 3000),
-      language: str(diag.language, 3000),
-      organization: str(diag.organization, 3000),
+    basis: {
+      content: str(basis.content, 600),
+      language: str(basis.language, 600),
+      organization: str(basis.organization, 600),
     },
     subscores: { content, language, organization },
     score: finalScore,
-    overall_comment: overall,
+    highlight,
+    priority,
     word_count: wordCount,
     word_count_penalty: wordPenalty,
     issues,
     revised_essay: revised,
-    suggestions: strArray(parsed.suggestions, 8),
-    practice,
+    // 数量不设硬上限（只求准确），20 为异常安全阀
+    suggestions: strArray(parsed.suggestions, 20, 400),
     argumentation: hasExamples === null && hasSolution === null ? undefined : {
       has_examples: hasExamples,
       has_solution: hasSolution,
       model_content: modelContent,   // 模型原始内容分（审计：看被服务端压了多少）
-      model_language: modelLanguage, // 模型原始语言分（同上）
+      model_language: modelLanguage, // 模型原始语言分（审计用）
     },
   };
 

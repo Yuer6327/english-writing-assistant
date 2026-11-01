@@ -134,10 +134,16 @@ export interface ContentPart {
   image_url?: { url: string };
 }
 
-/** callAI 返回值：内容 + 成功那次的 token 用量（计费结算用） */
+/** callAI 返回值：内容 + 成功那次的 token 用量（计费结算用）。
+ *  缓存命中/未命中是 DeepSeek 的实际计费维度（命中价远低于未命中），逐次透传给结算。 */
 export interface AIResult {
   content: string;
-  usage?: { prompt_tokens: number; completion_tokens: number };
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+  };
 }
 
 /** 统一调用 AI，带超时。json=true 时要求返回 JSON。contentParts 存在时走多模态（手写 OCR / 看图批改）。
@@ -353,8 +359,24 @@ async function callAIFetch(
     }
 
     const data: any = await resp.json();
+    // usage 逐字段宽松解析：上游各自的缓存拆分字段名不一（DeepSeek 顶层 *cache*_tokens，
+    // OpenAI 系在 prompt_tokens_details.cached_tokens），拿得到就透传，拿不到不阻塞计费
     const usage = data.usage && typeof data.usage.prompt_tokens === 'number'
-      ? { prompt_tokens: data.usage.prompt_tokens, completion_tokens: data.usage.completion_tokens ?? 0 }
+      ? (() => {
+        const u = data.usage;
+        const hit = typeof u.prompt_cache_hit_tokens === 'number' ? u.prompt_cache_hit_tokens
+          : typeof u.prompt_tokens_details?.cached_tokens === 'number' ? u.prompt_tokens_details.cached_tokens
+          : undefined;
+        const miss = typeof u.prompt_cache_miss_tokens === 'number' ? u.prompt_cache_miss_tokens
+          : hit !== undefined && typeof u.prompt_tokens === 'number' ? u.prompt_tokens - hit
+          : undefined;
+        return {
+          prompt_tokens: u.prompt_tokens,
+          completion_tokens: u.completion_tokens ?? 0,
+          ...(hit !== undefined && hit >= 0 ? { prompt_cache_hit_tokens: hit } : {}),
+          ...(miss !== undefined && miss >= 0 ? { prompt_cache_miss_tokens: miss } : {}),
+        };
+      })()
       : undefined;
     return { content: data.choices?.[0]?.message?.content ?? '', usage };
   } finally {

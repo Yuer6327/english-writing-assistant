@@ -8,7 +8,7 @@ import type { Context } from 'hono';
 import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp, memberWriteLimitHit } from '../utils/rate-limit';
-import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart } from '../utils/ai';
+import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart, type AIResult } from '../utils/ai';
 import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
@@ -16,11 +16,13 @@ import {
   checkReviewGate, quotaState, checkEssayGate, checkDraftGate, successStmt, GUEST_DAILY_ESSAYS, beijingDay,
 } from '../utils/quota';
 import {
-  GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock,
+  GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock, buildReviewMessages,
+  SCORE_ONLY_SYSTEM_PROMPT, buildScoreOnlyUser,
   FRAGMENT_POLISH_PROMPT, FULL_REWRITE_PROMPT, validatePromptTemplate,
 } from '../utils/prompts';
 import {
   countWords, sanitizeReview, sanitizeFragmentPolish, sanitizeFullRewrite,
+  clampSubscores, medianScore,
 } from '../utils/validate';
 import { seedSampleEssay } from '../sample/seed';
 import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
@@ -519,7 +521,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   const topicImages = parseJsonField<string[]>(essay.topic_images, []);
   const topic = essay.topic_text + (topicImages.length ? '\n（题目配有图片，见本消息附图）' : '');
 
-  const filled = fillTemplate(template, {
+  const { system: reviewSystem, user: reviewUser } = buildReviewMessages(template, promptSource, {
     topic,
     essay: draft.text,
     word_count: String(countWords(draft.text)),
@@ -534,10 +536,6 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   try {
     if (topicImages.length) {
       cfg = await getVisionConfig(c.env, userId, lane);
-      contentParts = [
-        { type: 'text', text: filled },
-        ...topicImages.map(url => ({ type: 'image_url', image_url: { url } })),
-      ];
     } else {
       cfg = await resolveLane(c.env, userId, lane);
     }
@@ -549,11 +547,13 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   // ── 预扣费（免费额度 → mode:'free'；BYOK → mode:'byok'；付费 → 冻结）──
   // 免费档带 skipQuota：次数由上面的 checkReviewGate/recordSuccess 按「成功」计数，
   // 不由 billing 在调用前扣（否则失败也扣次数）。
-  const maxOutput = maxOutputFor(lane, 4096);
+  // 6144：issues 不再设 10 条上限（只求准确），给弱文长输出留足余量，避免 JSON 截断 → 重试
+  const maxOutput = maxOutputFor(lane, 6144);
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: estimateTextTokens(filled) + estimateImageTokens(topicImages, cfg.provider, cfg.model),
+      estInputTokens: estimateTextTokens(reviewSystem) + estimateTextTokens(reviewUser)
+        + estimateImageTokens(topicImages, cfg.provider, cfg.model),
       maxOutputTokens: maxOutput,
       skipQuota: lane === 'free',
     });
@@ -574,21 +574,128 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   let settled = false;
   let charged = 0;
   try {
+    // ── 分项分采样（先行）：3 次独立「只打分」小调用，与正式批改同一口径（RUBRIC_BLOCK）──
+    // self-consistency：温度 0.6 保证样本多样性；3 个有效样本取中位数「定档」，
+    // 主调用按定档分数写依据（basis 与交付分数永远一致，贴近真实阅卷「先定档后写评语」）。
+    // 有效样本 <3（限流 / 解析失败 / 自定义模板无注入位）→ 退回旧行为：主调用独立打分，
+    // 其分项分与有效样本合并取中位数。采样阶段的失败成本并入结算，不单独计费。
+    const scoreDeadline = Math.min(Date.now() + 30_000, aiDeadline);
+    const sampleSignals: {
+      subscores: { content: number; language: number; organization: number };
+      hasExamples: boolean | null;
+      hasSolution: boolean | null;
+    }[] = [];
+    let sampleUsage: AIResult['usage'];
+    if (scoreDeadline - Date.now() > 5_000) {
+      const scoreUser = buildScoreOnlyUser(topic, draft.text, countWords(draft.text));
+      const rescores = await Promise.allSettled([
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
+      ]);
+      for (const r of rescores) {
+        if (r.status !== 'fulfilled') {
+          console.error(`[review] 打分采样失败（不计入）: ${r.reason?.message ?? r.reason}`);
+          continue;
+        }
+        const u = r.value.usage;
+        if (u) {
+          // 采样成本并入结算（含缓存拆分），付费车道不多收也不白嫖
+          const add = (a?: number, b?: number): number | undefined =>
+            a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+          sampleUsage = sampleUsage
+            ? {
+              prompt_tokens: (sampleUsage.prompt_tokens ?? 0) + (u.prompt_tokens ?? 0),
+              completion_tokens: (sampleUsage.completion_tokens ?? 0) + (u.completion_tokens ?? 0),
+              prompt_cache_hit_tokens: add(sampleUsage.prompt_cache_hit_tokens, u.prompt_cache_hit_tokens),
+              prompt_cache_miss_tokens: add(sampleUsage.prompt_cache_miss_tokens, u.prompt_cache_miss_tokens),
+            }
+            : u;
+        }
+        try {
+          const j = extractJSON(r.value.content);
+          // 形状不完整的输出（如 {"error":...}）直接弃样：缺 subscores 会被钳成 0 分，污染中位数
+          if (!j || typeof j !== 'object' || !j.subscores) throw new Error('采样输出缺少 subscores');
+          const arg = j.argumentation ?? {};
+          sampleSignals.push({
+            subscores: clampSubscores(arg, j.subscores),
+            hasExamples: typeof arg.has_examples === 'boolean' ? arg.has_examples : null,
+            hasSolution: typeof arg.has_solution === 'boolean' ? arg.has_solution : null,
+          });
+        } catch { /* 采样输出不合法 → 该样本丢弃 */ }
+      }
+    }
+
+    // 3 个有效样本且为内置默认模板（有注入位）→ 中位数定档；布尔判定取多数（平票/全缺视为未知 → 不钳制）
+    let agreed: { content: number; language: number; organization: number } | null = null;
+    let agreedArg: { has_examples: boolean; has_solution: boolean } | null = null;
+    if (sampleSignals.length >= 3 && promptSource === 'default') {
+      const majority = (vals: (boolean | null)[]): boolean => {
+        const b = vals.filter((v): v is boolean => v !== null);
+        return b.filter(Boolean).length * 2 >= b.length;
+      };
+      agreedArg = {
+        has_examples: majority(sampleSignals.map(s => s.hasExamples)),
+        has_solution: majority(sampleSignals.map(s => s.hasSolution)),
+      };
+      agreed = {
+        content: medianScore(sampleSignals.map(s => s.subscores.content)),
+        language: medianScore(sampleSignals.map(s => s.subscores.language)),
+        organization: medianScore(sampleSignals.map(s => s.subscores.organization)),
+      };
+    }
+
+    // 主调用用户消息：定档时在末位注入评分（可变数据区），否则用原始消息
+    const baseUser = agreed
+      ? `${reviewUser}\n\n【评分已定（三次独立评卷的中位数，不得更改）】
+- argumentation：has_examples = ${agreedArg!.has_examples}，has_solution = ${agreedArg!.has_solution}
+- 分项分：内容 ${agreed.content} / 语言 ${agreed.language} / 结构 ${agreed.organization}
+你的任务：写出支撑上述分项分的 basis 依据、问题清单、highlight/priority 与修改稿；argumentation 与 subscores 按上述值原样输出。`
+      : reviewUser;
+    // 视觉批改：题目图文与定档分数同入用户消息（组装放在定档之后）
+    if (topicImages.length) {
+      contentParts = [
+        { type: 'text', text: baseUser },
+        ...topicImages.map(url => ({ type: 'image_url', image_url: { url } })),
+      ];
+    }
+
     // 调用 + 校验 + 一次严格重试
     let result = null as ReturnType<typeof sanitizeReview> | null;
     let lastErr = '';
     let attemptsUsed = 0;
-    let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    let lastUsage: AIResult['usage'];
     for (let attempt = 0; attempt < 2; attempt++) {
       attemptsUsed = attempt + 1;
       try {
         const userPrompt = attempt === 0
-          ? filled
-          : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
+          ? baseUser
+          : `${baseUser}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
         const raw = await callAI(
-          cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, contentParts, maxOutput, 0.3, aiDeadline);
+          cfg.key, cfg.baseUrl, cfg.model, reviewSystem, userPrompt, true, contentParts, maxOutput, 0.2, aiDeadline);
         lastUsage = raw.usage;
-        result = sanitizeReview(extractJSON(raw.content), draft.text, !!prevReview);
+        const parsed = extractJSON(raw.content);
+        if (parsed && typeof parsed === 'object' && parsed.error === 'illegible') {
+          // 模型明确判定作文无法辨认：重试必然同样失败，释放预扣并友好返回（finally 释放并发锁）
+          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          console.error('[review] 模型判定作文正文无法辨认（illegible）');
+          return c.json({
+            error: '作文正文基本无法辨认（可能因手写不清或识别失败），请核对原文或换一张更清晰的照片后重试',
+            code: 'essay_illegible',
+          }, 422);
+        }
+        result = sanitizeReview(parsed, draft.text, !!prevReview);
+        // 定档覆盖：分项分以采样中位数为准（口径一致性由 clampSubscores 保证），
+        // 主调用只负责举证与展开——basis 与交付分数从此必然一致
+        if (agreed) {
+          result.subscores = agreed;
+          result.score = Math.max(0,
+            agreed.content + agreed.language + agreed.organization - result.word_count_penalty);
+          if (result.argumentation) {
+            result.argumentation.has_examples = agreedArg!.has_examples;
+            result.argumentation.has_solution = agreedArg!.has_solution;
+          }
+        }
         break;
       } catch (err: any) {
         if (isAIRateLimitError(err)) {
@@ -607,12 +714,43 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
       return c.json({ error: '批改失败：AI 返回格式不符合要求，请稍后重试' }, 502);
     }
 
+    // 采样与主调用用量合并（失败重试的中间成本不单独计费，吸收进加价倍率 N）
+    if (sampleUsage) {
+      const add = (a?: number, b?: number): number | undefined =>
+        a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+      lastUsage = lastUsage
+        ? {
+          prompt_tokens: (lastUsage.prompt_tokens ?? 0) + (sampleUsage.prompt_tokens ?? 0),
+          completion_tokens: (lastUsage.completion_tokens ?? 0) + (sampleUsage.completion_tokens ?? 0),
+          prompt_cache_hit_tokens: add(lastUsage.prompt_cache_hit_tokens, sampleUsage.prompt_cache_hit_tokens),
+          prompt_cache_miss_tokens: add(lastUsage.prompt_cache_miss_tokens, sampleUsage.prompt_cache_miss_tokens),
+        }
+        : sampleUsage;
+    }
+
+    // 未定档 → 主调用分项分与有效采样合并取中位数（主调用也是一路独立信号）
+    const scoreSamples = agreed ? 3 : 1 + sampleSignals.length;
+    if (!agreed && sampleSignals.length > 0) {
+      const samples = [result.subscores, ...sampleSignals.map(s => s.subscores)];
+      result.subscores = {
+        content: medianScore(samples.map(s => s.content)),
+        language: medianScore(samples.map(s => s.language)),
+        organization: medianScore(samples.map(s => s.organization)),
+      };
+      // 总分随中位数重算（词数扣分不变）
+      result.score = Math.max(0,
+        result.subscores.content + result.subscores.language + result.subscores.organization
+        - result.word_count_penalty);
+    }
+
     // 结算（实际成本，多退少补；settle 失败不阻塞结果返回，未结算的 hold 由 cron 过期释放兜底）
     if (holdInfo.mode === 'hold') {
       try {
         const s = await billing.settle(c.env, holdInfo.holdId!, {
           promptTokens: lastUsage?.prompt_tokens,
           completionTokens: lastUsage?.completion_tokens,
+          promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
+          promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
         });
         charged = s.charged;
         settled = true;
@@ -634,6 +772,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
       attempts: attemptsUsed,
       prompt_tokens: lastUsage?.prompt_tokens ?? null,
       completion_tokens: lastUsage?.completion_tokens ?? null,
+      score_samples: scoreSamples,
       issues_total: result.issues.length,
       issues_unlocated: result.issues.filter(i => i.located === false).length,
       prompt_source: promptSource,
@@ -809,7 +948,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
 
       let parsedResult = null as ReturnType<typeof sanitizeFragmentPolish> | null;
       let lastErr = '';
-      let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+      let lastUsage: AIResult['usage'];
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const userPrompt = attempt === 0
@@ -838,6 +977,8 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
           const s = await billing.settle(c.env, holdInfo.holdId!, {
             promptTokens: lastUsage?.prompt_tokens,
             completionTokens: lastUsage?.completion_tokens,
+            promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
+            promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
           });
           charged = s.charged;
           settled = true;
@@ -869,7 +1010,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
 
     let parsedResult = null as ReturnType<typeof sanitizeFullRewrite> | null;
     let lastErr = '';
-    let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    let lastUsage: AIResult['usage'];
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const userPrompt = attempt === 0
@@ -899,6 +1040,8 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
         const s = await billing.settle(c.env, holdInfo.holdId!, {
           promptTokens: lastUsage?.prompt_tokens,
           completionTokens: lastUsage?.completion_tokens,
+          promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
+          promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
         });
         charged = s.charged;
         settled = true;

@@ -203,6 +203,22 @@ export async function requireAuth() {
   return null;
 }
 
+/**
+ * 扣费操作成功后刷新导航栏余额 pill（批改/精修/润色结算完成后调用）。
+ * 服务端先结算再返回响应，此时重新拉会话拿到的就是结算后的余额；
+ * 顺带刷新 sessionCache，页面后续逻辑读到的也是新余额。静默失败不打扰用户。
+ */
+export async function refreshBalancePill() {
+  const pill = document.getElementById('nav-balance-pill');
+  if (!pill) return;
+  try {
+    const session = await getSession(true);
+    if (typeof session?.wallet?.balance === 'number') {
+      pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} 积分`;
+    }
+  } catch { /* 余额刷新失败不影响主流程 */ }
+}
+
 // ── HTML escape ──
 export function escapeHtml(str) {
   if (!str) return '';

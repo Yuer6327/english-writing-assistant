@@ -63,7 +63,12 @@ export function hold(
 
 export function settle(
   env: Env, holdId: string,
-  usage: { promptTokens?: number; completionTokens?: number; calls?: number },
+  usage: {
+    promptTokens?: number; completionTokens?: number;
+    /** 上游 usage 的输入缓存命中/未命中拆分：billing 按上游实际计费维度计价（N=1） */
+    promptCacheHitTokens?: number; promptCacheMissTokens?: number;
+    calls?: number;
+  },
 ): Promise<{ charged: number; refunded: number; balance: number }> {
   return call(env, `/internal/holds/${holdId}/settle`, { method: 'POST', body: usage });
 }

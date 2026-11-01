@@ -44,8 +44,9 @@ export interface Vars {
 /** 批改结果（AI 输出 JSON 的结构，前端渲染契约） */
 export interface ReviewIssue {
   quote: string;            // 原文逐字片段（用于高亮定位）
-  type: string;             // 语法/词汇/搭配/拼写/标点/逻辑/中式表达/论证
-  explanation: string;      // 问题分析（中文）
+  type: string;             // 语法/词汇/搭配/拼写/标点/逻辑/中式表达/论证/识别存疑
+  severity?: 'critical' | 'minor' | 'polish';  // critical=影响理解；polish=润色级；旧记录可能缺省
+  explanation: string;      // 为什么错（中文，说人话）
   correction: string;       // 修改后的句子
   located?: boolean;        // false = quote 未命中原文，只展示问题卡片、不高亮
 }
@@ -57,29 +58,17 @@ export interface ReviewImprovement {
   regression: string[];     // 新引入的问题
 }
 
-/** 巩固练习（针对本次批改发现的问题定制的中译英） */
-export interface ReviewPracticeItem {
-  chinese: string;          // 中文句子（学生译成英语）
-  answer: string;           // 参考答案（英文）
-  target: string;           // 考点及对应的原文问题
-}
-
-export interface ReviewPractice {
-  intro: string;            // 一句话说明本组练习针对的薄弱点
-  items: ReviewPracticeItem[];
-}
-
 export interface ReviewResult {
-  diagnosis: { content: string; language: string; organization: string };
+  basis: { content: string; language: string; organization: string };  // 各维度给分依据（= 诊断 + 举证）
   subscores: { content: number; language: number; organization: number };
   score: number;                        // 0-22，= 三维度之和 − 词数扣分（服务端硬扣）
-  overall_comment: string;
+  highlight: string;                    // 一个具体亮点（一句，引用原文表达）
+  priority: string;                     // 最优先改进点（一句）
   word_count: number;                   // 服务端统计的词数（空白分词）
   word_count_penalty: number;           // 词数扣分：<100 词 −5、>500 词 −3、其余 0
   issues: ReviewIssue[];
   revised_essay: string;                // 修改后全文，改动处 **粗体**
-  suggestions: string[];
-  practice?: ReviewPractice;            // 巩固练习（旧记录可能没有）
+  suggestions: string[];                // ≤3 条，必须针对本篇具体问题
   improvement?: ReviewImprovement;      // 二稿及以上才有
   /** 论证自评（服务端据此钳制内容分；null = 模型未填，未钳制） */
   argumentation?: {
