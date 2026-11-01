@@ -532,58 +532,83 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
   drawString(meta, (P.pageW - width(meta, metaSize)) / 2, cursor - metaSize, metaSize, C.gray);
   cursor -= metaSize * 1.8;
 
-  // ── 一、题目 ──
+  // ── 一、题目（文字与配图同框；配图约为内容宽一半，居中）──
   drawSectionHead(cnNum[0], '题目');
   const topicText = String(data.topic || '').trim();
-  if (topicText) {
-    const size = 10.5, lh = 16, pad = 10;
-    const paras = topicText.split(/\n+/).map(cleanText).filter(Boolean);
-    const allLines = paras.map(p => wrapRuns([{ text: p, color: C.ink }], size, P.contentW - pad * 2));
-    const totalLines = allLines.reduce((s, l) => s + l.length, 0);
-    const boxH = pad * 2 + totalLines * lh + (paras.length - 1) * 4;
-    if (boxH <= P.pageH - P.marginT - P.marginB) {
-      ensure(boxH);
-      const top = cursor;
-      page.drawRectangle({
-        x: P.marginL, y: top - boxH, width: P.contentW, height: boxH,
-        borderColor: C.lineSoft, borderWidth: 0.8,
-      });
-      let ty = top - pad - size;
-      for (const lines of allLines) {
-        for (const ln of lines) { drawRunLine(ln, P.marginL + pad, ty, size); ty -= lh; }
-        ty -= 4;
-      }
-      cursor = top - boxH - 14;
-    } else {
-      drawParas(topicText, { size, gap: 6 });
-    }
-  }
+  const topicSize = 10.5, topicLh = 16, topicPad = 10, topicParaGap = 4;
 
-  // 题目配图（图片作文）：居中、按内容宽等比缩放、限高 420pt，浅灰描边；单张失败不阻塞整份报告。
+  // 题目配图：解码嵌入并按半宽口径算好尺寸；单张失败不阻塞整份报告。
   // 浏览器壳已把 webp 等转成 PNG 传入 topicImages；未传时（Node 直调）就地解析 data URL（仅 png/jpg 可嵌）。
   const embeddable = (topicImages && topicImages.length)
     ? topicImages
     : (Array.isArray(data.topic_images) ? data.topic_images.map(parseImageDataUrl) : []);
+  const embeddedImgs = [];
   let imgFailed = 0;
   for (const img of embeddable) {
     if (!img || !img.bytes || !img.kind) { imgFailed++; continue; }
     try {
       const embedded = img.kind === 'png' ? await pdfDoc.embedPng(img.bytes) : await pdfDoc.embedJpg(img.bytes);
       const iw = embedded.width, ih = embedded.height;
-      let w = Math.min(P.contentW, iw);
+      let w = Math.min(P.contentW, iw) * 0.5;   // 横竖各约为旧全宽版式的一半
       let h = w * (ih / iw);
-      const maxH = 420;
+      const maxH = 210;
       if (h > maxH) { h = maxH; w = h * (iw / ih); }
-      ensure(h + 14);
-      const x = P.marginL + (P.contentW - w) / 2;
-      const y = cursor - h;
-      page.drawImage(embedded, { x, y, width: w, height: h });
+      const innerW = P.contentW - topicPad * 2;
+      if (w > innerW) { w = innerW; h = w * (ih / iw); }
+      embeddedImgs.push({ embedded, w, h });
+    } catch { imgFailed++; }
+  }
+
+  if (topicText || embeddedImgs.length) {
+    const paras = topicText ? topicText.split(/\n+/).map(cleanText).filter(Boolean) : [];
+    const allLines = paras.map(p => wrapRuns([{ text: p, color: C.ink }], topicSize, P.contentW - topicPad * 2));
+    const totalLines = allLines.reduce((s, l) => s + l.length, 0);
+    const textBlockH = totalLines * topicLh + Math.max(paras.length - 1, 0) * topicParaGap;
+    const imgGap = 8, imgBetween = 10;
+    const imgBlockH = embeddedImgs.length
+      ? imgGap + embeddedImgs.reduce((s, im) => s + im.h, 0) + (embeddedImgs.length - 1) * imgBetween
+      : 0;
+    const boxH = topicPad * 2 + textBlockH + imgBlockH;
+    const usable = P.pageH - P.marginT - P.marginB;
+    if (boxH <= usable) {
+      // 同框：细边框盒内先排题目文字，再居中排配图
+      ensure(boxH);
+      const top = cursor;
       page.drawRectangle({
-        x: x - 0.5, y: y - 0.5, width: w + 1, height: h + 1,
+        x: P.marginL, y: top - boxH, width: P.contentW, height: boxH,
         borderColor: C.lineSoft, borderWidth: 0.8,
       });
-      cursor = y - 14;
-    } catch { imgFailed++; }
+      let ty = top - topicPad - topicSize;
+      allLines.forEach((lines, pi) => {
+        for (const ln of lines) { drawRunLine(ln, P.marginL + topicPad, ty, topicSize); ty -= topicLh; }
+        if (pi < paras.length - 1) ty -= topicParaGap;
+      });
+      let iy = top - topicPad - textBlockH - imgGap;
+      for (const im of embeddedImgs) {
+        const ix = P.marginL + (P.contentW - im.w) / 2;
+        page.drawImage(im.embedded, { x: ix, y: iy - im.h, width: im.w, height: im.h });
+        page.drawRectangle({
+          x: ix - 0.5, y: iy - im.h - 0.5, width: im.w + 1, height: im.h + 1,
+          borderColor: C.lineSoft, borderWidth: 0.8,
+        });
+        iy -= im.h + imgBetween;
+      }
+      cursor = top - boxH - 14;
+    } else {
+      // 极端多图放不下同一个框：退化为文字盒 + 配图各自带框排在框外（仍缩半居中）
+      if (topicText) drawParas(topicText, { size: topicSize, gap: 6 });
+      for (const im of embeddedImgs) {
+        ensure(im.h + 14);
+        const ix = P.marginL + (P.contentW - im.w) / 2;
+        const iy = cursor - im.h;
+        page.drawImage(im.embedded, { x: ix, y: iy, width: im.w, height: im.h });
+        page.drawRectangle({
+          x: ix - 0.5, y: iy - 0.5, width: im.w + 1, height: im.h + 1,
+          borderColor: C.lineSoft, borderWidth: 0.8,
+        });
+        cursor = iy - 14;
+      }
+    }
   }
   if (imgFailed) drawFootnote(`（${imgFailed} 张题目图片未能嵌入报告）`);
 
