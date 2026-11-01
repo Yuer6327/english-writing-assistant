@@ -7,7 +7,7 @@
 import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor, refreshBalancePill,
-} from './api.js?v=20261031a';
+} from './api.js?v=20261101f';
 import { openExportModal, closeExportModal } from './export.js?v=20261101f';
 
 let generation = 0;
@@ -644,8 +644,20 @@ async function runReview(e) {
   const markerKey = `pending-review:${d.id}`;
   try {
     localStorage.setItem(markerKey, JSON.stringify({ started_at: Date.now(), previous_review_id: latestReview(d)?.id ?? null, essayId }));
-    const res = await api.reviewDraft(d.id, lane);
+    const t0 = Date.now();
+    const onPing = () => {
+      const t = btn.querySelector('.busy-time');
+      if (t) t.textContent = Math.round((Date.now() - t0) / 1000) + 's · 可离开，结果会自动保存';
+    };
+    const envelope = await api.reviewDraftStream(d.id, lane, onPing);
     if (gen !== generation) return;
+    const res = envelope.body;
+    if (envelope.status >= 400) {
+      const err = new Error(res.error || '批改失败，请稍后重试');
+      err.code = res.code;
+      err.rate_limited = res.rate_limited;
+      throw err;
+    }
     if (res.quota) {
       sessionQuota = res.quota;
       renderSessionBanner();

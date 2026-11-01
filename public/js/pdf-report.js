@@ -19,7 +19,7 @@
 // 可在 Node 侧直接驱动做视觉回归；buildPdfBlob(data) 为浏览器壳（CDN + SRI 加载）。
 // 由 export.js 调用 buildPdfBlob。
 
-import { loadScript, gradeFor } from './api.js?v=20261031a';
+import { loadScript, gradeFor } from './api.js?v=20261101f';
 
 // ── CDN 资源（带 SRI：镜像被投毒时浏览器拒绝执行）──
 const PDFLIB_CDN = 'https://cdn.jsdmirror.com/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js';

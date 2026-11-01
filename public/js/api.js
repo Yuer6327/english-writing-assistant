@@ -87,6 +87,49 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(modelId ? { model_id: modelId } : {}),
   }),
+
+  /**
+   * 批改（SSE 流式）：服务端每 10s 发心跳保活边缘连接，最终结果作为最后一个 data 事件
+   * 下发（{status, body}）。onPing 在每次心跳时回调（用于展示已耗时）。
+   * 非 SSE 的即时 JSON 响应（中间件 401/429 等）同样归一为 {status, body} 返回。
+   */
+  async reviewDraftStream(draftId, modelId, onPing) {
+    const resp = await fetch(`${API_BASE}/drafts/${draftId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(modelId ? { model_id: modelId } : {}),
+    });
+    const ct = resp.headers.get('content-type') || '';
+    if (!ct.includes('text/event-stream')) {
+      const data = await resp.json().catch(() => ({}));
+      if (resp.status === 401) { gotoAuth('login'); return new Promise(() => {}); }
+      return { status: resp.status, body: data };
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let final = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try { final = JSON.parse(line.slice(6)); } catch { /* 坏帧忽略 */ }
+          } else if (line.startsWith(': ping') && onPing) {
+            try { onPing(); } catch { /* 回调异常不阻断读取 */ }
+          }
+        }
+      }
+    }
+    if (final && final.status === 401) { gotoAuth('login'); return new Promise(() => {}); }
+    return final ?? { status: resp.status, body: {} };
+  },
   polish: (essayId, payload) => request(`/essays/${essayId}/polish`, { method: 'POST', body: JSON.stringify(payload) }),
   ocr: (images, mode) => request('/ocr', { method: 'POST', body: JSON.stringify({ images, mode }) }),
 

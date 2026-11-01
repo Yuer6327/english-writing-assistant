@@ -8,7 +8,7 @@ import type { Context } from 'hono';
 import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp, memberWriteLimitHit } from '../utils/rate-limit';
-import { callAI, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart, type AIResult } from '../utils/ai';
+import { callAI, callAIStreaming, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart, type AIResult } from '../utils/ai';
 import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
@@ -462,10 +462,42 @@ api.delete('/drafts/:id', userMiddleware, async (c) => {
 // 批改
 // ============================================================
 
-// ── 对稿件执行批改 ──
-api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
+// ── 对稿件执行批改（SSE：每 10s 心跳保活边缘连接，最终结果作为最后一个 data 事件下发；
+//    心跳使浏览器↔边缘不再受 ~100s 空闲限制，主调用可流式生成数分钟）──
+api.post('/drafts/:id/review', userMiddleware, aiRateLimit, (c) => {
+  const inner = runReview(c);   // 立即开始执行（到首个 await 让出，心跳随后接管）
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const ping = setInterval(() => {
+        try { controller.enqueue(enc.encode(': ping\n\n')); } catch { clearInterval(ping); }
+      }, 10_000);
+      try {
+        const res = await inner;
+        const body = await res.json();
+        controller.enqueue(enc.encode(`data: ${JSON.stringify({ status: res.status, body })}\n\n`));
+      } catch (err) {
+        console.error('[review] SSE 包装层异常:', err instanceof Error ? err.message : err);
+        controller.enqueue(enc.encode(`data: ${JSON.stringify({ status: 500, body: { error: '服务器内部错误' } })}\n\n`));
+      } finally {
+        clearInterval(ping);
+        try { controller.close(); } catch { /* 已关闭 */ }
+      }
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+});
+
+async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promise<Response> {
   const startedAt = Date.now();
-  const aiDeadline = startedAt + 90_000;
+  // 流式 + 心跳下不再受 ~100s 边缘空闲限制，预算放宽到 3 分钟（长文 8k-token 生成实测 33-90s）
+  const aiDeadline = startedAt + 180_000;
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
   const draftId = parseId(c.req.param('id'));
@@ -673,7 +705,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
         const userPrompt = attempt === 0
           ? baseUser
           : `${baseUser}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
-        const raw = await callAI(
+        const raw = await callAIStreaming(
           cfg.key, cfg.baseUrl, cfg.model, reviewSystem, userPrompt, true, contentParts, maxOutput, 0.2, aiDeadline);
         lastUsage = raw.usage;
         const parsed = extractJSON(raw.content);
@@ -847,7 +879,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
   } finally {
     if (locked) releaseSlot(userId, lockToken);
   }
-});
+}
 
 // ============================================================
 // 精修（片段） / 全文润色

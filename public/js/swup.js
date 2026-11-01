@@ -210,7 +210,7 @@ window.addEventListener('popstate', async () => {
 });
 
 // ── 初始化 ──
-import { getSession, loginHref } from './api.js?v=20261031a';
+import { getSession, loginHref } from './api.js?v=20261101f';
 
 // ── 导航栏会话态（navbar 持久化，查重防重复追加；本模块全站常驻）──
 //   登录：余额 pill + 管理链接（admin）

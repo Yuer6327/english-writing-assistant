@@ -6,7 +6,7 @@
 // 由 essay.js 调用 openExportModal({ mode:'report', getData })。
 // ============================================================
 
-import { loadScript, toast, gradeFor } from './api.js?v=20261031a';
+import { loadScript, toast, gradeFor } from './api.js?v=20261101f';
 import { buildPdfBlob } from './pdf-report.js?v=20261101f';
 
 // ── CDN 资源 ──

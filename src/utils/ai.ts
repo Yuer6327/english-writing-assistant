@@ -7,8 +7,11 @@
 // ============================================================
 
 /** 单次 AI 请求超时（毫秒）；Cloudflare 客户端空闲超时约 100s，必须留出预算。
- *  40s 曾把 8000-token 的批改主调用（实测 33-70s 生成）掐成必现超时——提到 75s。 */
+ *  40s 曾把 8000-token 的批改主调用（实测 33-70s 生成）掐成必现超时——提到 75s。
+ *  流式调用（stream=true）不受此上限约束：字节持续流动，改用空闲超时（见 STREAM_IDLE_TIMEOUT_MS）。 */
 const AI_TIMEOUT_MS = 75000;
+/** 流式请求的空闲超时：超过该时长没有收到任何新 chunk 才判定连接死亡（每个 chunk 重置计时） */
+const STREAM_IDLE_TIMEOUT_MS = 60000;
 /** 单个批改等请求的全局时间预算（含 failover / 等待） */
 const AI_TOTAL_BUDGET_MS = 90000;
 
@@ -302,6 +305,135 @@ async function callAIEndpoints(
   const finalErr: UpstreamError = lastError ?? new Error('AI 调用失败');
   if (lastRetryAfterSec !== null) finalErr.retryAfterSec = lastRetryAfterSec;
   throw finalErr;
+}
+
+/**
+ * 流式版 AI 调用（SSE）：字节持续流动，长生成（大 JSON / 长文）不再受单请求 40-75s 超时
+ * 与边缘 ~100s 空闲限制的掐杀——空闲超过 STREAM_IDLE_TIMEOUT_MS 才判定连接死亡。
+ * usage 取自末块（stream_options.include_usage）；参数不支持（400/404/415）时自动回退
+ * 非流式重试一次（并记忆 skipFormat）；限流/鉴权/5xx/abort 照常上抛，由调用方既定语义处理。
+ */
+export async function callAIStreaming(
+  apiKey: string,
+  baseUrl: string | string[],
+  model: string,
+  systemPrompt: string,
+  userPrompt: string,
+  json: boolean = true,
+  contentParts?: ContentPart[],
+  maxTokens?: number,
+  temperature?: number,
+  deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
+): Promise<AIResult> {
+  const formatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
+  const useFormat = json && !/^agnes-/i.test(model) && !skipResponseFormatModels.has(formatKey);
+
+  const streamOnce = async (endpointUrl: string, withFormat: boolean): Promise<AIResult> => {
+    const controller = new AbortController();
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+    };
+    armIdle();
+    try {
+      const url = `${endpointUrl.replace(/\/$/, '')}/chat/completions`;
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+            { role: 'user', content: contentParts && contentParts.length > 0 ? contentParts : userPrompt },
+          ],
+          temperature: temperature ?? 0.3,
+          ...(maxTokens ? { max_tokens: maxTokens } : {}),
+          stream: true,
+          stream_options: { include_usage: true },
+          ...(withFormat ? { response_format: { type: 'json_object' } } : {}),
+        }),
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        const err: UpstreamError = new Error(`AI API error ${resp.status}: ${errText}`);
+        const retryAfterRaw = resp.headers.get('retry-after');
+        if (retryAfterRaw !== null) err.retryAfterSec = parseInt(retryAfterRaw, 10);
+        throw err;
+      }
+      if (!resp.body) throw new Error('流式响应缺少 body');
+
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let content = '';
+      let usage: AIResult['usage'];
+      let done = false;
+      for (;;) {
+        const { done: rdDone, value } = await reader.read();
+        if (rdDone) break;
+        if (Date.now() >= deadline) { controller.abort(); throw new Error('AI 调用超时'); }
+        armIdle();
+        buf += dec.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') { done = true; continue; }
+          try {
+            const j = JSON.parse(payload);
+            if (j.usage && typeof j.usage.prompt_tokens === 'number') {
+              usage = {
+                prompt_tokens: j.usage.prompt_tokens,
+                completion_tokens: j.usage.completion_tokens ?? 0,
+              };
+            }
+            const delta = j.choices?.[0]?.delta?.content ?? j.choices?.[0]?.text ?? '';
+            if (delta) content += delta;
+          } catch { /* 单帧解析失败忽略（SSE 容错） */ }
+        }
+        if (done) break;
+      }
+      if (!content.trim()) throw new Error(`AI 返回空内容（${endpointUrl}）`);
+      return { content, usage };
+    } catch (err: any) {
+      if (/abort/i.test(String(err?.message ?? '')) && Date.now() < deadline) {
+        throw new Error(`AI 流式连接空闲超时（${STREAM_IDLE_TIMEOUT_MS / 1000}s 无数据）`);
+      }
+      throw err;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+    }
+  };
+
+  const urls = orderEndpoints(baseUrl);
+  if (urls.length === 0) throw new Error('未配置 AI 接口地址');
+  let lastError: Error | null = null;
+  for (const url of urls) {
+    if (Date.now() >= deadline) throw new Error('AI 调用超时');
+    try {
+      return await streamOnce(url, useFormat);
+    } catch (err: any) {
+      const msg = String(err?.message ?? '');
+      lastError = err instanceof Error ? err : new Error(msg);
+      // 参数不支持（常见于代理/模型不认 response_format 或 stream）：记忆并回退非流式
+      if (/^AI API error (400|415|422)/.test(msg)) {
+        skipResponseFormatModels.add(formatKey);
+        console.error(`[callAI] 流式参数不被支持（${msg.slice(0, 80)}），回退非流式`);
+        return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+      }
+      // 限流/鉴权/模型不存在/服务端错误：换端点也无济于事，立即上抛（与 callAIEndpoints 同语义）
+      if (isRateLimitMessage(msg) || isCloudflareEndpointBlock(msg) || /^AI API error (401|403|404|5\d\d)/.test(msg)) {
+        throw err;
+      }
+      // 其余（网络抖动等）：换下一端点
+      console.error(`[callAI] 流式端点 ${url} 失败（${msg.slice(0, 80)}），尝试下一端点`);
+    }
+  }
+  throw lastError ?? new Error('AI 流式调用失败');
 }
 
 /** 单端点实际请求（一次 /chat/completions 调用） */
