@@ -22,7 +22,7 @@ import {
 } from '../utils/prompts';
 import {
   countWords, sanitizeReview, sanitizeFragmentPolish, sanitizeFullRewrite,
-  clampSubscores, medianScore,
+  clampSubscores, medianScore, normalizeReviewShape,
 } from '../utils/validate';
 import { seedSampleEssay } from '../sample/seed';
 import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
@@ -267,7 +267,7 @@ api.get('/essays/:id', userMiddleware, async (c) => {
       review_count: d.review_count, created_at: d.created_at,
       reviews: reviews.filter(r => r.draft_id === d.id).map(r => ({
         id: r.id, model: r.model, created_at: r.created_at, reviewed_text: r.reviewed_text ?? null,
-        result: parseJsonField(r.result, {}, `review:${r.id}`),
+        result: normalizeReviewShape(parseJsonField(r.result, {}, `review:${r.id}`)),
       })),
     })),
     polishes: polishes.map(p => ({

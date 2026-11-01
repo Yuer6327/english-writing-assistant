@@ -280,3 +280,25 @@ export function countWords(text: string): number {
   if (!t) return 0;
   return t.split(/\s+/).length;
 }
+
+/**
+ * 旧版批改结果结构兼容映射（读取路径，不改库存数据）：
+ * 2026-11 前的结果用 diagnosis{content,language,organization} + overall_comment，
+ * 2026-11 改版为 basis + priority（highlight 为新增字段，旧结果无此数据，保持缺省）。
+ * 详情接口统一过这里，网页渲染与 PDF 导出（buildReportPayload）即同时兼容新旧两代结果。
+ */
+export function normalizeReviewShape(result: unknown): any {
+  if (!result || typeof result !== 'object') return result;
+  const r = result as Record<string, any>;
+  if (r.basis || !r.diagnosis) return r;
+  const d = (r.diagnosis ?? {}) as Record<string, any>;
+  return {
+    ...r,
+    basis: {
+      content: typeof d.content === 'string' ? d.content : '',
+      language: typeof d.language === 'string' ? d.language : '',
+      organization: typeof d.organization === 'string' ? d.organization : '',
+    },
+    priority: typeof r.priority === 'string' && r.priority ? r.priority : (typeof r.overall_comment === 'string' ? r.overall_comment : undefined),
+  };
+}

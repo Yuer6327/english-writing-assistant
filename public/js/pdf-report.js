@@ -66,7 +66,40 @@ function ensureFonts() {
 export async function buildPdfBlob(data) {
   const { PDFLib, fontkit } = await ensurePdfLib();
   const { sans, serif } = await ensureFonts();
-  return renderReport(data, { PDFLib, fontkit, sansBytes: sans, serifBytes: serif });
+  // 题目配图归一：PNG/JPEG 直接用；webp/gif/bmp 等经 canvas 转成 PNG；失败的置 null 渲染端跳过
+  const images = Array.isArray(data.topic_images) ? data.topic_images : [];
+  const topicImages = await Promise.all(images.map(ensureEmbeddableImage));
+  return renderReport(data, { PDFLib, fontkit, sansBytes: sans, serifBytes: serif, topicImages });
+}
+
+/** data URL → { bytes, kind: 'png'|'jpg' }；其他格式经 canvas 解码转 PNG；失败返回 null */
+async function ensureEmbeddableImage(dataUrl) {
+  try {
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return null;
+    const direct = parseImageDataUrl(dataUrl);
+    if (direct && direct.kind) return direct;
+    // 声明为 png/jpeg 之外（webp/gif/bmp…）或魔数不符：浏览器解码后转 PNG
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width; canvas.height = bitmap.height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0);
+    const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    if (!pngBlob) return null;
+    return { bytes: new Uint8Array(await pngBlob.arrayBuffer()), kind: 'png' };
+  } catch { return null; }
+}
+
+/** 解 data URL 为字节；按魔数判定可嵌入格式（png/jpg 返回 kind，其余 kind=null 交 canvas 兜底） */
+function parseImageDataUrl(dataUrl) {
+  const m = /^data:image\/([a-z+.-]+);base64,(.*)$/i.exec(dataUrl);
+  if (!m) return null;
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) return { bytes, kind: 'png' };  // \x89PNG
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8) return { bytes, kind: 'jpg' };  // \xFF\xD8\xFF
+  return { bytes, kind: null };
 }
 
 // ============================================================
@@ -88,7 +121,7 @@ function splitMarked(text, baseColor, markColor) {
 
 const CAP_NOTE = '注：总分满分 25 分，系统内上限 22 分；词数不足（少于 100 词）扣 5 分、超过（多于 500 词）扣 3 分。';
 
-export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifBytes }) {
+export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifBytes, topicImages = [] }) {
   const pdfDoc = await PDFLib.PDFDocument.create();
   pdfDoc.registerFontkit(fontkit);
   // F_SANS：中文/CJK 标点/全角；F_SERIF：拉丁字母、数字、西文标点（Times 风格）
@@ -164,6 +197,8 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
 
   /** 行首禁排标点（避头尾）：断行落在这些字符前时，改挂在上一行行尾 */
   const BANNED_HEAD = /^[，。、；：？！”’）》〉】〕」』…～·‰！？,.;:!?)\]}]$/;
+  /** 行尾禁排标点：开括号/开引号不悬在行尾，断行时移到下一行行首 */
+  const BANNED_END = /^[（“‘《〈【〔「『]$/;
 
   /**
    * 富文本贪心折行。segs: [{text, color}]，返回行数组，每行是 [{text, color, w}]。
@@ -191,6 +226,13 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
           }
           lines.push(line);
           line = []; w = 0;
+          // 行尾禁则：上一行末尾若是开括号/开引号，移到新行行首
+          const prev = lines[lines.length - 1];
+          if (prev.length && prev[prev.length - 1].text.length === 1 && BANNED_END.test(prev[prev.length - 1].text)) {
+            const moved = prev.pop();
+            line.push(moved);
+            w += moved.w;
+          }
           if (tok === ' ') continue;
         }
         line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok) });
@@ -516,6 +558,34 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
       drawParas(topicText, { size, gap: 6 });
     }
   }
+
+  // 题目配图（图片作文）：居中、按内容宽等比缩放、限高 420pt，浅灰描边；单张失败不阻塞整份报告。
+  // 浏览器壳已把 webp 等转成 PNG 传入 topicImages；未传时（Node 直调）就地解析 data URL（仅 png/jpg 可嵌）。
+  const embeddable = (topicImages && topicImages.length)
+    ? topicImages
+    : (Array.isArray(data.topic_images) ? data.topic_images.map(parseImageDataUrl) : []);
+  let imgFailed = 0;
+  for (const img of embeddable) {
+    if (!img || !img.bytes || !img.kind) { imgFailed++; continue; }
+    try {
+      const embedded = img.kind === 'png' ? await pdfDoc.embedPng(img.bytes) : await pdfDoc.embedJpg(img.bytes);
+      const iw = embedded.width, ih = embedded.height;
+      let w = Math.min(P.contentW, iw);
+      let h = w * (ih / iw);
+      const maxH = 420;
+      if (h > maxH) { h = maxH; w = h * (iw / ih); }
+      ensure(h + 14);
+      const x = P.marginL + (P.contentW - w) / 2;
+      const y = cursor - h;
+      page.drawImage(embedded, { x, y, width: w, height: h });
+      page.drawRectangle({
+        x: x - 0.5, y: y - 0.5, width: w + 1, height: h + 1,
+        borderColor: C.lineSoft, borderWidth: 0.8,
+      });
+      cursor = y - 14;
+    } catch { imgFailed++; }
+  }
+  if (imgFailed) drawFootnote(`（${imgFailed} 张题目图片未能嵌入报告）`);
 
   // ── 多稿时：各稿得分总览表 ──
   const drafts = Array.isArray(data.drafts) ? data.drafts : [];
