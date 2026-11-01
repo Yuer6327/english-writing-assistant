@@ -579,13 +579,14 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
     // 主调用按定档分数写依据（basis 与交付分数永远一致，贴近真实阅卷「先定档后写评语」）。
     // 有效样本 <3（限流 / 解析失败 / 自定义模板无注入位）→ 退回旧行为：主调用独立打分，
     // 其分项分与有效样本合并取中位数。采样阶段的失败成本并入结算，不单独计费。
-    const scoreDeadline = Math.min(Date.now() + 30_000, aiDeadline);
+    const scoreDeadline = Math.min(Date.now() + 20_000, aiDeadline);
     const sampleSignals: {
       subscores: { content: number; language: number; organization: number };
       hasExamples: boolean | null;
       hasSolution: boolean | null;
     }[] = [];
     let sampleUsage: AIResult['usage'];
+    let sampleCallsOk = 0;
     if (scoreDeadline - Date.now() > 5_000) {
       const scoreUser = buildScoreOnlyUser(topic, draft.text, countWords(draft.text));
       const rescores = await Promise.allSettled([
@@ -600,6 +601,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
         }
         const u = r.value.usage;
         if (u) {
+          sampleCallsOk++;
           // 采样成本并入结算（含缓存拆分），付费车道不多收也不白嫖
           const add = (a?: number, b?: number): number | undefined =>
             a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
@@ -751,6 +753,7 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
           completionTokens: lastUsage?.completion_tokens,
           promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
           promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
+          calls: 1 + sampleCallsOk,   // 主调用（含一次 JSON 重试的可能）+ 成功的采样调用
         });
         charged = s.charged;
         settled = true;
@@ -772,6 +775,9 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, async (c) => {
       attempts: attemptsUsed,
       prompt_tokens: lastUsage?.prompt_tokens ?? null,
       completion_tokens: lastUsage?.completion_tokens ?? null,
+      sample_prompt_tokens: sampleUsage?.prompt_tokens ?? null,
+      sample_completion_tokens: sampleUsage?.completion_tokens ?? null,
+      sample_calls_ok: sampleCallsOk,
       score_samples: scoreSamples,
       issues_total: result.issues.length,
       issues_unlocated: result.issues.filter(i => i.located === false).length,

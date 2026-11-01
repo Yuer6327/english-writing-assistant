@@ -6,8 +6,9 @@
 // 业务提示词见 prompts.ts；结果校验见 validate.ts。
 // ============================================================
 
-/** 单次 AI 请求超时（毫秒）；Cloudflare 客户端空闲超时约 100s，必须留出预算 */
-const AI_TIMEOUT_MS = 40000;
+/** 单次 AI 请求超时（毫秒）；Cloudflare 客户端空闲超时约 100s，必须留出预算。
+ *  40s 曾把 8000-token 的批改主调用（实测 33-70s 生成）掐成必现超时——提到 75s。 */
+const AI_TIMEOUT_MS = 75000;
 /** 单个批改等请求的全局时间预算（含 failover / 等待） */
 const AI_TOTAL_BUDGET_MS = 90000;
 
@@ -176,9 +177,10 @@ export async function callAI(
       return await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, true, contentParts, maxTokens, temperature, deadline);
     } catch (firstErr: any) {
       const firstMsg = String(firstErr?.message ?? '');
-      // 限流、鉴权、配置和服务端错误重试 response_format 没有意义。
+      // 限流、鉴权、配置和服务端错误重试 response_format 没有意义；
+      // abort/超时同理——不是参数问题，回退重试只会再烧一次上游计费（2026-11-01 故障复盘）。
       if (isRateLimitMessage(firstMsg) || isCloudflareEndpointBlock(firstMsg)
-        || /^AI API error (401|403|404|5\d\d)/.test(firstMsg)) {
+        || /^AI API error (401|403|404|5\d\d)/.test(firstMsg) || /abort|timed? ?out/i.test(firstMsg)) {
         throw firstErr;
       }
       console.error(`[callAI] 带 response_format 调用失败（${firstMsg || '未知错误'}），去掉该参数重试`);

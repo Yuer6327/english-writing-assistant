@@ -108,18 +108,19 @@ function parseImageDataUrl(dataUrl) {
 
 const cnNum = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
-/** 把含 **粗体** 标记的文本拆成着色分段（marked 段用 markColor，其余用 baseColor） */
-function splitMarked(text, baseColor, markColor) {
+/** 把含 **粗体** 标记的文本拆成分段：markBold=true 时 marked 段加粗（同色，伪粗双画），
+ *  否则用 markColor 着色（修改稿的蓝色改动点）。 */
+function splitMarked(text, baseColor, markColor, markBold = false) {
   const segs = [];
   for (const p of String(text || '').split(/(\*\*[^*]+\*\*)/g)) {
     if (!p) continue;
     const m = p.match(/^\*\*([^*]+)\*\*$/);
-    segs.push({ text: m ? m[1] : p, color: m ? markColor : baseColor });
+    segs.push(m
+      ? { text: m[1], color: markBold ? baseColor : markColor, bold: markBold }
+      : { text: p, color: baseColor });
   }
   return segs.length ? segs : [{ text: '', color: baseColor }];
 }
-
-const CAP_NOTE = '注：总分满分 25 分，系统内上限 22 分；词数不足（少于 100 词）扣 5 分、超过（多于 500 词）扣 3 分。';
 
 export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifBytes, topicImages = [] }) {
   const pdfDoc = await PDFLib.PDFDocument.create();
@@ -214,12 +215,12 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
         const tw = width(tok, size);
         // 连续禁排字符：新空行以禁排字符开头时并入上一行行尾（否则会产出单标点孤行）
         if (line.length === 0 && lines.length && tok.length === 1 && BANNED_HEAD.test(tok)) {
-          lines[lines.length - 1].push({ text: tok, color: seg.color, w: tw, font: charFont(tok) });
+          lines[lines.length - 1].push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
           continue;
         }
         if (w + tw > maxW && line.length) {
           if (tok.length === 1 && BANNED_HEAD.test(tok)) {
-            line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok) });
+            line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
             lines.push(line);
             line = []; w = 0;
             continue;
@@ -235,7 +236,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
           }
           if (tok === ' ') continue;
         }
-        line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok) });
+        line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
         w += tw;
       }
     }
@@ -243,11 +244,14 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     return lines.length ? lines : [[]];
   }
 
-  /** 画一行富文本（runs 由 wrapRuns 产出，含各自字体） */
+  /** 画一行富文本（runs 由 wrapRuns 产出，含各自字体）；bold 段伪粗双画 */
   function drawRunLine(runs, x, y, size) {
     let cx = x;
     for (const r of runs) {
-      if (r.text) page.drawText(r.text, { x: cx, y, size, font: r.font, color: r.color });
+      if (r.text) {
+        page.drawText(r.text, { x: cx, y, size, font: r.font, color: r.color });
+        if (r.bold) page.drawText(r.text, { x: cx + 0.3, y, size, font: r.font, color: r.color });
+      }
       cx += r.w;
     }
   }
@@ -376,7 +380,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
   /** 强调框：左侧彩色竖条 + 彩色标签 + 黑色正文（用于亮点/最该改） */
   function drawCallout(label, text, color) {
     const size = 10, lh = size * 1.5, barW = 2.5, padX = 9;
-    const segs = [{ text: `${label}　`, color }, ...splitMarked(cleanText(text), C.ink, C.blue)];
+    const segs = [{ text: `${label}　`, color }, ...splitMarked(cleanText(text), C.ink, C.ink, true)];
     const lines = wrapRuns(segs, size, P.contentW - barW - padX * 2);
     const h = lines.length * lh + 10;
     ensure(h + 6);
@@ -614,7 +618,6 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
 
   // ── 多稿时：各稿得分总览表 ──
   const drafts = Array.isArray(data.drafts) ? data.drafts : [];
-  let capNoteDrawn = false;
   if (drafts.length > 1) {
     const rows = drafts.map((d, i) => {
       const r = d.review;
@@ -646,9 +649,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     });
     drawSubHead('各稿得分总览', null, tb.keepBlock);
     tb.draw();
-    cursor -= 4;
-    drawFootnote(CAP_NOTE);
-    capNoteDrawn = true;
+    cursor -= 6;
   }
 
   if (!drafts.length) {
@@ -694,7 +695,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
       t(dim, C.ink, 'center'),
       t(full, C.ink, 'center'),
       t(val ?? 0, C.ink, 'center'),
-      t(cleanText(txt) || '—', txt ? C.ink : C.gray),
+      { segs: txt ? splitMarked(cleanText(txt), C.ink, C.ink, true) : [{ text: '—', color: C.gray }] },
     ]);
     const pen = typeof r.word_count_penalty === 'number' ? r.word_count_penalty : 0;
     const totalBasis = [
@@ -715,11 +716,6 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     });
     drawSubHead('得分与依据', null, tb.keepBlock);
     tb.draw();
-    if (!capNoteDrawn) {
-      cursor -= 2;
-      drawFootnote(CAP_NOTE);
-      capNoteDrawn = true;
-    }
     cursor -= 4;
 
     // 突出优点 / 主要问题（评语惯用书面语，替代口语化的「亮点/最该改」）
@@ -730,13 +726,15 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     if (r.issues && r.issues.length) {
       const rows = r.issues.map(iss => {
         const sev = SEV[iss.severity] || SEV.minor;
-        const quoteParas = [[{ text: `“${cleanText(iss.quote) || '—'}”`, color: C.ink }]];
+        const quoteTxt = cleanText(iss.quote) || '—';
+        const quoteParas = [splitMarked(iss.quote ? `“${quoteTxt}”` : quoteTxt, C.ink, C.ink, true)];
         const probParas = [
           [{ text: sev.label, color: sev.color }, { text: ` · ${cleanText(iss.type) || '问题'}`, color: C.ink }],
         ];
-        if (iss.explanation) probParas.push([{ text: cleanText(iss.explanation), color: C.ink }]);
+        if (iss.explanation) probParas.push(splitMarked(cleanText(iss.explanation), C.ink, C.ink, true));
         if (iss.located === false) probParas.push([{ text: '（原文中未找到该句）', color: C.gray }]);
-        const fixParas = [[{ text: cleanText(iss.correction) || '—', color: iss.correction ? C.ink : C.gray }]];
+        const fixTxt = cleanText(iss.correction);
+        const fixParas = [fixTxt ? splitMarked(fixTxt, C.ink, C.ink, true) : [{ text: '—', color: C.gray }]];
         return [tParas(quoteParas), tParas(probParas), tParas(fixParas)];
       });
       const tb = measureTable({
@@ -760,7 +758,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
       drawSubHead('提升建议', null, 22);
       r.suggestions.forEach((s, k) => {
         drawHanging(
-          [{ text: `${k + 1}. `, color: C.ink }, { text: cleanText(s), color: C.ink }],
+          [{ text: `${k + 1}. `, color: C.ink }, ...splitMarked(cleanText(s), C.ink, C.ink, true)],
           { size: 10, indent: 16 },
         );
       });
@@ -789,7 +787,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
         cursor -= 15;
         for (const item of arr) {
           drawHanging(
-            [{ text: '· ', color: C.ink }, { text: cleanText(item), color: C.ink }],
+            [{ text: '· ', color: C.ink }, ...splitMarked(cleanText(item), C.ink, C.ink, true)],
             { size: 9.5, indent: 12, itemGap: 3 },
           );
         }

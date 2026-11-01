@@ -8,7 +8,7 @@ import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor, refreshBalancePill,
 } from './api.js?v=20261031a';
-import { openExportModal, closeExportModal } from './export.js?v=20261101d';
+import { openExportModal, closeExportModal } from './export.js?v=20261101e';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
@@ -740,7 +740,7 @@ function renderReview() {
               <div class="score-bar-track"><div class="score-bar-fill" style="width:${(b.val / b.max) * 100}%"></div></div>
               <span class="val">${b.val}/${b.max}</span>
             </div>
-            ${b.basis ? `<div class="basis-line">${escapeHtml(b.basis)}</div>` : ''}
+            ${b.basis ? `<div class="basis-line">${renderBold(b.basis)}</div>` : ''}
           </div>`).join('')}
       </div>
     </div>`;
@@ -770,9 +770,9 @@ function renderReview() {
       <div class="issue-thead"><span>原句</span><span>问题点</span><span>建议修改</span></div>
       ${r.issues.map((iss, i) => `
       <div class="issue-trow sev-${sevOf(iss)}" data-issue-card="${i}" style="--row-i:${Math.min(i, 8)}">
-        <div class="issue-cell c-quote"><span class="cell-label">原句</span><span class="issue-quote">"${escapeHtml(iss.quote)}"</span></div>
-        <div class="issue-cell c-problem"><span class="cell-label">问题点</span><span class="issue-type-tag">${escapeHtml(iss.type)}</span>${iss.type === '识别存疑' ? '<span class="chip doubt">可能是识别错误</span>' : ''}${iss.located === false ? '<span class="chip">原文中未找到</span>' : ''}<p class="issue-exp">${escapeHtml(iss.explanation) || '—'}</p></div>
-        <div class="issue-cell c-fix"><span class="cell-label">建议修改</span><p class="issue-arrow">${escapeHtml(iss.correction) || '—'}</p></div>
+        <div class="issue-cell c-quote"><span class="cell-label">原句</span><span class="issue-quote">"${renderBold(iss.quote)}"</span></div>
+        <div class="issue-cell c-problem"><span class="cell-label">问题点</span><span class="issue-type-tag">${escapeHtml(iss.type)}</span>${iss.type === '识别存疑' ? '<span class="chip doubt">可能是识别错误</span>' : ''}${iss.located === false ? '<span class="chip">原文中未找到</span>' : ''}<p class="issue-exp">${renderBold(iss.explanation) || '—'}</p></div>
+        <div class="issue-cell c-fix"><span class="cell-label">建议修改</span><p class="issue-arrow">${renderBold(iss.correction) || '—'}</p></div>
       </div>`).join('')}
     </div>`;
   }
@@ -785,7 +785,7 @@ function renderReview() {
 
   if (r.suggestions && r.suggestions.length) {
     html += `<div class="section-title">提升建议</div><ul style="margin-left:20px;line-height:2">${
-      r.suggestions.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul>`;
+      r.suggestions.map(s => `<li>${renderBold(s)}</li>`).join('')}</ul>`;
   }
 
   if (r.improvement) {
@@ -798,9 +798,9 @@ function renderReview() {
           <span style="font-size:13px;color:var(--text-soft)">较上一稿</span>
         </div>
         <div class="improve-lists">
-          ${imp.fixed?.length ? `<div>✅ 已解决：<ul>${imp.fixed.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>` : ''}
-          ${imp.remaining?.length ? `<div>⏳ 仍存在：<ul>${imp.remaining.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>` : ''}
-          ${imp.regression?.length ? `<div>⚠ 新引入：<ul>${imp.regression.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul></div>` : ''}
+          ${imp.fixed?.length ? `<div>✅ 已解决：<ul>${imp.fixed.map(x => `<li>${renderBold(x)}</li>`).join('')}</ul></div>` : ''}
+          ${imp.remaining?.length ? `<div>⏳ 仍存在：<ul>${imp.remaining.map(x => `<li>${renderBold(x)}</li>`).join('')}</ul></div>` : ''}
+          ${imp.regression?.length ? `<div>⚠ 新引入：<ul>${imp.regression.map(x => `<li>${renderBold(x)}</li>`).join('')}</ul></div>` : ''}
         </div>
       </div>`;
   }
