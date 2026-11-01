@@ -7,7 +7,7 @@
 // ============================================================
 
 import { loadScript, toast, gradeFor } from './api.js?v=20261031a';
-import { buildPdfBlob } from './pdf-report.js?v=20261101e';
+import { buildPdfBlob } from './pdf-report.js?v=20261101f';
 
 // ── CDN 资源 ──
 // 脚本带 SRI（sha384）：镜像被投毒时浏览器拒绝执行，供应链风险收敛为「不可用」而非「任意代码」。
