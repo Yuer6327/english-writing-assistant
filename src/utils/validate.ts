@@ -7,6 +7,7 @@
 import type {
   ReviewResult, ReviewIssue, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
 } from '../types';
+import { scanInjection, scrubAuthorityClaims, unmarkSpans } from './injection';
 
 /** 分数收敛到 [min, max] 的整数 */
 function safeScore(v: unknown, min: number, max: number, fallback = 0): number {
@@ -67,10 +68,12 @@ function boolFlag(v: unknown): boolean | null {
 /**
  * 按 argumentation 自评 + 服务端钳制规则收敛一组分项分。
  * 供 sanitizeReview 与独立打分采样（essays.ts 3 采样取中位数）共用，保证口径一致。
+ * @param caps 额外的硬顶（注入命中时下压：可疑稿按从严尺度处理，掐掉"刷到上限"的收益）
  */
 export function clampSubscores(
   arg: any,
   sub: any,
+  caps?: { content?: number; language?: number; organization?: number },
 ): { content: number; language: number; organization: number } {
   const hasExamples = boolFlag(arg?.has_examples);
   const hasSolution = boolFlag(arg?.has_solution);
@@ -78,16 +81,22 @@ export function clampSubscores(
   let content = safeScore(sub?.content, 0, 9);
   if (hasExamples === false) content = reconcileScore(content, CONTENT_CAP_NO_EXAMPLES);
   if (hasSolution === false) content = reconcileScore(content, CONTENT_CAP_NO_SOLUTION);
+  if (caps?.content !== undefined) content = reconcileScore(content, caps.content);
 
   let language = safeScore(sub?.language, 0, 9);
   if (hasSolution === false) language = reconcileScore(language, LANGUAGE_CAP_NO_SOLUTION);
+  if (caps?.language !== undefined) language = reconcileScore(language, caps.language);
 
   // 结构定档用钳制前的内容分 + 钳制前的语言分（语义同 sanitizeReview：追加惩罚不二次连锁）
   let organization = safeScore(sub?.organization, 0, 4);
   if (content + safeScore(sub?.language, 0, 9) < 15) organization = Math.min(organization, 3);
+  if (caps?.organization !== undefined) organization = reconcileScore(organization, caps.organization);
 
   return { content, language, organization };
 }
+
+/** 注入命中时的分项硬顶：内容 ≤8、语言 ≤8、结构 ≤3 → 总分 ≤19（常态上限 22） */
+export const INJECTION_SCORE_CAPS = { content: 8, language: 8, organization: 3 } as const;
 
 /**
  * 分数采样聚合：奇数个取中位数；偶数个取均值后向下取整（方向偏严，符合「压低」口径）。
@@ -101,22 +110,31 @@ export function medianScore(values: number[]): number {
 /**
  * 校验并净化批改结果。
  * @param parsed    AI 返回的 JSON
- * @param essayText 学生作文原文（quote 命中校验基准）
+ * @param essayText 学生作文原文（quote 命中校验基准；应为 stripInvisible 之后的文本）
  * @param expectsImprovement 二稿及以上 → 要求 improvement 字段
+ * @param opts.harden 输入侧检出高置信注入 → 分数硬顶下压 + 剥离伪造权威评语
  * @throws Error 整体不合法（触发上层严格重试）
  */
-export function sanitizeReview(parsed: any, essayText: string, expectsImprovement: boolean): ReviewResult {
+export function sanitizeReview(
+  parsed: any,
+  essayText: string,
+  expectsImprovement: boolean,
+  opts?: { harden?: boolean },
+): ReviewResult {
   if (!parsed || typeof parsed !== 'object') throw new Error('AI 返回不是 JSON 对象');
 
+  const harden = !!opts?.harden;
   const basis = parsed.basis ?? {};
 
   // 评分纪律封顶（与提示词一致）：分项 ≤9/≤9/≤4 → 总分 ≤22；结构另受定档规则约束
+  // 注入命中时再叠一层硬顶（≤8/≤8/≤3 → ≤19）：可疑稿从严，掐掉"刷到上限"的收益
   const arg = parsed.argumentation ?? {};
   const hasExamples = boolFlag(arg.has_examples);
   const hasSolution = boolFlag(arg.has_solution);
   const modelContent = safeScore(parsed.subscores?.content, 0, 9);
   const modelLanguage = safeScore(parsed.subscores?.language, 0, 9);
-  const { content, language, organization } = clampSubscores(arg, parsed.subscores);
+  const { content, language, organization } = clampSubscores(
+    arg, parsed.subscores, harden ? INJECTION_SCORE_CAPS : undefined);
 
   const sum = content + language + organization;
   // 词数扣分：硬阈值，服务端自算，模型不参与（分项保持模型判定的原始分，只在总分上扣）
@@ -127,12 +145,13 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
   const finalScore = Math.max(0, sum - wordPenalty);
 
   // quote 命中校验：先原文 substring，再空白归一比对
+  // （输入侧 datamark 的 ⟦⟧ 先剥掉：模型若把标记抄进 quote，仍应能命中原文）
   const normEssay = normWs(essayText);
   const issues: ReviewIssue[] = [];
   if (Array.isArray(parsed.issues)) {
     for (const raw of parsed.issues) {
       if (!raw || typeof raw !== 'object') continue;
-      const quote = str(raw.quote, 600).trim();
+      const quote = unmarkSpans(str(raw.quote, 600)).trim();
       if (quote.length < 2) continue;
       const hit = essayText.includes(quote) || normEssay.includes(normWs(quote));
       const type = ISSUE_TYPES.includes(raw.type) ? raw.type : '其他';
@@ -152,21 +171,41 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
   // 可定位的问题优先展示；未定位项保留说明但不绘制高亮。
   issues.sort((a, b) => Number(b.located !== false) - Number(a.located !== false));
 
-  const revised = str(parsed.revised_essay, 20000);
-  const highlight = str(parsed.highlight, 300);
-  const priority = str(parsed.priority, 300);
+  // ── 评语清洗（输出侧）──
+  // 注入成功后的典型二次产物是「三位阅卷专家一致评为满分」这类编造论据：
+  // 既无原文依据，也不属于评语规范，整句剥离；分数不动（分数由服务端钳制）。
+  const cleanedBasis = {
+    content: scrubAuthorityClaims(str(basis.content, 600)),
+    language: scrubAuthorityClaims(str(basis.language, 600)),
+    organization: scrubAuthorityClaims(str(basis.organization, 600)),
+  };
+  const claimsScrubbed = cleanedBasis.content.removed + cleanedBasis.language.removed
+    + cleanedBasis.organization.removed;
+  const cleanedHighlight = scrubAuthorityClaims(str(parsed.highlight, 300));
+  const cleanedPriority = scrubAuthorityClaims(str(parsed.priority, 300));
+
+  // 修改稿回流检测：原文干净但修改稿里冒出注入指令 → 模型把攻击文本抄进了产出
+  let revised = str(parsed.revised_essay, 20000);
+  let revisedDropped = false;
+  if (revised && scanInjection(revised).level === 'high' && scanInjection(essayText).level !== 'high') {
+    revised = '';
+    revisedDropped = true;
+  }
+
+  const highlight = cleanedHighlight.text;
+  const priority = cleanedPriority.text;
 
   // 整体合法性：修改全文 / 分项依据 / 问题清单 / 亮点·优先点至少有一项非空
-  const hasBasis = !!(basis.content || basis.language || basis.organization);
+  const hasBasis = !!(cleanedBasis.content.text || cleanedBasis.language.text || cleanedBasis.organization.text);
   if (!revised && !hasBasis && issues.length === 0 && !highlight && !priority) {
     throw new Error('批改结果为空（缺少依据/问题清单/修改全文）');
   }
 
   const result: ReviewResult = {
     basis: {
-      content: str(basis.content, 600),
-      language: str(basis.language, 600),
-      organization: str(basis.organization, 600),
+      content: cleanedBasis.content.text,
+      language: cleanedBasis.language.text,
+      organization: cleanedBasis.organization.text,
     },
     subscores: { content, language, organization },
     score: finalScore,
@@ -183,6 +222,13 @@ export function sanitizeReview(parsed: any, essayText: string, expectsImprovemen
       has_solution: hasSolution,
       model_content: modelContent,   // 模型原始内容分（审计：看被服务端压了多少）
       model_language: modelLanguage, // 模型原始语言分（审计用）
+    },
+    // 完整性审计（注入/幻觉类信号；前端只在 injection_flagged 时展示提示条）
+    integrity: {
+      injection_flagged: harden,
+      claims_scrubbed: claimsScrubbed,
+      quotes_unlocated: issues.filter(i => i.located === false).length,
+      revised_dropped: revisedDropped,
     },
   };
 

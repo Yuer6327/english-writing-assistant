@@ -129,6 +129,7 @@
 | 调试后门 | `GET /api/auth/dev-session` | 需 `.dev.vars` 里 `ENABLE_DEV_SESSION=1` **且** 本地 auth-db 有测试会话行才发 Cookie；生产不配置该变量 → 恒 404。**不要用 Host 判断**：`wrangler dev` 会把请求 URL/Host 重写成 `routes` 里的生产域名 |
 | 计费 | `hold → settle/release` | **入参校验必须放在 `hold` 之前**，否则 400 早退会留下未释放的冻结额度（要等 cron 过期才对账）；免费档带 `skipQuota`，次数由 `quota_events` 计 |
 | 入参 | 自增 id 统一走 `parseId()`；文本长度封顶 | 新增/修改稿件同为 `MAX_ESSAY_CHARS`；BYOK 端点只允许 https（本地环回除外） |
+| 提示词注入 | `utils/injection.ts` 三层：入库剥不可见字符 → 规则族检测（只标记不硬拦）→ 高置信时 datamark + 服务端分项硬顶 ≤8/≤8/≤3 | **威胁模型是"用户本人就是攻击者"**（学生给自己刷分），所以措辞类防御不算边界，真边界是 `sanitizeReview` 的钳制。详见 `docs/INJECTION.md`；改规则后必跑 `npm run inj:test` |
 
 ## 前端 UI 约定
 
@@ -144,7 +145,8 @@ npm run dev            # wrangler dev → http://localhost:8788
 npm run typecheck      # tsc --noEmit
 npm run csp:check      # 校验 CSP 内联脚本哈希（CI 必跑）
 npm run csp:hash       # 打印当前 HTML 内联脚本哈希（改完 HTML 用）
-npm run check          # typecheck + csp:check（部署前一条命令）
+npm run inj:test       # 注入防护回归（攻击样本必须 high / 正常样本不得 high / 服务端钳制）
+npm run check          # typecheck + csp:check + inj:test（部署前一条命令）
 npm run db:migrate     # 本地 D1 迁移（db:migrate:remote 为生产）
 npm run deploy         # 部署（自动维护 writing.yuer6327.top/* 路由）
 ```

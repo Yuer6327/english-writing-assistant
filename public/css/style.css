@@ -600,8 +600,11 @@ input[type="file"]::file-selector-button:hover {
 .verdict-banner b { flex-shrink: 0; font-size: 12px; letter-spacing: .5px; }
 .verdict-banner.focus { border: 1px solid rgba(214,69,69,.35); background: var(--danger-soft); }
 .verdict-banner.good { border: 1px solid rgba(47,107,63,.35); background: var(--success-soft); }
+.verdict-banner.warn { border: 1px dashed var(--border); background: var(--warning-soft); color: var(--text-light); }
+.verdict-banner.warn b { color: var(--warning); }
 [data-theme="dark"] .verdict-banner.focus b { color: #e08585; }
 [data-theme="dark"] .verdict-banner.good b { color: #8fc79a; }
+[data-theme="dark"] .verdict-banner.warn b { color: #d8c48a; }
 
 /* ── 分项依据（跟在分数条下方）── */
 .score-bar-group { display: flex; flex-direction: column; gap: 3px; }

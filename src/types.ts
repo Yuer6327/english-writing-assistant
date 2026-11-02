@@ -77,6 +77,13 @@ export interface ReviewResult {
     model_content: number;              // 模型原始内容分（审计用）
     model_language: number;             // 模型原始语言分（审计用）
   };
+  /** 完整性审计：注入防护在各处拦下/清理了什么（旧记录无此字段） */
+  integrity?: {
+    injection_flagged: boolean;         // 输入侧检出高置信注入 → 分数已按从严尺度下压
+    claims_scrubbed: number;            // 被剥离的"伪造外部权威"评语句数
+    quotes_unlocated: number;           // quote 未能命中原文的条数
+    revised_dropped: boolean;           // 修改稿含注入回流，已丢弃
+  };
 }
 
 /** 片段精修结果 */

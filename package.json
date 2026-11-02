@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "csp:check": "node scripts/csp-hash.js",
     "csp:hash": "node scripts/csp-hash.js --print",
-    "check": "npm run typecheck && npm run csp:check",
+    "inj:test": "esbuild scripts/injection-test.mjs scripts/review-guard-test.mjs --bundle --format=esm --platform=node --outdir=.wrangler/test --log-level=warning && node .wrangler/test/injection-test.js && node .wrangler/test/review-guard-test.js",
+    "check": "npm run typecheck && npm run csp:check && npm run inj:test",
     "secret:key": "wrangler secret put ENCRYPTION_KEY"
   },
   "dependencies": {

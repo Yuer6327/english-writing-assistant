@@ -766,6 +766,12 @@ function renderReview() {
       </div>
     </div>`;
 
+  // 注入防护提示：只在检出高置信评分指令时展示。
+  // 文案不复述命中的原文、不暴露规则，避免变成"怎么绕过"的教学。
+  if (r.integrity && r.integrity.injection_flagged) {
+    html += `<div class="verdict-banner warn"><b>已忽略</b>文中的评分指令与「专家已评分」声称，按正文实际水平评分</div>`;
+  }
+
   // 两句结论：最优先改进点 + 一个具体亮点（旧记录无此字段则不渲染）
   if (r.priority) {
     html += `<div class="verdict-banner focus"><b>最该改</b>${escapeHtml(r.priority)}</div>`;

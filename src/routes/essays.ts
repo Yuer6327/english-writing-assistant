@@ -22,8 +22,11 @@ import {
 } from '../utils/prompts';
 import {
   countWords, sanitizeReview, sanitizeFragmentPolish, sanitizeFullRewrite,
-  clampSubscores, medianScore, normalizeReviewShape,
+  clampSubscores, medianScore, normalizeReviewShape, INJECTION_SCORE_CAPS,
 } from '../utils/validate';
+import {
+  stripInvisible, scanInjection, markSuspiciousSpans, summarizeInjection, type InjectionReport,
+} from '../utils/injection';
 import { seedSampleEssay } from '../sample/seed';
 import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
 
@@ -378,7 +381,9 @@ api.post('/essays/:id/drafts', userMiddleware, async (c) => {
   ).bind(essayId, userId).first();
   if (!essay) return c.json({ error: '作文不存在' }, 404);
 
-  const text = strField(body.text).replace(/\r\n/g, '\n').trim();
+  // 入库即剥离零宽 / bidi / Unicode Tag 等不可见字符：批改时的 quote 基准、
+  // 前端高亮与导出必须用同一份文本，否则藏起来的指令会在送模型时才生效。
+  const text = stripInvisible(strField(body.text)).text.replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
   if (text.length > MAX_ESSAY_CHARS) return c.json({ error: '稿件内容过长' }, 400);
 
@@ -441,7 +446,7 @@ api.put('/drafts/:id', userMiddleware, async (c) => {
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
   const body = ((await c.req.json<{ text?: string }>().catch(() => null)) ?? ({} as any));
 
-  const text = strField(body.text).replace(/\r\n/g, '\n').trim();
+  const text = stripInvisible(strField(body.text)).text.replace(/\r\n/g, '\n').trim();
   if (text.length < 10) return c.json({ error: '稿件内容过短' }, 400);
   // 与新建稿件同一条上限，避免绕过前端直接写超长文本撑爆 D1 行体积
   if (text.length > MAX_ESSAY_CHARS) return c.json({ error: '稿件内容过长' }, 400);
@@ -561,16 +566,34 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   }
 
   const topicImages = parseJsonField<string[]>(essay.topic_images, []);
-  const topic = essay.topic_text + (topicImages.length ? '\n（题目配有图片，见本消息附图）' : '');
+
+  // ── 输入侧防护（提示词注入）──
+  // 稿件入库时已剥过不可见字符，这里再洗一次兜住存量数据（幂等）。
+  // essayText 同时作为「送模型的作文」与「quote 校验基准」，两处必须同一份文本。
+  const cleaned = stripInvisible(draft.text);
+  const essayText = cleaned.text;
+  const injection = scanInjection(essayText, cleaned.removed, cleaned.tagged);
+  // 题面同样是学生可控文本（可自填题目），命中高置信注入时与正文同等处理；
+  // 题目里写「满分 25 分」只到 suspicious，不触发降分。
+  const topicClean = stripInvisible(essay.topic_text);
+  const topicInjection = scanInjection(topicClean.text, topicClean.removed, topicClean.tagged);
+  const harden = injection.level === 'high' || topicInjection.level === 'high';
+  const topicBase = topicInjection.level === 'high'
+    ? markSuspiciousSpans(topicClean.text, topicInjection.spans)
+    : topicClean.text;
+  const topic = topicBase + (topicImages.length ? '\n（题目配有图片，见本消息附图）' : '');
+  // 高置信注入 → 可疑片段打 ⟦⟧ 标记（datamark）：模型据此把它当"被标记的数据"而非指令
+  const essayForPrompt = harden ? markSuspiciousSpans(essayText, injection.spans) : essayText;
 
   const { system: reviewSystem, user: reviewUser } = buildReviewMessages(template, promptSource, {
     topic,
-    essay: draft.text,
-    word_count: String(countWords(draft.text)),
+    essay: essayForPrompt,
+    word_count: String(countWords(essayText)),
     previous_feedback: prevReview
       ? buildPreviousFeedbackBlock(prevReview.score, prevReview.issues)
       : '',
-  });
+  }, { harden });
+
 
   // 模型配置解析（车道已在门禁前确定）
   let cfg: ResolvedConfig;
@@ -630,7 +653,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     let sampleUsage: AIResult['usage'];
     let sampleCallsOk = 0;
     if (scoreDeadline - Date.now() > 5_000) {
-      const scoreUser = buildScoreOnlyUser(topic, draft.text, countWords(draft.text));
+      const scoreUser = buildScoreOnlyUser(topic, essayForPrompt, countWords(essayText), harden);
       const rescores = await Promise.allSettled([
         callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
         callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
@@ -662,7 +685,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           if (!j || typeof j !== 'object' || !j.subscores) throw new Error('采样输出缺少 subscores');
           const arg = j.argumentation ?? {};
           sampleSignals.push({
-            subscores: clampSubscores(arg, j.subscores),
+            subscores: clampSubscores(arg, j.subscores, harden ? INJECTION_SCORE_CAPS : undefined),
             hasExamples: typeof arg.has_examples === 'boolean' ? arg.has_examples : null,
             hasSolution: typeof arg.has_solution === 'boolean' ? arg.has_solution : null,
           });
@@ -671,6 +694,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     }
 
     // 3 个有效样本且为内置默认模板（有注入位）→ 中位数定档；布尔判定取多数（平票/全缺视为未知 → 不钳制）
+    // 注入命中时改取最小值：三次采样都会被同一段注入污染，中位数救不了；取最小值才逼近"干净时该给的分"
+    const aggregate = harden ? (v: number[]) => Math.min(...v) : medianScore;
     let agreed: { content: number; language: number; organization: number } | null = null;
     let agreedArg: { has_examples: boolean; has_solution: boolean } | null = null;
     if (sampleSignals.length >= 3 && promptSource === 'default') {
@@ -683,9 +708,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         has_solution: majority(sampleSignals.map(s => s.hasSolution)),
       };
       agreed = {
-        content: medianScore(sampleSignals.map(s => s.subscores.content)),
-        language: medianScore(sampleSignals.map(s => s.subscores.language)),
-        organization: medianScore(sampleSignals.map(s => s.subscores.organization)),
+        content: aggregate(sampleSignals.map(s => s.subscores.content)),
+        language: aggregate(sampleSignals.map(s => s.subscores.language)),
+        organization: aggregate(sampleSignals.map(s => s.subscores.organization)),
       };
     }
 
@@ -728,7 +753,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
             code: 'essay_illegible',
           }, 422);
         }
-        result = sanitizeReview(parsed, draft.text, !!prevReview);
+        result = sanitizeReview(parsed, essayText, !!prevReview, { harden });
         // 定档覆盖：分项分以采样中位数为准（口径一致性由 clampSubscores 保证），
         // 主调用只负责举证与展开——basis 与交付分数从此必然一致
         if (agreed) {
@@ -777,9 +802,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     if (!agreed && sampleSignals.length > 0) {
       const samples = [result.subscores, ...sampleSignals.map(s => s.subscores)];
       result.subscores = {
-        content: medianScore(samples.map(s => s.content)),
-        language: medianScore(samples.map(s => s.language)),
-        organization: medianScore(samples.map(s => s.organization)),
+        content: aggregate(samples.map(s => s.content)),
+        language: aggregate(samples.map(s => s.language)),
+        organization: aggregate(samples.map(s => s.organization)),
       };
       // 总分随中位数重算（词数扣分不变）
       result.score = Math.max(0,
@@ -824,6 +849,14 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       issues_total: result.issues.length,
       issues_unlocated: result.issues.filter(i => i.located === false).length,
       prompt_source: promptSource,
+      // 注入防护审计：命中族、分值、被标记片段数、被剥离的伪权威评语数
+      injection: {
+        essay: summarizeInjection(injection),
+        topic: summarizeInjection(topicInjection),
+        spans_marked: harden ? injection.spans.length + topicInjection.spans.length : 0,
+        invisible_removed: cleaned.removed,
+      },
+      integrity: result.integrity ?? null,
     });
 
     // 结果与成功计次同一事务；游客「每稿一次」由唯一索引和条件插入硬约束。
@@ -835,12 +868,12 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
              SELECT 1 FROM quota_events
               WHERE user_id = ? AND draft_id = ? AND kind = 'review'
            )`,
-      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, draft.text, meta,
+      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, essayText, meta,
         userId, draftId)
       : c.env.DB.prepare(
         `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text, meta)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, draft.text, meta)];
+      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, essayText, meta)];
     if (lane === 'free') stmts.push(successStmt(c.env.DB, userId, 'review', draft.essay_id, draftId));
 
     let insert: { meta: { last_row_id: number | null; changes: number } } | null = null;
@@ -875,6 +908,11 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       prompt_source: promptSource,
       model,
       result,
+      // 输入侧检出疑似元指令时告知前端（前端只展示一句"已忽略文中的评分指令"，
+      // 不给攻击者任何"差一点就成功"的反馈，也不暴露命中规则）
+      injection: (harden || injection.level !== 'clean' || topicInjection.level !== 'clean')
+        ? { level: harden ? 'high' as const : 'suspicious' as const, flagged: harden }
+        : undefined,
       points_charged: charged,          // 微积分（前端 ÷10000 展示为积分）
       lane: laneLabel(lane),            // free / paid / byok
       quota: await quotaState(c.env.DB, userId, isGuest),
