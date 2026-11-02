@@ -3,6 +3,8 @@
 面向 AI 编码助手（Claude Code / ZCode 等）的项目地图。本项目为 [english-reading-assistant](../english-reading-assistant) 的姊妹项目，架构与基础设施（加密 / 限流 / AI 调用层 / SPA 前端）复用自该项目的成熟实现，业务层围绕"作文批改教学"重写。
 
 > **待办任务清单见 [`docs/AUDIT.md`](docs/AUDIT.md)**（2026-10-27 全站审查：P0×5 / P1×12 / P2×7 + 功能建议 + 明确不做清单）。动手改提示词、计费、并发写入前先看那里的 P0 条目与「不可违反的既有约束」。
+>
+> **安全缺口见 [`docs/SECURITY-GAPS.md`](docs/SECURITY-GAPS.md)**（2026-11-02：自适应攻击 / 题图多模态注入 / 刷分监控三份工单）。提示词注入的现有防线与设计理由见 [`docs/INJECTION.md`](docs/INJECTION.md)。
 
 ## 线上地址与部署形态
 
