@@ -401,7 +401,27 @@ export async function callAIStreaming(
         }
         if (done) break;
       }
-      if (!content.trim()) throw new Error(`AI 返回空内容（${endpointUrl}）`);
+      // 上游不认 stream:true（部分代理/网关）会返回 200 + 普通 JSON body：
+      // 此时逐帧解析得空内容。body 整体是 JSON 就地解析回退，避免误报"空内容"，
+      // 也不再补发第二次请求（零额外成本）。usage 一并提取（结算准确性）。
+      if (!content.trim()) {
+        const whole = buf.trim();
+        if (whole.startsWith('{')) {
+          try {
+            const j = JSON.parse(whole);
+            const text = j.choices?.[0]?.message?.content ?? j.choices?.[0]?.text ?? '';
+            if (typeof text === 'string' && text.trim()) {
+              console.error('[callAI] 流式请求收到非流式 JSON body，已就地解析');
+              const u = j.usage;
+              const usage = u && typeof u.prompt_tokens === 'number'
+                ? { prompt_tokens: u.prompt_tokens, completion_tokens: u.completion_tokens ?? 0 }
+                : undefined;
+              return { content: text, usage };
+            }
+          } catch { /* 非 JSON，按空内容处理 */ }
+        }
+        throw new Error(`AI 返回空内容（${endpointUrl}）`);
+      }
       return { content, usage };
     } catch (err: any) {
       if (/abort/i.test(String(err?.message ?? '')) && Date.now() < deadline) {
@@ -526,6 +546,11 @@ async function callAIFetch(
 
 /** 尝试从 AI 返回中解析 JSON（容错）*/
 export function extractJSON(text: string): any {
+  if (typeof text !== 'string' || !text.trim()) {
+    // 上游异常（限速打穿 / 网关剥空 body）可能给出 undefined/空串：
+    // 直接给可读错误，避免落到正则分支上报 "reading 'match' of undefined"
+    throw new Error('AI 返回内容为空');
+  }
   try {
     return JSON.parse(text);
   } catch { /* continue */ }

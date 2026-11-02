@@ -38,7 +38,7 @@ export interface InjectionReport {
   score: number;
   hits: number;
   families: InjectionFamily[];
-  /** 命中片段（最多 8 条，按位置排序），供审计与 datamark */
+  /** 命中片段（最多 MAX_SPANS 条，按位置排序），供审计与 datamark */
   spans: InjectionSpan[];
   /** 被剥掉的不可见字符数（原始文本 → 清洗后） */
   removed_invisible: number;
@@ -150,7 +150,7 @@ const RULES: Rule[] = [
   // `give me / give this essay full marks` 才是对评分者下指令。
   {
     family: 'score_demand', label: '索要分数', weight: 10, strong: true,
-    re: /\b(?:give|award|assign|grant)\s+(?:me|my (?:essay|writing|composition)|this (?:essay|composition|paper|writing)|it)\b[^.!?\n]{0,25}\b(?:full|maximum|perfect|top|25)\b/gi,
+    re: /\b(?:give|award|assign|grant)\s+(?:me|my (?:essay|writing|composition)|this (?:essay|composition|paper|writing)|it)\b[^.!?\n]{0,25}\b(?:full|maximum|perfect|top|highest|25)\b/gi,
   },
   {
     family: 'score_demand', label: '索要分数', weight: 9, strong: true,
@@ -204,7 +204,9 @@ function saturation(totalWeight: number): number {
 const HIGH_SCORE = 45;        // ≥45 → high（动作：datamark + 输出侧硬化 + 前端提示）
 const SUSPICIOUS_SCORE = 20;  // ≥20 → suspicious（只记录）
 const SAME_FAMILY_DECAY = 0.6;
-const MAX_SPANS = 8;
+// span 上限：同时是 datamark / 盲评 redact / 证据 void 的预算。8 太容易被
+// "前置弱规则诱饵"饱和（8 个诱饵吃光预算，第 9+ 条真实 payload 裸奔）→ 放宽到 32
+const MAX_SPANS = 32;
 
 /** 扫描不可信文本（作文正文 / 题面）。输入应为 stripInvisible 之后的文本。 */
 export function scanInjection(text: string, invisibleRemoved = 0, invisibleTagged = 0): InjectionReport {
@@ -324,6 +326,86 @@ export function unmarkSpans(text: string): string {
   return text.includes(MARK_OPEN) || text.includes(MARK_CLOSE)
     ? text.replace(/[\u27E6\u27E7]/g, '')
     : text;
+}
+
+// ── redact：把可疑片段替换为等长占位（双通道盲评的 B 版本用）──
+// 与 datamark（保留原文）不同：B 版本只用于取分，把可疑内容从模型视野里彻底拿掉，
+// 得到"这段文字不存在时该给的分"。等长占位让词数/篇幅观感与 A 版本一致，评分可比。
+// 注意：B 版本绝不能交给用户（会以为作文被删改），也不能作为 quote 校验基准。
+export function redactSpans(text: string, spans: InjectionSpan[]): string {
+  if (!spans.length) return text;
+  let out = '';
+  let cursor = 0;
+  for (const s of spans) {
+    const start = Math.max(cursor, Math.min(s.start, text.length));
+    const end = Math.max(start, Math.min(s.end, text.length));
+    if (end <= start) continue;
+    out += text.slice(cursor, start);
+    const len = end - start;
+    // […redacted = 10 字符 + ] = 11 字符骨架，内部用 . 补齐到原长，总长不变；
+    // 更短的 span 用固定 11 字符占位（略长于原文，但保证占位符本身可识别、可审计）
+    out += len >= 13 ? `[…redacted${'.'.repeat(len - 11)}]` : '[…redacted]';
+    cursor = end;
+  }
+  return out + text.slice(cursor);
+}
+
+/** 逐字校验外部给出的 span 文本（语义检测器的输出不可信：只收能在原文找到的片段）。
+ *  先原文 substring，再空白归一比对（归一命中时用索引映射回原文精确位置）；
+ *  返回去重、按位置排序的 span。 */
+export function validateVerbatimSpans(text: string, candidates: unknown): InjectionSpan[] {
+  const out: InjectionSpan[] = [];
+  // 数量上限：异常输出（上万条 span）不参与逐条匹配，防无效 CPU 消耗
+  const list = Array.isArray(candidates) ? candidates.slice(0, 32) : [];
+  if (!list.length) return out;
+
+  // 归一索引映射：normText[i] ↔ 原文 map[i]（空白折叠为单空格后仍可回溯）
+  const normMap: number[] = [];
+  let normText = '';
+  let prevWs = true;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (/\s/.test(ch)) {
+      if (prevWs) continue;
+      normText += ' ';
+      normMap.push(i);
+      prevWs = true;
+    } else {
+      normText += ch;
+      normMap.push(i);
+      prevWs = false;
+    }
+  }
+  // 行首/行尾空白已折叠，normText 仍是原文的逐字符超集映射（trim 掉两端空格）
+  const lead = normText.startsWith(' ') ? 1 : 0;
+  const trail = normText.endsWith(' ') ? 1 : 0;
+  const nText = normText.slice(lead, normText.length - trail);
+  const nMap = normMap.slice(lead, normMap.length - trail);
+
+  for (const c of list) {
+    if (typeof c !== 'string') continue;
+    const raw = c.trim();
+    if (raw.length < 4) continue;
+    let start = -1;
+    let end = -1;
+    const exact = text.indexOf(raw);
+    if (exact >= 0) {
+      start = exact;
+      end = exact + raw.length;
+    } else {
+      const nRaw = raw.replace(/\s+/g, ' ').trim();
+      const nIdx = nText.indexOf(nRaw);
+      if (nIdx >= 0 && nMap.length) {
+        start = nMap[nIdx];
+        end = (nMap[Math.min(nMap.length - 1, nIdx + nRaw.length - 1)] ?? start) + 1;
+      }
+    }
+    if (start < 0 || end <= start) continue;
+    // 去重叠：与已有 span 相交则跳过（先到先得，保留更早的命中）
+    if (out.some(s => start < s.end && s.start < end)) continue;
+    out.push({ start, end, family: 'semantic' });
+  }
+  return out.sort((a, b) => a.start - b.start);
 }
 
 // ── 输出侧：剥离"伪造外部权威"的评语句 ──

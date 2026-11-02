@@ -1,5 +1,11 @@
 # 安全缺口报告 — 提示词注入（2026-11-02）
 
+> **状态更新（2026-11-03）**：F1-P0（证据耦合 + 双通道盲评）、F1-P1（语义检测器）、
+> F2-P0（图内文字抽取）+ P1（降权呈现）、F3-P0（累计命中 → 强制硬化）已全部实现并验收。
+> 实现与残余风险见 [`docs/INJECTION.md`](./INJECTION.md)（L1.5/L2.5/L2.6 层与「残余风险」6-8 条）。
+> 回归：`npm run inj:test`（自适应变体组 + 证据耦合用例）与 `scripts/security/attack-writing.mjs` 的
+> `inj` 组（端到端）。F1-P2（锚定样卷 pairwise）与 F3-P1/P2 仍为暂缓项。
+
 > **给接手的 agent**：本文只列**当前防护盖不住**的部分。已完成的能力与设计理由见
 > [`docs/INJECTION.md`](./INJECTION.md)，动手前必须先读它，尤其「明确没做」与「残余风险」两节。
 > 三个工单 F1/F2/F3 互相独立，可按优先级各自实现、各自验收。
@@ -192,7 +198,7 @@ SELECT COUNT(*) AS n FROM reviews
    AND created_at > datetime('now', '-7 days');
 ```
 
-`n >= 3` → 该用户后续所有批改**强制 `harden = true`**（即使当前稿干净），并在 `user_flags` 记一行（`PRIMARY KEY (user_id, flag)`，插 `flag='forced_harden'`，`INSERT OR REPLACE` 幂等）。
+`n >= 3` → 该用户后续所有批改**强制 `harden = true`**（即使当前稿干净），并在 `user_flags` 记一行（`PRIMARY KEY (user_id, flag)`，插 `flag='forced_harden'`；实现用 `INSERT ... ON CONFLICT DO UPDATE` 幂等并刷新时间戳，标记带 30 天自愈窗口）。
 
 > ⚠️ `user_flags` 是 `(user_id, flag)` 复合主键，**不是**单一 user_id —— 不要写 `ALTER TABLE ADD COLUMN`，直接插行即可。
 

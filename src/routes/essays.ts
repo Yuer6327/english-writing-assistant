@@ -19,14 +19,19 @@ import {
   GENRES, fillTemplate, getEffectivePrompt, buildPreviousFeedbackBlock, buildReviewMessages,
   SCORE_ONLY_SYSTEM_PROMPT, buildScoreOnlyUser,
   FRAGMENT_POLISH_PROMPT, FULL_REWRITE_PROMPT, validatePromptTemplate,
+  SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser, REVIEW_SYSTEM_PROMPT,
 } from '../utils/prompts';
 import {
   countWords, sanitizeReview, sanitizeFragmentPolish, sanitizeFullRewrite,
   clampSubscores, medianScore, normalizeReviewShape, INJECTION_SCORE_CAPS,
+  enforceEvidenceCoupling, shouldDeliverShadowB,
 } from '../utils/validate';
 import {
-  stripInvisible, scanInjection, markSuspiciousSpans, summarizeInjection, type InjectionReport,
+  stripInvisible, scanInjection, markSuspiciousSpans, summarizeInjection,
+  redactSpans, validateVerbatimSpans, type InjectionReport, type InjectionSpan,
 } from '../utils/injection';
+import { shouldForceHarden } from '../utils/audit';
+import { scanTopicImages, type ImageTextScan } from '../utils/image-text';
 import { seedSampleEssay } from '../sample/seed';
 import { MAX_IMAGES, MAX_IMAGE_CHARS, estimateImageTokens, estimateTextTokens } from '../utils/limits';
 
@@ -544,6 +549,11 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   const gate = await checkReviewGate(c.env.DB, userId, isGuest, { lane, draftId });
   if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
 
+  // F3 门禁（必须在 billing.hold 之前，hold 后早退会留冻结额度）：
+  // 近 7 天 ≥3 次 high 级命中 → 该用户后续所有批改强制硬化（≤8/≤8/≤3 + 采样取最小），
+  // 无论当前稿是否干净。只压分留痕，不拒评、不扣次数、不封号。
+  const forcedHarden = await shouldForceHarden(c.env.DB, userId);
+
   // 生效提示词：作文自定义 > 用户模板（按题型） > 内置默认
   const { prompt: template, source: promptSource } = await getEffectivePrompt(
     c.env.DB, userId, essay.genre, essay.custom_prompt);
@@ -567,35 +577,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
 
   const topicImages = parseJsonField<string[]>(essay.topic_images, []);
 
-  // ── 输入侧防护（提示词注入）──
-  // 稿件入库时已剥过不可见字符，这里再洗一次兜住存量数据（幂等）。
-  // essayText 同时作为「送模型的作文」与「quote 校验基准」，两处必须同一份文本。
-  const cleaned = stripInvisible(draft.text);
-  const essayText = cleaned.text;
-  const injection = scanInjection(essayText, cleaned.removed, cleaned.tagged);
-  // 题面同样是学生可控文本（可自填题目），命中高置信注入时与正文同等处理；
-  // 题目里写「满分 25 分」只到 suspicious，不触发降分。
-  const topicClean = stripInvisible(essay.topic_text);
-  const topicInjection = scanInjection(topicClean.text, topicClean.removed, topicClean.tagged);
-  const harden = injection.level === 'high' || topicInjection.level === 'high';
-  const topicBase = topicInjection.level === 'high'
-    ? markSuspiciousSpans(topicClean.text, topicInjection.spans)
-    : topicClean.text;
-  const topic = topicBase + (topicImages.length ? '\n（题目配有图片，见本消息附图）' : '');
-  // 高置信注入 → 可疑片段打 ⟦⟧ 标记（datamark）：模型据此把它当"被标记的数据"而非指令
-  const essayForPrompt = harden ? markSuspiciousSpans(essayText, injection.spans) : essayText;
-
-  const { system: reviewSystem, user: reviewUser } = buildReviewMessages(template, promptSource, {
-    topic,
-    essay: essayForPrompt,
-    word_count: String(countWords(essayText)),
-    previous_feedback: prevReview
-      ? buildPreviousFeedbackBlock(prevReview.score, prevReview.issues)
-      : '',
-  }, { harden });
-
-
-  // 模型配置解析（车道已在门禁前确定）
+  // 模型配置解析（车道已在门禁前确定；题图扫描需要视觉通道配置，前置到这里）
   let cfg: ResolvedConfig;
   let contentParts: ContentPart[] | undefined;
   try {
@@ -609,16 +591,42 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     return c.json(fail.body, fail.status);
   }
 
-  // ── 预扣费（免费额度 → mode:'free'；BYOK → mode:'byok'；付费 → 冻结）──
-  // 免费档带 skipQuota：次数由上面的 checkReviewGate/recordSuccess 按「成功」计数，
-  // 不由 billing 在调用前扣（否则失败也扣次数）。
+  // ── 输入侧防护（提示词注入）──
+  // 稿件入库时已剥过不可见字符，这里再洗一次兜住存量数据（幂等）。
+  // essayText 同时作为「送模型的作文」与「quote 校验基准」，两处必须同一份文本。
+  const cleaned = stripInvisible(draft.text);
+  const essayText = cleaned.text;
+  const injection = scanInjection(essayText, cleaned.removed, cleaned.tagged);
+  // 题面同样是学生可控文本（可自填题目），命中高置信注入时与正文同等处理；
+  // 题目里写「满分 25 分」只到 suspicious，不触发降分。
+  const topicClean = stripInvisible(essay.topic_text);
+  const topicInjection = scanInjection(topicClean.text, topicClean.removed, topicClean.tagged);
+
+  // harden 是可变的：题图扫描与盲评链路都会把它升级（见下）——
+  // 此前已定型的只有输入侧标记，聚合口径 / 硬顶 / 审计全部跟随最终值。
+  let harden = injection.level === 'high' || topicInjection.level === 'high' || forcedHarden;
+  const topicBase = topicInjection.level !== 'clean'
+    ? markSuspiciousSpans(topicClean.text, topicInjection.spans)
+    : topicClean.text;
+
+  // ── 预扣费 + 并发锁（必须在任何算子侧 AI 调用之前）──
+  // 题图扫描/盲评链路会烧平台的 vision/LLM key：付费车道零余额账户若先扫描后 hold(402)，
+  // 等于免费用平台额度刷 vision 调用（终判 P1-1）。顺序：hold → 锁 → 扫描/采样/主调用。
+  // 免费档带 skipQuota：次数由 checkReviewGate/recordSuccess 按「成功」计数，不由 billing 扣。
   // 6144：issues 不再设 10 条上限（只求准确），给弱文长输出留足余量，避免 JSON 截断 → 重试
   const maxOutput = maxOutputFor(lane, 6144);
+  // 预扣估算（此时尚未扫描题图）：题图按 主调用+扫描 两遍图 token 计，
+  // 图内文字以文本并入 topic 的部分按 2 万字符上限的保守余量预冻结（settle 多退少补）
+  const estImageTextTokens = 6000;
+  const estUserBase = estimateTextTokens(topicBase) + estimateTextTokens(essayText) + 3000
+    + (prevReview ? 1500 : 0);
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: estimateTextTokens(reviewSystem) + estimateTextTokens(reviewUser)
-        + estimateImageTokens(topicImages, cfg.provider, cfg.model),
+      // 系统消息按内置默认（最大静态前缀）估：自定义模板时略高估，方向安全
+      estInputTokens: estimateTextTokens(REVIEW_SYSTEM_PROMPT) + estUserBase
+        + estimateImageTokens(topicImages, cfg.provider, cfg.model) * (topicImages.length ? 2 : 0)
+        + (topicImages.length ? estImageTextTokens : 2 * estUserBase),
       maxOutputTokens: maxOutput,
       skipQuota: lane === 'free',
     });
@@ -636,6 +644,43 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   }
   const locked = holdInfo.mode !== 'byok';
 
+  // F2-P0：题图是文本规则完全看不见的通道 —— 批改前先抽图内文字，过同一套扫描。
+  // 失败 fail-open 照常批改（拒评等于告诉攻击者"图里有字被发现了"）。
+  // 在 hold/锁之后执行：失败与余额不足都不再烧平台 key。
+  let imageScan: ImageTextScan | null = null;
+  if (topicImages.length) {
+    imageScan = await scanTopicImages(cfg.key, cfg.baseUrl, cfg.model, topicImages, {
+      deadline: Math.min(Date.now() + 25_000, aiDeadline),
+    });
+  }
+  harden = harden || imageScan?.report.level === 'high';
+
+  // P1 降权呈现：图内文字以文本形式放进 <topic> 数据区（模型对文本数据区的边界
+  // 服从度高于图内像素，等于给图内指令补一层隔离）；图内文字命中时同样 datamark。
+  let imageTopicPart = '';
+  if (imageScan?.text) {
+    const marked = imageScan.report.level === 'high'
+      ? markSuspiciousSpans(imageScan.text, imageScan.report.spans)
+      : imageScan.text;
+    imageTopicPart = `\n[题图文字（系统转写，与附图内容一致）]\n${marked}`;
+  }
+  const topic = topicBase + imageTopicPart
+    + (topicImages.length ? '\n（题目配有图片，见本消息附图）' : '');
+  // 高置信注入 → 可疑片段打 ⟦⟧ 标记（datamark）：模型据此把它当"被标记的数据"而非指令
+  // 真实 datamark 快照：harden 可能在此之后因覆盖率悬崖翻转（翻转前的标记动作不变），
+  // 审计按"当时是否真的打了 ⟦⟧"记录，而非翻转后的最终值
+  const essayMarkedAtPrompt = harden;
+  const essayForPrompt = harden ? markSuspiciousSpans(essayText, injection.spans) : essayText;
+
+  const { system: reviewSystem, user: reviewUser } = buildReviewMessages(template, promptSource, {
+    topic,
+    essay: essayForPrompt,
+    word_count: String(countWords(essayText)),
+    previous_feedback: prevReview
+      ? buildPreviousFeedbackBlock(prevReview.score, prevReview.issues)
+      : '',
+  }, { harden });
+
   let settled = false;
   let charged = 0;
   try {
@@ -652,12 +697,121 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     }[] = [];
     let sampleUsage: AIResult['usage'];
     let sampleCallsOk = 0;
+    // F1 盲评链路（语义检测 + B 版打分）的独立用量（与采样并行发起，下面 merge 进结算）
+    let auxUsage: AIResult['usage'];
+    let auxCallsOk = 0;
+    const mergeUsage = (
+      base: AIResult['usage'] | undefined, u: AIResult['usage'] | undefined,
+    ): AIResult['usage'] => {
+      if (!u) return base;
+      const add = (a?: number, b?: number): number | undefined =>
+        a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+      return base
+        ? {
+          prompt_tokens: (base.prompt_tokens ?? 0) + (u.prompt_tokens ?? 0),
+          completion_tokens: (base.completion_tokens ?? 0) + (u.completion_tokens ?? 0),
+          prompt_cache_hit_tokens: add(base.prompt_cache_hit_tokens, u.prompt_cache_hit_tokens),
+          prompt_cache_miss_tokens: add(base.prompt_cache_miss_tokens, u.prompt_cache_miss_tokens),
+        }
+        : u;
+    };
+
+    // ── F1 双通道盲评（shadow scoring）+ 语义检测器（与采样并行发起）──
+    // 规则族是公开的正则：委婉化 / 换语种 / 纯语义施压能整段绕过（实测 8 变体 7 个判 clean，
+    // 且"一个弱规则诱饵"就能让改写 payload 藏进 suspicious 档躲过检测器）。
+    // 对策不依赖"识别攻击"：
+    //   · 规则命中（suspicious+）→ 用规则 span；clean 或 suspicious 时再跑语义检测器
+    //     （suspicious 也跑：防"诱饵占位让真 payload 躲进 suspicious"的免检门）；
+    //   · 检测器摘出的"对评分者说的话"经逐字校验后与规则 span 合并 → 生成 B 版本；
+    //   · B 版本把可疑内容替换为等长占位后独立打分；若 B（封顶前原始分）比 A 低 ≥2
+    //     → 注入生效，交付 B（交付时才按注入口径封顶）。
+    // 覆盖率悬崖：摘出的元话语占正文 >40% → B 版本失真（整篇大半被删），不跑盲评，
+    // 但降级为强制硬化（≤8/≤8/≤3 + 采样取最小）——"payload 越大审查越少"的激励必须反过来。
+    // 只在无题图时启用（有题图时题图扫描已覆盖多模态通道，避免延迟叠加）；
+    // 失败 / 超时 / 限流一律跳过（fail-open），绝不影响主链路。
+    // B 版本只用于取分：交付的 basis / issues / 修改稿仍来自 A，绝不把占位符漏给学生。
+    const shadowState = {
+      source: null as 'rule' | 'semantic' | null,
+      detectorSpans: 0,   // 语义检测器摘到的 span 数（规则命中时为 0）
+      overflow: false,    // 元话语覆盖率 >40%（放弃盲评，降级强制硬化）
+      scoresRaw: null as { content: number; language: number; organization: number } | null,
+      scores: null as { content: number; language: number; organization: number } | null,
+      argumentation: null as { has_examples: boolean; has_solution: boolean } | null,
+    };
+    const shadowChain = (async (): Promise<void> => {
+      if (topicImages.length) return;
+      const chainStart = Date.now();
+      try {
+        let spans: InjectionSpan[] = [];
+        if (injection.level !== 'clean' && injection.spans.length) {
+          spans = [...injection.spans];
+          shadowState.source = 'rule';
+        }
+        // 语义检测：clean 必跑（自适应攻击在规则下全漏）；suspicious 也跑
+        // （规则只命中诱饵时，真 payload 靠它摘出）；high（已硬化）不跑，省延迟。
+        if (!harden && (injection.level === 'clean' || injection.level === 'suspicious')) {
+          const det = await callAI(cfg.key, cfg.baseUrl, cfg.model,
+            SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(essayText),
+            true, undefined, maxOutputFor(lane, 400), 0.1,
+            Math.min(chainStart + 15_000, aiDeadline));
+          if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
+          const found = validateVerbatimSpans(essayText, extractJSON(det.content)?.spans);
+          shadowState.detectorSpans = found.length;
+          if (found.length) {
+            // 覆盖率按合并后的 span 集算（规则 + 语义，去重叠）。
+            // 超过 40% → 整篇大半是元话语，B 版本失真（遮蔽删文评分失真，RobustJudge 教训）：
+            // 彻底放弃盲评（含已有的规则 span，行为与文档口径一致），改由强制硬化兜底。
+            const merged = [...spans];
+            for (const s of found) {
+              if (!merged.some(m => s.start < m.end && m.start < s.end)) merged.push(s);
+            }
+            const covered = merged.reduce((a, s) => a + (s.end - s.start), 0);
+            if (covered > essayText.length * 0.4) {
+              shadowState.overflow = true;   // 覆盖率悬崖 → 放弃盲评，主流程强制硬化
+              spans = [];
+            } else {
+              spans = merged;
+              if (!shadowState.source) shadowState.source = 'semantic';
+            }
+          }
+        }
+        if (!spans.length || !shadowState.source) { shadowState.source = null; return; }
+        const redacted = redactSpans(essayText, spans);
+        if (redacted === essayText) { shadowState.source = null; return; }
+        const bUser = buildScoreOnlyUser(topic, redacted, countWords(essayText), false);
+        const res = await callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT,
+          bUser, true, undefined, maxOutputFor(lane, 900), 0.2,
+          Math.min(chainStart + 40_000, aiDeadline));
+        if (res.usage) { auxUsage = mergeUsage(auxUsage, res.usage); auxCallsOk++; }
+        const j = extractJSON(res.content);
+        if (!j || typeof j !== 'object' || !j.subscores) { shadowState.source = null; return; }
+        // 常态口径（论证纪律等）+ 证据耦合先行；注入口径封顶（≤8/≤8/≤3）只在交付时做——
+        // 比较必须用封顶前原始分，否则 sumA≥21 的干净高分稿会被自动判"注入生效"（红队 P1-1）。
+        // 注意：clampSubscores（含结构定档）在此应用两次（此处 + 交付封顶），
+        // 第二次以证据降档后的内容分复算结构档——方向是 B 更低更易触发交付，偏差 ≤1 分，保守可接受。
+        const ev = enforceEvidenceCoupling(
+          clampSubscores(j.argumentation ?? {}, j.subscores),
+          j.evidence, essayText, spans,
+        );
+        shadowState.scoresRaw = ev.subscores;
+        shadowState.scores = clampSubscores({}, ev.subscores, INJECTION_SCORE_CAPS);
+        const arg = j.argumentation ?? {};
+        if (typeof arg.has_examples === 'boolean' && typeof arg.has_solution === 'boolean') {
+          shadowState.argumentation = { has_examples: arg.has_examples, has_solution: arg.has_solution };
+        }
+      } catch (err) {
+        shadowState.source = null;
+        shadowState.overflow = false;
+        console.error('[review] 盲评链路失败（跳过）:', err instanceof Error ? err.message : err);
+      }
+    })();
+
     if (scoreDeadline - Date.now() > 5_000) {
       const scoreUser = buildScoreOnlyUser(topic, essayForPrompt, countWords(essayText), harden);
       const rescores = await Promise.allSettled([
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 600), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
       ]);
       for (const r of rescores) {
         if (r.status !== 'fulfilled') {
@@ -668,30 +822,32 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         if (u) {
           sampleCallsOk++;
           // 采样成本并入结算（含缓存拆分），付费车道不多收也不白嫖
-          const add = (a?: number, b?: number): number | undefined =>
-            a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
-          sampleUsage = sampleUsage
-            ? {
-              prompt_tokens: (sampleUsage.prompt_tokens ?? 0) + (u.prompt_tokens ?? 0),
-              completion_tokens: (sampleUsage.completion_tokens ?? 0) + (u.completion_tokens ?? 0),
-              prompt_cache_hit_tokens: add(sampleUsage.prompt_cache_hit_tokens, u.prompt_cache_hit_tokens),
-              prompt_cache_miss_tokens: add(sampleUsage.prompt_cache_miss_tokens, u.prompt_cache_miss_tokens),
-            }
-            : u;
+          sampleUsage = mergeUsage(sampleUsage, u);
         }
         try {
           const j = extractJSON(r.value.content);
           // 形状不完整的输出（如 {"error":...}）直接弃样：缺 subscores 会被钳成 0 分，污染中位数
           if (!j || typeof j !== 'object' || !j.subscores) throw new Error('采样输出缺少 subscores');
           const arg = j.argumentation ?? {};
+          // 证据耦合（F1-P0）：采样分同样必须有原文逐字证据，落在注入段内 → 降档
+          const ev = enforceEvidenceCoupling(
+            clampSubscores(arg, j.subscores, harden ? INJECTION_SCORE_CAPS : undefined),
+            j.evidence, essayText, injection.spans,
+          );
           sampleSignals.push({
-            subscores: clampSubscores(arg, j.subscores, harden ? INJECTION_SCORE_CAPS : undefined),
+            subscores: ev.subscores,
             hasExamples: typeof arg.has_examples === 'boolean' ? arg.has_examples : null,
             hasSolution: typeof arg.has_solution === 'boolean' ? arg.has_solution : null,
           });
         } catch { /* 采样输出不合法 → 该样本丢弃 */ }
       }
     }
+    await shadowChain;
+
+    // 覆盖率悬崖（检测器摘出的元话语占正文 >40%）→ 强制硬化：
+    // "payload 越大审查越少"的激励必须反过来。采样跑在原口径下，
+    // 定档/交付分在下面补封顶；harden 翻转同时作用于聚合、主调用钳制与审计。
+    if (shadowState.overflow) harden = true;
 
     // 3 个有效样本且为内置默认模板（有注入位）→ 中位数定档；布尔判定取多数（平票/全缺视为未知 → 不钳制）
     // 注入命中时改取最小值：三次采样都会被同一段注入污染，中位数救不了；取最小值才逼近"干净时该给的分"
@@ -714,9 +870,38 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       };
     }
 
+    // F1 盲评裁决（定档路径）：比较用 B 的封顶前原始分（红队 P1-1：B 恒封顶会让
+    // sumA≥21 的干净高分稿自动满足 delta≥2），交付用封顶分。放在主调用之前：
+    // basis 由主调用按 B 的分数展开，交付分数与依据保持一致。
+    let shadowUsed = false;
+    let shadowSumA: number | null = null;
+    let shadowSumB: number | null = null;
+    if (shadowState.scores && shadowState.scoresRaw && shadowState.source && agreed) {
+      const sumBRaw = shadowState.scoresRaw.content + shadowState.scoresRaw.language
+        + shadowState.scoresRaw.organization;
+      const sumA = agreed.content + agreed.language + agreed.organization;
+      if (shouldDeliverShadowB(sumA, sumBRaw)) {
+        agreed = shadowState.scores;
+        if (shadowState.argumentation) {
+          agreedArg = shadowState.argumentation;   // B 的分数按 B 的自评钳过，自洽
+        } else if (agreedArg) {
+          // B 未给自评 → 按交付口径的 argumentation 再收敛（防 has_examples=false + content=8）
+          agreed = clampSubscores(agreedArg, agreed, INJECTION_SCORE_CAPS);
+        }
+        shadowUsed = true;
+        shadowSumA = sumA;
+        shadowSumB = sumBRaw;
+      }
+    }
+
+    // 覆盖率悬崖升级 harden 后，采样是未硬化口径 → 定档分补封顶（shadowUsed 已封顶，幂等）
+    if (shadowState.overflow && agreed) {
+      agreed = clampSubscores({}, agreed, INJECTION_SCORE_CAPS);
+    }
+
     // 主调用用户消息：定档时在末位注入评分（可变数据区），否则用原始消息
     const baseUser = agreed
-      ? `${reviewUser}\n\n【评分已定（三次独立评卷的中位数，不得更改）】
+      ? `${reviewUser}\n\n【评分已定（多次独立评卷结果汇总，不得更改）】
 - argumentation：has_examples = ${agreedArg!.has_examples}，has_solution = ${agreedArg!.has_solution}
 - 分项分：内容 ${agreed.content} / 语言 ${agreed.language} / 结构 ${agreed.organization}
 你的任务：写出支撑上述分项分的 basis 依据、问题清单、highlight/priority 与修改稿；argumentation 与 subscores 按上述值原样输出。`
@@ -753,7 +938,10 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
             code: 'essay_illegible',
           }, 422);
         }
-        result = sanitizeReview(parsed, essayText, !!prevReview, { harden });
+        result = sanitizeReview(parsed, essayText, !!prevReview, {
+          harden,
+          injSpans: injection.spans,   // F1 证据耦合：证据落在注入段内 → 降档
+        });
         // 定档覆盖：分项分以采样中位数为准（口径一致性由 clampSubscores 保证），
         // 主调用只负责举证与展开——basis 与交付分数从此必然一致
         if (agreed) {
@@ -783,18 +971,10 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       return c.json({ error: '批改失败：AI 返回格式不符合要求，请稍后重试' }, 502);
     }
 
-    // 采样与主调用用量合并（失败重试的中间成本不单独计费，吸收进加价倍率 N）
+    // 采样 / 盲评链路与主调用用量合并（失败重试的中间成本不单独计费，吸收进加价倍率 N）
+    sampleUsage = mergeUsage(sampleUsage, auxUsage);
     if (sampleUsage) {
-      const add = (a?: number, b?: number): number | undefined =>
-        a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
-      lastUsage = lastUsage
-        ? {
-          prompt_tokens: (lastUsage.prompt_tokens ?? 0) + (sampleUsage.prompt_tokens ?? 0),
-          completion_tokens: (lastUsage.completion_tokens ?? 0) + (sampleUsage.completion_tokens ?? 0),
-          prompt_cache_hit_tokens: add(lastUsage.prompt_cache_hit_tokens, sampleUsage.prompt_cache_hit_tokens),
-          prompt_cache_miss_tokens: add(lastUsage.prompt_cache_miss_tokens, sampleUsage.prompt_cache_miss_tokens),
-        }
-        : sampleUsage;
+      lastUsage = mergeUsage(lastUsage, sampleUsage);
     }
 
     // 未定档 → 主调用分项分与有效采样合并取中位数（主调用也是一路独立信号）
@@ -811,6 +991,44 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         result.subscores.content + result.subscores.language + result.subscores.organization
         - result.word_count_penalty);
     }
+    // 覆盖率悬崖升级 harden 后，采样是未硬化口径 → 中位数补封顶
+    if (shadowState.overflow && !agreed) {
+      result.subscores = clampSubscores({}, result.subscores, INJECTION_SCORE_CAPS);
+      result.score = Math.max(0,
+        result.subscores.content + result.subscores.language + result.subscores.organization
+        - result.word_count_penalty);
+    }
+
+    // F1 盲评裁决（非定档路径，如自定义模板 / 采样不足）：主调用结果 vs B 版本
+    if (shadowState.scores && shadowState.scoresRaw && shadowState.source && !agreed) {
+      const sumBRaw = shadowState.scoresRaw.content + shadowState.scoresRaw.language
+        + shadowState.scoresRaw.organization;
+      const sumA = result.subscores.content + result.subscores.language + result.subscores.organization;
+      if (shouldDeliverShadowB(sumA, sumBRaw)) {
+        result.subscores = shadowState.scores;
+        if (result.argumentation) {
+          if (shadowState.argumentation) {
+            result.argumentation.has_examples = shadowState.argumentation.has_examples;
+            result.argumentation.has_solution = shadowState.argumentation.has_solution;
+          } else {
+            // B 未给自评 → 按交付 argumentation 再收敛，保持"自评与分数"自洽
+            result.subscores = clampSubscores(result.argumentation, result.subscores, INJECTION_SCORE_CAPS);
+          }
+        }
+        result.score = Math.max(0,
+          result.subscores.content + result.subscores.language + result.subscores.organization
+          - result.word_count_penalty);
+        shadowUsed = true;
+        shadowSumA = sumA;
+        shadowSumB = sumBRaw;
+      }
+    }
+
+    // 盲评裁决生效 = 注入确认生效（才交付更低分）→ 审计与前端横幅同口径
+    if (shadowUsed && result.integrity) {
+      result.integrity.shadow_used = true;
+      result.integrity.injection_flagged = true;
+    }
 
     // 结算（实际成本，多退少补；settle 失败不阻塞结果返回，未结算的 hold 由 cron 过期释放兜底）
     if (holdInfo.mode === 'hold') {
@@ -820,7 +1038,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           completionTokens: lastUsage?.completion_tokens,
           promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
           promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
-          calls: 1 + sampleCallsOk,   // 主调用（含一次 JSON 重试的可能）+ 成功的采样调用
+          // 主调用（含一次 JSON 重试的可能）+ 成功的采样 + 盲评链路（语义检测 / B 版打分）
+          calls: 1 + sampleCallsOk + auxCallsOk,
         });
         charged = s.charged;
         settled = true;
@@ -853,8 +1072,24 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       injection: {
         essay: summarizeInjection(injection),
         topic: summarizeInjection(topicInjection),
-        spans_marked: harden ? injection.spans.length + topicInjection.spans.length : 0,
+        // image.failed：抽取失败 fail-open（与"扫了且干净"在审计上区分开，红队 P2-4）
+        image: imageScan?.scanned
+          ? { ...summarizeInjection(imageScan.report), failed: imageScan.failed === true }
+          : undefined,
+        // 审计按真实标记动作记录（essay 在翻转前的口径打标；topic 按 suspicious+ 打标）
+        spans_marked_essay: essayMarkedAtPrompt ? injection.spans.length : 0,
+        spans_marked_topic: topicInjection.level !== 'clean' ? topicInjection.spans.length : 0,
         invisible_removed: cleaned.removed,
+        // F1：语义检测 + 双通道盲评的审计（shadow.used = 已按 B 版本分数交付）
+        semantic: { spans: shadowState.detectorSpans },
+        shadow: shadowState.source ? {
+          source: shadowState.source,
+          sum_a: shadowSumA,
+          sum_b: shadowSumB,
+          used: shadowUsed,
+        } : null,
+        // F3：近 7 天累计命中触发的强制硬化
+        forced_harden: forcedHarden,
       },
       integrity: result.integrity ?? null,
     });
@@ -902,6 +1137,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       console.error('[review] 更新作文时间失败:', err instanceof Error ? err.message : err);
     }
 
+    const imageFlagged = !!imageScan && imageScan.report.level !== 'clean';
+    const injected = harden || shadowUsed
+      || injection.level !== 'clean' || topicInjection.level !== 'clean' || imageFlagged;
     return c.json({
       review_id: insert?.meta?.last_row_id ?? null,
       persisted: insert?.meta?.changes === 1,
@@ -909,9 +1147,12 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       model,
       result,
       // 输入侧检出疑似元指令时告知前端（前端只展示一句"已忽略文中的评分指令"，
-      // 不给攻击者任何"差一点就成功"的反馈，也不暴露命中规则）
-      injection: (harden || injection.level !== 'clean' || topicInjection.level !== 'clean')
-        ? { level: harden ? 'high' as const : 'suspicious' as const, flagged: harden }
+      // 不给攻击者任何"差一点就成功"的反馈，也不暴露命中规则与盲评细节）
+      injection: injected
+        ? {
+          level: (harden || shadowUsed) ? 'high' as const : 'suspicious' as const,
+          flagged: harden || shadowUsed,
+        }
         : undefined,
       points_charged: charged,          // 微积分（前端 ÷10000 展示为积分）
       lane: laneLabel(lane),            // free / paid / byok

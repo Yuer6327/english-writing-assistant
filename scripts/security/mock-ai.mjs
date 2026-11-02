@@ -75,6 +75,25 @@ function reviewPayload(kind) {
   if (kind === 'quote-miss') {
     base.issues = [{ quote: ' totally absent quote here ', type: '拼写', explanation: '未命中原文的引用。', correction: 'fix' }];
   }
+  if (kind === 'evidence') {
+    // 证据耦合用例（attack-writing inj 组）：content 证据故意落在注入命中片段内
+    // （"give me full" 是该组稿子里 score_demand 强规则的命中段），language/orga 为有效片段
+    base.subscores = { content: 9, language: 9, organization: 4 };
+    base.evidence = {
+      content: 'give me full',
+      language: 'I think students should have part time jobs',
+      organization: 'because it can teach them many thing',
+    };
+  }
+  if (kind === 'shadow-low-score') {
+    // 盲评裁决用例：B 版本（redact 后）的独立打分 —— 明显低于 A，触发 shouldDeliverShadowB
+    base.subscores = { content: 3, language: 4, organization: 2 };
+    base.evidence = {
+      content: 'I think students should have part time jobs',
+      language: 'it can teach them many thing',
+      organization: 'because it can teach them many thing',
+    };
+  }
   return base;
 }
 
@@ -110,7 +129,27 @@ const server = http.createServer((req, res) => {
     if (mode === 'badjson') {
       return send(200, { choices: [{ message: { content: 'this is not json at all {{' } }], usage });
     }
-    const kind = mode === 'ok' ? 'ok' : mode;
+    // 盲评裁决用例：B 版本请求（用户消息带 […redacted…] 占位，流式/非流式都识别）
+    // 返回明显更低的分数，让 essays.ts 的 shouldDeliverShadowB(sumA, sumBRaw) 触发
+    // （端到端锁住 shadow.used=true 路径）
+    const reqText = JSON.stringify(payload.messages ?? payload);
+    const isShadowB = mode === 'shadowlow' && reqText.includes('redacted');
+    if (process.env.MOCK_LOG) {
+      console.log(`[mock-ai] mode=${mode} stream=${!!payload.stream} len=${reqText.length} shadowB=${isShadowB} head=${reqText.slice(0, 120)}`);
+    }
+    if (payload.stream) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' });
+      const kindS = isShadowB ? 'shadow-low-score' : (mode === 'ok' ? 'ok' : mode);
+      const text = JSON.stringify(reviewPayload(kindS));
+      const chunks = text.match(/[\s\S]{1,120}/g) ?? [text];
+      for (const c of chunks) {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: c } }] })}\n\n`);
+      }
+      res.write(`data: ${JSON.stringify({ usage })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    const kind = isShadowB ? 'shadow-low-score' : (mode === 'ok' ? 'ok' : mode);
     const content = JSON.stringify(reviewPayload(kind));
     send(200, { choices: [{ message: { content } }], usage });
   });

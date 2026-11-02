@@ -83,6 +83,9 @@ export interface ReviewResult {
     claims_scrubbed: number;            // 被剥离的"伪造外部权威"评语句数
     quotes_unlocated: number;           // quote 未能命中原文的条数
     revised_dropped: boolean;           // 修改稿含注入回流，已丢弃
+    evidence_voided?: number;           // 证据落在注入段内被降档的分项数（F1 证据耦合）
+    evidence_unproven?: number;         // 无有效证据被压分的分项数
+    shadow_used?: boolean;              // 盲评裁决生效：交付分来自 B 版本（注入确认生效）
   };
 }
 

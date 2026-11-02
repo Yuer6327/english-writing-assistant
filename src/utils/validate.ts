@@ -7,7 +7,7 @@
 import type {
   ReviewResult, ReviewIssue, FragmentPolishResult, FullRewriteResult, OcrVlmResult,
 } from '../types';
-import { scanInjection, scrubAuthorityClaims, unmarkSpans } from './injection';
+import { scanInjection, scrubAuthorityClaims, unmarkSpans, type InjectionSpan } from './injection';
 
 /** 分数收敛到 [min, max] 的整数 */
 function safeScore(v: unknown, min: number, max: number, fallback = 0): number {
@@ -98,6 +98,104 @@ export function clampSubscores(
 /** 注入命中时的分项硬顶：内容 ≤8、语言 ≤8、结构 ≤3 → 总分 ≤19（常态上限 22） */
 export const INJECTION_SCORE_CAPS = { content: 8, language: 8, organization: 3 } as const;
 
+// ── 证据耦合（F1-P0）──
+// 分项分必须有原文逐字证据支撑，掐住"靠注入段自我论证拿高分"的路径：
+//   · 证据未命中原文 → 证据作废；
+//   · 证据落在注入命中片段内 → 该档位作废，分数降一档（内容/语言 −2、结构 −1）；
+//   · 无有效证据且分项 ≥8 → 压到 7（结构上限 4 不适用此条）。
+// 这层不依赖"识别攻击"：攻击者无论怎么改写 payload，模型引用注入段当证据就会被降档。
+const EVIDENCE_BAND_STEP: Record<string, number> = { content: 2, language: 2, organization: 1 };
+const EVIDENCE_MISSING_CAP = 7;   // 无有效证据的高分项压到 7
+const EVIDENCE_HIGH_FLOOR = 8;    // 仅当分项 ≥8 才触发"无证据降分"
+
+export interface EvidenceOutcome {
+  subscores: { content: number; language: number; organization: number };
+  /** 证据落进注入段被降档的分项 */
+  voided: string[];
+  /** 无有效证据被压分的分项 */
+  unproven: string[];
+}
+
+/** 证据中的包裹引号/标记剥离：模型常写 "..." / 「...」 / ⟦...⟧ 包住片段 */
+function cleanEvidenceSpan(raw: string): string {
+  let s = unmarkSpans(raw).trim();
+  // 引号族：直引号 / 全角引号 / 弯引号 / 直角引号，用转义避免源码字面量歧义
+  s = s.replace(/^[\u0022\u0027\uFF02\uFF07\u201C\u2018\u300C\u300E]+/, '')
+    .replace(/[\u0022\u0027\uFF02\uFF07\u201D\u2019\u300D\u300F]+$/, '')
+    .trim();
+  return s;
+}
+
+// 标点/排版折叠（证据匹配用）：模型引用原文时常把弯引号写成直引号、
+// 全角标点转半角、连字符/破折号互换——不折叠会把干净稿的高分项系统性压 7（审核 F-3）。
+// 只用于"比对"，不改变 quote 高亮基准。
+function foldPunctuation(s: string): string {
+  return s
+    .replace(/[\u201C\u201D\u201E\u00AB\u00BB\u300C\u300D\u300E\u300F\uFF02]/g, '"')
+    .replace(/[\u2018\u2019\u201A\uFF07]/g, "'")
+    .replace(/[\u2012\u2013\u2014\u2015]/g, '-')
+    .replace(/[\uFF0C\u3001]/g, ',')
+    .replace(/\uFF1A/g, ':')
+    .replace(/\uFF1B/g, ';')
+    .replace(/\uFF01/g, '!')
+    .replace(/\uFF1F/g, '?')
+    .replace(/\u3002/g, '.')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 证据 span 是否与注入命中片段重叠（红队 P2-1：完全包含判定可被"包裹命中短语的一整句"逃逸） */
+function spanHitsInjection(text: string, needle: string, injSpans: InjectionSpan[]): boolean {
+  if (!injSpans.length) return false;
+  const idx = text.indexOf(needle);
+  if (idx < 0) return false;
+  return injSpans.some(s => idx < s.end && s.start < idx + needle.length);
+}
+
+/**
+ * 盲评裁决（纯函数，进 CI）：B 版本用【封顶前】的原始分参与比较（红队 P1-1：
+ * B 恒封顶 ≤19 会让 sumA≥21 的稿子自动满足 delta≥2，把干净高分稿误降），
+ * 交付时才按注入口径封顶。
+ */
+export function shouldDeliverShadowB(sumA: number, sumBRaw: number): boolean {
+  return sumA - sumBRaw >= 2 && sumBRaw < sumA;
+}
+
+/**
+ * 分项分 × 证据耦合校验。subscores 应先过 clampSubscores（本函数只做证据层收敛）。
+ * @param evidence   模型输出的 evidence 字段（{content,language,organization} 各为原文片段）
+ * @param essayText  quote 校验基准（stripInvisible 之后的作文原文）
+ * @param injSpans   输入侧注入命中片段（正文坐标）
+ */
+export function enforceEvidenceCoupling(
+  subscores: { content: number; language: number; organization: number },
+  evidence: any,
+  essayText: string,
+  injSpans: InjectionSpan[],
+): EvidenceOutcome {
+  const foldedEssay = foldPunctuation(essayText);
+  const out = { ...subscores };
+  const voided: string[] = [];
+  const unproven: string[] = [];
+
+  for (const dim of ['content', 'language', 'organization'] as const) {
+    const raw = evidence && typeof evidence === 'object' ? evidence[dim] : undefined;
+    // 长度上限：异常输出（巨串）不参与匹配，避免无效 CPU 消耗
+    const span = typeof raw === 'string' ? cleanEvidenceSpan(raw.slice(0, 600)) : '';
+    const foldedSpan = foldPunctuation(span);
+    const valid = span.length >= 2
+      && (essayText.includes(span) || foldedEssay.includes(foldedSpan));
+    if (valid && spanHitsInjection(essayText, span, injSpans)) {
+      out[dim] = Math.max(0, out[dim] - (EVIDENCE_BAND_STEP[dim] ?? 2));
+      voided.push(dim);
+    } else if (!valid && out[dim] >= EVIDENCE_HIGH_FLOOR && dim !== 'organization') {
+      out[dim] = EVIDENCE_MISSING_CAP;
+      unproven.push(dim);
+    }
+  }
+  return { subscores: out, voided, unproven };
+}
+
 /**
  * 分数采样聚合：奇数个取中位数；偶数个取均值后向下取整（方向偏严，符合「压低」口径）。
  */
@@ -113,13 +211,14 @@ export function medianScore(values: number[]): number {
  * @param essayText 学生作文原文（quote 命中校验基准；应为 stripInvisible 之后的文本）
  * @param expectsImprovement 二稿及以上 → 要求 improvement 字段
  * @param opts.harden 输入侧检出高置信注入 → 分数硬顶下压 + 剥离伪造权威评语
+ * @param opts.injSpans 输入侧注入命中片段（正文坐标）→ evidence 证据耦合降档
  * @throws Error 整体不合法（触发上层严格重试）
  */
 export function sanitizeReview(
   parsed: any,
   essayText: string,
   expectsImprovement: boolean,
-  opts?: { harden?: boolean },
+  opts?: { harden?: boolean; injSpans?: InjectionSpan[] },
 ): ReviewResult {
   if (!parsed || typeof parsed !== 'object') throw new Error('AI 返回不是 JSON 对象');
 
@@ -133,8 +232,12 @@ export function sanitizeReview(
   const hasSolution = boolFlag(arg.has_solution);
   const modelContent = safeScore(parsed.subscores?.content, 0, 9);
   const modelLanguage = safeScore(parsed.subscores?.language, 0, 9);
-  const { content, language, organization } = clampSubscores(
+  const clamped = clampSubscores(
     arg, parsed.subscores, harden ? INJECTION_SCORE_CAPS : undefined);
+  // 证据耦合（F1-P0）：分项分必须有原文逐字证据；证据落在注入段内 → 降档，
+  // 无有效证据且 ≥8 → 压 7。放在 clampSubscores 之后，两层独立收敛。
+  const evidenceOut = enforceEvidenceCoupling(clamped, parsed.evidence, essayText, opts?.injSpans ?? []);
+  const { content, language, organization } = evidenceOut.subscores;
 
   const sum = content + language + organization;
   // 词数扣分：硬阈值，服务端自算，模型不参与（分项保持模型判定的原始分，只在总分上扣）
@@ -229,6 +332,8 @@ export function sanitizeReview(
       claims_scrubbed: claimsScrubbed,
       quotes_unlocated: issues.filter(i => i.located === false).length,
       revised_dropped: revisedDropped,
+      evidence_voided: evidenceOut.voided.length,
+      evidence_unproven: evidenceOut.unproven.length,
     },
   };
 
