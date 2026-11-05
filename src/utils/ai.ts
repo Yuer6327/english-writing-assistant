@@ -12,6 +12,9 @@
 const AI_TIMEOUT_MS = 75000;
 /** 流式请求的空闲超时：超过该时长没有收到任何新 chunk 才判定连接死亡（每个 chunk 重置计时） */
 const STREAM_IDLE_TIMEOUT_MS = 60000;
+/** 空闲计时器重挂节流（Free plan CPU 降耗）：数据流动时至少间隔该时长才重挂一次；
+ *  必须远小于 STREAM_IDLE_TIMEOUT_MS，保证「真空闲 ~55s+」语义不漂移 */
+const STREAM_IDLE_REARM_MS = 5000;
 /** 单个批改等请求的全局时间预算（含 failover / 等待） */
 const AI_TOTAL_BUDGET_MS = 90000;
 
@@ -138,6 +141,17 @@ export interface ContentPart {
   image_url?: { url: string };
 }
 
+/** 模型特有附加请求体。LongCat 系列显式关闭思考：默认思考会把 max_tokens 预算
+ *  全部烧在 reasoning 上（2026-11-04 生产实测：16384 预算 5 分钟全是 reasoning_content、
+ *  content 为空；显式 disabled 后 ~17s 出完整批改 JSON）。
+ *  catalog 车道以 opts.thinking 为准（'off' / budget_tokens）；free/byok 硬编码车道
+ *  无目录可查，按模型名正则兜底（BYOK 自带 LongCat 模型同样受益）。 */
+function thinkingBodyFor(model: string, opts?: AICallOpts): Record<string, unknown> {
+  if (opts?.thinking === 'off') return { thinking: { type: 'disabled' } };
+  if (typeof opts?.thinking === 'number') return { thinking: { type: 'enabled', budget_tokens: opts.thinking } };
+  return /^LongCat/i.test(model) ? { thinking: { type: 'disabled' } } : {};
+}
+
 /** callAI 返回值：内容 + 成功那次的 token 用量（计费结算用）。
  *  缓存命中/未命中是 DeepSeek 的实际计费维度（命中价远低于未命中），逐次透传给结算。 */
 export interface AIResult {
@@ -150,9 +164,48 @@ export interface AIResult {
   };
 }
 
+/** usage 逐字段宽松解析（流式/非流式共用）：上游缓存拆分字段名不一（DeepSeek 顶层
+ *  *cache*_tokens，OpenAI 系在 prompt_tokens_details.cached_tokens），拿得到就透传。
+ *  拆分缺失时结算端按全未命中价保守计——所以这条提取链路直接影响 N=1 结算准确性
+ *  （2026-11-06 审计 P1：流式路径曾丢拆分 → deepseek/relay 系统性多扣费）。 */
+function parseUsage(u: any): AIResult['usage'] | undefined {
+  if (!u || typeof u.prompt_tokens !== 'number') return undefined;
+  const hit = typeof u.prompt_cache_hit_tokens === 'number' ? u.prompt_cache_hit_tokens
+    : typeof u.prompt_tokens_details?.cached_tokens === 'number' ? u.prompt_tokens_details.cached_tokens
+    : undefined;
+  const miss = typeof u.prompt_cache_miss_tokens === 'number' ? u.prompt_cache_miss_tokens
+    : hit !== undefined && typeof u.prompt_tokens === 'number' ? u.prompt_tokens - hit
+    : undefined;
+  return {
+    prompt_tokens: u.prompt_tokens,
+    completion_tokens: u.completion_tokens ?? 0,
+    ...(hit !== undefined && hit >= 0 ? { prompt_cache_hit_tokens: hit } : {}),
+    ...(miss !== undefined && miss >= 0 ? { prompt_cache_miss_tokens: miss } : {}),
+  };
+}
+
+/** AI 调用行为参数（模型库单源：由 billing catalog 条目经 api-config.aiCallOpts 传入）。
+ *  未传时按模型名正则 + 运行时记忆推断（free/byok 硬编码车道的既有行为）。 */
+export interface AICallOpts {
+  /** 上游支持 response_format（catalog jsonMode）；false = 不发该参数 */
+  supportsResponseFormat?: boolean;
+  /** 仅流式可用（catalog streamOnly）：流式参数被拒时不回退非流式，原样上抛 */
+  streamOnly?: boolean;
+  /** 思考参数：'off' = 显式关思考；number = 开思考并限 budget_tokens（LongCat 系，
+   *  Anthropic 风格嵌套字段被上游尊重）。缺省 = 不发思考参数（deepseek 系思考不可控）。 */
+  thinking?: 'off' | number;
+  /** 上游不稳，失败不重试（catalog noRetry，避免双倍上游计费）：跳过 response_format
+   *  回退重试与限流后同端点重试（端点间 failover 保留） */
+  noRetry?: boolean;
+  /** 外部中止信号（SSE 客户端断开 → 取消上游调用，白烧共享 key 的资源口子，
+   *  2026-11-06 审计 P2）。与内部超时/空闲 controller 经 AbortSignal.any 合并。 */
+  signal?: AbortSignal;
+}
+
 /** 统一调用 AI，带超时。json=true 时要求返回 JSON。contentParts 存在时走多模态（手写 OCR / 看图批改）。
  *  temperature 显式覆盖默认温度（json 0.3 / 纯文本 0.7）。
- *  多端点/重试路径透传"成功那次"的 usage（失败重试的中间成本不单独计费，吸收进加价倍率 N）。 */
+ *  多端点/重试路径透传"成功那次"的 usage（失败重试的中间成本不单独计费，吸收进加价倍率 N）。
+ *  opts：catalog 车道的行为参数（response_format 支持性等），见 AICallOpts。 */
 export async function callAI(
   apiKey: string,
   baseUrl: string | string[],
@@ -164,30 +217,35 @@ export async function callAI(
   maxTokens?: number,
   temperature?: number,
   deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
+  opts?: AICallOpts,
 ): Promise<AIResult> {
   // json 请求带 response_format 仅是"强制输出 JSON"的开关。部分端点不支持该参数
   // （Agnes 文档未列出该字段），失败后去掉重试一次即可——提示词本身已强制"输出纯 JSON"。
+  // catalog 车道直接以 jsonMode 为准；free/byok 硬编码车道按模型名正则 + 运行时记忆推断。
   const responseFormatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
-  const skipFormat = /^(agnes-|deepseek-ai\/)/i.test(model) || skipResponseFormatModels.has(responseFormatKey);
+  const skipFormat = opts?.supportsResponseFormat !== undefined
+    ? !opts.supportsResponseFormat
+    : /^(agnes-|deepseek-ai\/)/i.test(model) || skipResponseFormatModels.has(responseFormatKey);
 
   if (json && skipFormat) {
-    return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
+    return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline, opts);
   }
 
   // 其余 json 请求先带 response_format；失败后去掉该参数重试一次并缓存
   if (json) {
     try {
-      return await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, true, contentParts, maxTokens, temperature, deadline);
+      return await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, true, contentParts, maxTokens, temperature, deadline, opts);
     } catch (firstErr: any) {
       const firstMsg = String(firstErr?.message ?? '');
       // 限流、鉴权、配置和服务端错误重试 response_format 没有意义；
       // abort/超时同理——不是参数问题，回退重试只会再烧一次上游计费（2026-11-01 故障复盘）。
-      if (isRateLimitMessage(firstMsg) || isCloudflareEndpointBlock(firstMsg)
+      // noRetry 车道（上游不稳）：任何失败都不做第二次上游调用
+      if (opts?.noRetry || isRateLimitMessage(firstMsg) || isCloudflareEndpointBlock(firstMsg)
         || /^AI API error (401|403|404|5\d\d)/.test(firstMsg) || /abort|timed? ?out/i.test(firstMsg)) {
         throw firstErr;
       }
       console.error(`[callAI] 带 response_format 调用失败（${firstMsg || '未知错误'}），去掉该参数重试`);
-      const retry = await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
+      const retry = await callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline, opts);
       // 容量守卫：key 含任意 BYOK model@baseUrl，长命 isolate 下防缓慢膨胀
       if (skipResponseFormatModels.size >= 200) skipResponseFormatModels.clear();
       skipResponseFormatModels.add(responseFormatKey);
@@ -196,7 +254,7 @@ export async function callAI(
   }
 
   // json=false（纯文本）：原样请求
-  return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline);
+  return callAIEndpoints(apiKey, baseUrl, model, systemPrompt, userPrompt, false, contentParts, maxTokens, temperature, deadline, opts);
 }
 
 /** 多端点调度：按"谁先解封"排班逐个尝试。全部端点被 1015 封住且最早解封超出
@@ -212,6 +270,7 @@ async function callAIEndpoints(
   maxTokens?: number,
   temperature?: number,
   deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
+  opts?: AICallOpts,
 ): Promise<AIResult> {
   const urls = orderEndpoints(baseUrl);
   if (urls.length === 0) throw new Error('未配置 AI 接口地址');
@@ -249,7 +308,7 @@ async function callAIEndpoints(
     for (const url of order) {
       if (Date.now() >= deadline) throw new Error('AI 调用超时');
       try {
-        const result = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+        const result = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline, opts);
         if (result.content && result.content.trim()) return result;
         console.error(`[callAI] 端点 ${url} 返回空内容（HTTP 200），尝试下一端点`);
         lastError = new Error(`AI 返回空内容（${url}）`);
@@ -272,12 +331,14 @@ async function callAIEndpoints(
 
         allEdgeBlocked = false;
 
-        // 账户 RPM：额度问题，换端点无效；短等后同端点再打一次
+        // 账户 RPM：额度问题，换端点无效；短等后同端点再打一次（noRetry 车道跳过——
+        // 重试只会再烧一次上游计费，直接上抛）
         if (isRateLimitMessage(msg)) {
+          if (opts?.noRetry) throw lastError;
           const sec = aiRetryAfterSec(e);
           await sleep(sec === null ? 1000 : Math.min(sec * 1000 + 300, 5000));
           try {
-            const retry = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+            const retry = await callAIFetch(apiKey, url, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline, opts);
             if (retry.content && retry.content.trim()) return retry;
           } catch (retryErr: any) {
             lastError = retryErr instanceof Error ? retryErr : new Error(String(retryErr));
@@ -324,19 +385,24 @@ export async function callAIStreaming(
   maxTokens?: number,
   temperature?: number,
   deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
+  opts?: AICallOpts,
 ): Promise<AIResult> {
   // Agnes 免费通道：apihub 流式支持未验证 → 直接委托非流式（保持既有行为）
   if (/^agnes-/i.test(model)) {
-    return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+    return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline, opts);
   }
   const formatKey = `${model}@${Array.isArray(baseUrl) ? baseUrl.join(',') : baseUrl}`;
-  const useFormat = json && !skipResponseFormatModels.has(formatKey);
+  const useFormat = json && (opts?.supportsResponseFormat !== undefined
+    ? opts.supportsResponseFormat
+    : !skipResponseFormatModels.has(formatKey));
 
   const streamOnce = async (endpointUrl: string, withFormat: boolean): Promise<AIResult> => {
     const controller = new AbortController();
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastArmAt = 0;
     const armIdle = () => {
       if (idleTimer) clearTimeout(idleTimer);
+      lastArmAt = Date.now();
       idleTimer = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
     };
     armIdle();
@@ -353,11 +419,12 @@ export async function callAIStreaming(
           ],
           temperature: temperature ?? 0.3,
           ...(maxTokens ? { max_tokens: maxTokens } : {}),
+          ...thinkingBodyFor(model, opts),
           stream: true,
           stream_options: { include_usage: true },
           ...(withFormat ? { response_format: { type: 'json_object' } } : {}),
         }),
-        signal: controller.signal,
+        signal: opts?.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal,
       });
       if (!resp.ok) {
         const errText = await resp.text();
@@ -378,7 +445,10 @@ export async function callAIStreaming(
         const { done: rdDone, value } = await reader.read();
         if (rdDone) break;
         if (Date.now() >= deadline) { controller.abort(); throw new Error('AI 调用超时'); }
-        armIdle();
+        // 空闲计时器按时间节流重挂（Free plan CPU 降耗）：逐帧 clearTimeout/setTimeout
+        // 在数千帧的长思考流里白烧 CPU。节流到 ≥5s 一次后，语义不变——计时器只在
+        // 连续 ~55s 无新帧时才会真正走完 60s 触发 abort，数据流动时被持续重置。
+        if (Date.now() - lastArmAt >= STREAM_IDLE_REARM_MS) armIdle();
         buf += dec.decode(value, { stream: true });
         let nl: number;
         while ((nl = buf.indexOf('\n')) >= 0) {
@@ -387,14 +457,14 @@ export async function callAIStreaming(
           if (!line.startsWith('data:')) continue;
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') { done = true; continue; }
+          // 思考流降耗：纯 reasoning 块（占长思考请求的 95%+ 帧量）既不产出 content
+          // 也不含 usage，逐帧 JSON.parse 白烧 CPU（累计可撞运行时 CPU 上限被无声杀请求）。
+          // 注意 '"content"' 带引号匹配不会命中 '"reasoning_content"'（其 content 前是下划线）。
+          if (payload.includes('"reasoning_content"') && !payload.includes('"content"') && !payload.includes('"usage"')) continue;
           try {
             const j = JSON.parse(payload);
-            if (j.usage && typeof j.usage.prompt_tokens === 'number') {
-              usage = {
-                prompt_tokens: j.usage.prompt_tokens,
-                completion_tokens: j.usage.completion_tokens ?? 0,
-              };
-            }
+            const parsed = parseUsage(j.usage);
+            if (parsed) usage = parsed;
             const delta = j.choices?.[0]?.delta?.content ?? j.choices?.[0]?.text ?? '';
             if (delta) content += delta;
           } catch { /* 单帧解析失败忽略（SSE 容错） */ }
@@ -412,11 +482,7 @@ export async function callAIStreaming(
             const text = j.choices?.[0]?.message?.content ?? j.choices?.[0]?.text ?? '';
             if (typeof text === 'string' && text.trim()) {
               console.error('[callAI] 流式请求收到非流式 JSON body，已就地解析');
-              const u = j.usage;
-              const usage = u && typeof u.prompt_tokens === 'number'
-                ? { prompt_tokens: u.prompt_tokens, completion_tokens: u.completion_tokens ?? 0 }
-                : undefined;
-              return { content: text, usage };
+              return { content: text, usage: parseUsage(j.usage) };
             }
           } catch { /* 非 JSON，按空内容处理 */ }
         }
@@ -425,6 +491,8 @@ export async function callAIStreaming(
       return { content, usage };
     } catch (err: any) {
       if (/abort/i.test(String(err?.message ?? '')) && Date.now() < deadline) {
+        // 外部中止（SSE 客户端断开）原样上抛：不误报"空闲超时"（日志语义 + 端点循环空转）
+        if (opts?.signal?.aborted) throw err;
         throw new Error(`AI 流式连接空闲超时（${STREAM_IDLE_TIMEOUT_MS / 1000}s 无数据）`);
       }
       throw err;
@@ -446,10 +514,11 @@ export async function callAIStreaming(
       // 参数不支持（常见于代理/模型不认 response_format 或 stream）：记忆并回退非流式
       if (/^AI API error (400|415|422)/.test(msg)) {
         // 仅流式可用模型（中转推理模型非流式 content=null）：不回退，原样上抛
-        if (/^deepseek-ai\//i.test(model)) throw err;
+        // （catalog 车道以 streamOnly 为准；free/byok 硬编码车道按模型名正则推断）
+        if (opts?.streamOnly === true || (opts?.streamOnly === undefined && /^deepseek-ai\//i.test(model))) throw err;
         skipResponseFormatModels.add(formatKey);
         console.error(`[callAI] 流式参数不被支持（${msg.slice(0, 80)}），回退非流式`);
-        return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline);
+        return callAI(apiKey, baseUrl, model, systemPrompt, userPrompt, json, contentParts, maxTokens, temperature, deadline, opts);
       }
       // 限流/鉴权/模型不存在/服务端错误：换端点也无济于事，立即上抛（与 callAIEndpoints 同语义）
       if (isRateLimitMessage(msg) || isCloudflareEndpointBlock(msg) || /^AI API error (401|403|404|5\d\d)/.test(msg)) {
@@ -474,6 +543,7 @@ async function callAIFetch(
   maxTokens?: number,
   temperature?: number,
   deadline: number = Date.now() + AI_TOTAL_BUDGET_MS,
+  opts?: AICallOpts,
 ): Promise<AIResult> {
   const controller = new AbortController();
   const timeoutMs = Math.max(1000, Math.min(AI_TIMEOUT_MS, deadline - Date.now()));
@@ -501,8 +571,9 @@ async function callAIFetch(
         temperature: temperature ?? (json ? 0.3 : 0.7),
         ...(json ? { response_format: { type: 'json_object' } } : {}),
         ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        ...thinkingBodyFor(model, opts),
       }),
-      signal: controller.signal,
+      signal: opts?.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal,
     });
 
     if (!resp.ok) {
@@ -519,25 +590,7 @@ async function callAIFetch(
     }
 
     const data: any = await resp.json();
-    // usage 逐字段宽松解析：上游各自的缓存拆分字段名不一（DeepSeek 顶层 *cache*_tokens，
-    // OpenAI 系在 prompt_tokens_details.cached_tokens），拿得到就透传，拿不到不阻塞计费
-    const usage = data.usage && typeof data.usage.prompt_tokens === 'number'
-      ? (() => {
-        const u = data.usage;
-        const hit = typeof u.prompt_cache_hit_tokens === 'number' ? u.prompt_cache_hit_tokens
-          : typeof u.prompt_tokens_details?.cached_tokens === 'number' ? u.prompt_tokens_details.cached_tokens
-          : undefined;
-        const miss = typeof u.prompt_cache_miss_tokens === 'number' ? u.prompt_cache_miss_tokens
-          : hit !== undefined && typeof u.prompt_tokens === 'number' ? u.prompt_tokens - hit
-          : undefined;
-        return {
-          prompt_tokens: u.prompt_tokens,
-          completion_tokens: u.completion_tokens ?? 0,
-          ...(hit !== undefined && hit >= 0 ? { prompt_cache_hit_tokens: hit } : {}),
-          ...(miss !== undefined && miss >= 0 ? { prompt_cache_miss_tokens: miss } : {}),
-        };
-      })()
-      : undefined;
+    const usage = parseUsage(data.usage);
     return { content: data.choices?.[0]?.message?.content ?? '', usage };
   } finally {
     clearTimeout(timer);

@@ -10,7 +10,7 @@
 //   游客（未登录，设备 cookie 标识）：每天 3 次，且必须是「当天唯一一篇作文的
 //        一稿/二稿/三稿」——每篇最多 3 稿、每稿最多成功批改 1 次。
 //   登录用户：每天 10 次。
-//   付费通道（DeepSeek/积分）与自备 Key：按量计费，不占免费次数。
+//   付费通道（DeepSeek/credit）与自备 Key：按量计费，不占免费次数。
 // ============================================================
 
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types';
@@ -145,7 +145,7 @@ export async function checkReviewGate(
       }
       : {
         ok: false, status: 409, code: 'quota_exhausted',
-        error: `今日 ${MEMBER_DAILY_REVIEWS} 次免费批改已用完。可切换「DeepSeek（积分）」或「我的 Key」，或明天再来。`,
+        error: `今日 ${MEMBER_DAILY_REVIEWS} 次免费批改已用完。可切换「DeepSeek（credit）」或「我的 Key」，或明天再来。`,
       };
   }
   return { ok: true, state };

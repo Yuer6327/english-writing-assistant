@@ -69,20 +69,22 @@ export function settle(
     promptCacheHitTokens?: number; promptCacheMissTokens?: number;
     calls?: number;
   },
+  /** 可选归属校验：携带即要求 hold.user_id 匹配（纵深防御，2026-11-06 审计） */
+  userId?: string,
 ): Promise<{ charged: number; refunded: number; balance: number }> {
-  return call(env, `/internal/holds/${holdId}/settle`, { method: 'POST', body: usage });
+  return call(env, `/internal/holds/${holdId}/settle`, { method: 'POST', body: { ...usage, userId } });
 }
 
 export function release(
-  env: Env, holdId: string,
+  env: Env, holdId: string, userId?: string,
 ): Promise<{ refunded: number; balance: number }> {
-  return call(env, `/internal/holds/${holdId}/release`, { method: 'POST', body: {} });
+  return call(env, `/internal/holds/${holdId}/release`, { method: 'POST', body: { userId } });
 }
 
-/** 静默释放（失败路径兜底，绝不掩盖主错误） */
-export async function releaseQuietly(env: Env, holdId: string | undefined): Promise<void> {
+/** 静默释放（失败路径兜底，绝不掩盖主错误）。userId 可选透传（hold 归属校验，与 settle 同口径） */
+export async function releaseQuietly(env: Env, holdId: string | undefined, userId?: string): Promise<void> {
   if (!holdId) return;
-  try { await release(env, holdId); } catch (err) {
+  try { await release(env, holdId, userId); } catch (err) {
     console.error('[billing] release 失败（将被 cron 过期释放兜底）:', err instanceof Error ? err.message : err);
   }
 }
@@ -92,7 +94,7 @@ export function wallet(env: Env, userId: string): Promise<{ balance: number }> {
 }
 
 export interface ModelConfig {
-  provider: 'agnes' | 'deepseek' | 'byok';
+  provider: string;   // 'agnes' | 'longcat' | 'deepseek' | 'byok' | ...（由 billing catalog 单源下发，客户端不再枚举）
   key: string;
   baseUrl: string | string[];
   model: string;
@@ -113,6 +115,35 @@ export interface ByokStatus {
   agnes_available: boolean;
 }
 
+/** 服务目录条目（GET /internal/catalog 下发的脱敏子集；模型库单源，客户端不自维护模型表）。
+ *  免费档约定在客户端硬编码（lane 'free'），不依赖本列表。 */
+export interface CatalogEntry {
+  id: string;              // billing 服务 id（'llm:longcat' 等；hold/settle/config 用）
+  lane: string;            // 对外车道短名（前端选项 value，兼容旧 model_id）
+  provider: string;        // 'deepseek' | 'longcat' | ...
+  tier: 'free' | 'free-quota' | 'paid';
+  enabled: boolean;
+  heavy: boolean;
+  vision: boolean;
+  jsonMode: boolean;       // 上游支持 response_format
+  displayName: string;     // 下拉显示名（也是响应里 model 展示串）
+  hint: string | null;     // 选中提示文案
+  streamOnly: boolean;     // 仅流式可用
+  maxOutputFactor: number; // max_tokens 放大倍数（reasoning 占预算）
+  maxOutputMin: number | null;
+  budgetMs: number | null; // AI 时间预算
+  thinkingBudget: number | null; // 思考预算（LongCat 系 budget_tokens；null = 不发思考参数）
+  imageTokenEstimate: number | null;
+  noRetry: boolean;
+  price: { inputHitPer1k: number; inputMissPer1k: number; outputPer1k: number } | null; // 微积分/1k；null=免费
+}
+
+/** 模型库（billing 目录）。TTL 缓存由 api-config.getCatalog 管理（含失败降级口径） */
+export async function catalog(env: Env): Promise<CatalogEntry[]> {
+  const d = await call<{ services: CatalogEntry[] }>(env, '/internal/catalog');
+  return d.services;
+}
+
 export function byokStatus(env: Env, userId: string): Promise<ByokStatus> {
   return call(env, `/internal/byok/${userId}`);
 }
@@ -120,6 +151,10 @@ export function byokStatus(env: Env, userId: string): Promise<ByokStatus> {
 export interface BillingOverview {
   balance: number;
   paid_enabled: boolean;
+  relay_enabled?: boolean;
+  longcat_enabled?: boolean;
+  /** 客户端模型库单源（含免费档）；旧版逐车道 flag 保留一个版本兼容 */
+  models?: CatalogEntry[];
   quota: Record<string, { service: string; period: string; used: number; limit: number }[]>;
   recent_usage: Record<string, unknown>[];
 }

@@ -14,7 +14,7 @@
 // ============================================================
 
 import { callAI, extractJSON } from './ai';
-import type { ContentPart } from './ai';
+import type { ContentPart, AICallOpts } from './ai';
 import { stripInvisible, scanInjection, type InjectionReport } from './injection';
 
 /** 图内文字抽取提示词（system 位）：只转写、不解释、不翻译、不纠错（与手写 OCR 同纪律）。
@@ -78,7 +78,7 @@ export async function scanTopicImages(
   baseUrl: string | string[],
   model: string,
   images: string[],
-  opts?: { deadline?: number; temperature?: number },
+  opts?: { deadline?: number; temperature?: number; aiOpts?: AICallOpts },
 ): Promise<ImageTextScan> {
   if (!images.length) return { text: '', report: EMPTY_REPORT, scanned: false };
 
@@ -97,7 +97,7 @@ export async function scanTopicImages(
       // 提示词走 system 位（红队 P2-4）；contentParts 首位是短指令（与 ocr.ts 同构，
       // callAI 在 contentParts 存在时忽略 userPrompt 参数）
       apiKey, baseUrl, model, IMAGE_TEXT_PROMPT, '', true, contentParts,
-      1024, opts?.temperature ?? 0.1, opts?.deadline ?? Date.now() + 20_000,
+      1024, opts?.temperature ?? 0.1, opts?.deadline ?? Date.now() + 20_000, opts?.aiOpts,
     );
     const j = extractJSON(raw.content);
     const text = typeof j?.text === 'string' ? j.text : '';

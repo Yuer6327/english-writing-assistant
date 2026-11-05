@@ -259,7 +259,25 @@ interface ServiceDef {
 3. `ocr:baidu` — kind percall / tier free-quota（额度内免费，超出按次）/ enabled:true / heavy:false / price `{perCall: 10000}`（10000 微积分 = 1 积分）。
 4. 伪模型 `byok` — 不入目录；`config/hold` 遇到 `modelId='byok'` 走 byok_keys 解析，零计费。
 
-另外导出 `PROJECTS = ['writing']`（未来加 'reading'）与 `estimateHoldCost(service, estInputTokens, maxOutputTokens)`：llm = `ceil((est_in*inputPer1k + max_out*outputPer1k)/1000)`，最低 1 分；percall = perCall。
+另外导出 `PROJECTS = ['writing']`（未来加 'reading'）与 `estimateHoldCost(service, estInputTokens, maxOutputTokens)`。
+
+> ⚠️ 本节及 §3.5 的旧字段名/公式（`inputPer1k/outputPer1k`、「最低 1 分」、settle 向上取整到分、TTL 5 分钟）是设计稿历史口径，**以实现为准**：price 为三档 `{inputHitPer1k, inputMissPer1k, outputPer1k, perCall}`（微积分/1k）；结算按上游 usage 缓存拆分三档计价、成本 ceil 到微积分（`actualCostMicro`）；hold TTL 10 分钟（> relay/longcat budgetMs 300s）；settle/release 带退款行 NOT EXISTS 守卫与可选 userId 归属校验；gift/recharge/setBalance/codes 强制 operator + 日限/批上限。现行契约见 §3.4.1 与 billing 仓库源码。
+
+### 3.4.1 模型库单源契约（2026-11-05 增补）
+
+**billing catalog 是所有子项目共用的唯一模型库。** `ServiceDef` 除定价/端点外，还承载客户端展示与行为字段：`provider` / `lane`（对外车道短名）/ `displayName` / `hint` / `hidden` / `streamOnly` / `maxOutputFactor` / `maxOutputMin` / `budgetMs` / `imageTokenEstimate` / `noRetry`。下发通道：
+
+- `GET /internal/catalog`（X-Internal-Token）→ `{services:[...]}`，仅 `kind==='llm' && !hidden && lane` 的条目，脱敏（**绝不含 baseUrl/secretName/密钥**），price 为 `resolveTokenPrice` 解析后的三档微积分/1k（null=免费）。
+- `GET /internal/overview/:userId` 同步返回 `models` 数组（同形状），essay 的 `/api/billing/me` 原样透传——前端模型下拉/提示/标签的数据源。旧 `paid_enabled/relay_enabled/longcat_enabled` 三 flag 保留一个版本兼容。
+
+**客户端约定（子项目一律如此，如 english-writing）：**
+- **免费档 `lane:'free'`（llm:agnes-flash）在客户端硬编码**：首屏零额外请求、billing 不可用时免费链路仍可用；`AGNES_BASE_URLS/AGNES_MODEL` 常量为此保留。
+- **其余车道运行时懒加载**：后端 `api-config.resolveLane/laneFromBody` 查 catalog（isolate 内 TTL 5 分钟缓存，接受短名或服务 id）；前端下拉 = 硬编码 free（首位）+ catalog 车道（免费→付费排序）+ 硬编码 byok（末位，按 `byok_configured`）；`entry.hint` 作选中提示、`entry.displayName` 作显示名与响应 model 串、行为参数（maxOutput 放大/时间预算/仅流式/response_format/图片估值）全部读 entry，客户端不再按车道枚举。
+- `laneFromBody` 对未知/停用/目录拉取失败一律回落**用户默认车道（byok/free，绝不静默换付费档）**；`resolveLane` 对未知车道 400 `unknown_lane`、停用 409 `model_disabled`。
+
+**启停/调价不改代码**：临时停用设 `DISABLED_SERVICES`（env CSV，如 `llm:longcat,ocr:baidu`），`isServiceEnabled()` 在 catalog/overview/config/hold 四处统一 fail-closed；调价沿用 `priceOverrides` 指向的 env（元/M）。
+
+⇒ **新增/调整模型 = 只改 billing `src/catalog.ts` + `wrangler secret put` + 部署 billing 一次**，两个仓库的其余代码零改动。
 
 ### 3.5 行为规格
 

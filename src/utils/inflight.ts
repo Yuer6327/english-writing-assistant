@@ -5,7 +5,9 @@
 // ============================================================
 
 const inflight = new Map<string, { ts: number; token: string }>();
-const LOCK_TTL_MS = 3 * 60_000;
+// 必须 ≥ 最深 AI 预算（catalog budgetMs=300s）+ 余量（R1 验证）：锁先于请求过期的话，
+// 长思考请求运行中途同用户可并发第二笔（双倍烧上游）。6min = 300s 预算 + 一倍缓冲。
+const LOCK_TTL_MS = 6 * 60_000;
 
 export function tryAcquire(userId: string): string | null {
   // 惰性清扫：过期条目原本只在同一用户再次 acquire 时被覆盖，

@@ -126,8 +126,9 @@ async function attackExpired() {
     return;
   }
   const b0 = await walletOf(U);
-  // dev 必须带 --test-scheduled 启动；POST /__scheduled 真正触发 cron
-  const cronResp = await fetch(BASE + '/__scheduled?cron=' + encodeURIComponent('*/5 * * * *'), { method: 'POST' });
+  // dev 需带 --test-scheduled 启动；wrangler 4.x 的本地 cron 测试端点为
+  // GET /cdn-cgi/local/scheduled（旧 /__scheduled 已 404，2026-11-06 实测）
+  const cronResp = await fetch(BASE + '/cdn-cgi/local/scheduled?cron=' + encodeURIComponent('*/5 * * * *'));
   await new Promise(r => setTimeout(r, 2500));
   const statusAfter = d1(`SELECT status FROM holds WHERE id = '${h.holdId}'`);
   const expired = statusAfter.includes('expired');
@@ -176,7 +177,8 @@ async function attackGarbage() {
 
 async function attackRedeem() {
   console.log('\n═══ 5. 兑换码 ═══');
-  const gen = await req('POST', '/admin/codes', { points: 5000, count: 1 });
+  // 2026-11-06 起 /admin/codes 强制 operator（资金操作溯源）；批次总额上限 1000 credit
+  const gen = await req('POST', '/admin/codes', { points: 5000, count: 1, operator: 'suite:audit' });
   const code = gen.json?.codes?.[0];
   if (!code) { record('5 生成兑换码', 'FAIL', JSON.stringify(gen.json)); return; }
 

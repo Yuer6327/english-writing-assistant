@@ -252,7 +252,7 @@ async function injectNavbarSession() {
     pill.className = 'badge badge-completed';
     pill.href = '/settings.html#billing';
     pill.style.cssText = 'font-variant-numeric:tabular-nums;text-decoration:none';
-    pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} 积分`;
+    pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} credit`;
     right.insertBefore(pill, settingsLink || right.lastElementChild);
   }
   if (session.role === 'admin' && !document.getElementById(ADMIN_LINK_ID)) {

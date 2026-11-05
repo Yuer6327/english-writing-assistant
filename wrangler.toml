@@ -33,6 +33,10 @@ database_id = "85b7d1cc-fbb4-4ffe-8f1e-b6690c193a1f"
 [dev]
 port = 8788
 
+# ⚠️ Free plan：CPU 上限不可配置（[limits] 部署会被 API 拒绝 code 100328），长思考流
+# 只能靠降耗活下来——ai.ts 流式循环已做两层节流：纯 reasoning 帧跳过 JSON.parse、
+# 空闲计时器按时间节流重挂（见 STREAM_IDLE_REARM_MS）。
+
 # ── 可观测性（Workers Observability，各部署保持一致）──
 [observability]
 enabled = true

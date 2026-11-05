@@ -605,6 +605,8 @@ for (const [g, fn] of runners) {
   await fn();
 }
 
+await setMockMode('ok');   // 收尾复位（R2）：inj 组的 shadowlow 等模式不能留在文件里污染下次手动运行
+
 console.log('\n──────── 汇总 ────────');
 const fail = results.filter(r => r.verdict === 'FAIL');
 const pass = results.filter(r => r.verdict === 'PASS').length;

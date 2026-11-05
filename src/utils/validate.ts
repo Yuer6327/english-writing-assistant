@@ -146,10 +146,19 @@ function foldPunctuation(s: string): string {
 
 /** 证据 span 是否与注入命中片段重叠（红队 P2-1：完全包含判定可被"包裹命中短语的一整句"逃逸） */
 function spanHitsInjection(text: string, needle: string, injSpans: InjectionSpan[]): boolean {
-  if (!injSpans.length) return false;
-  const idx = text.indexOf(needle);
-  if (idx < 0) return false;
-  return injSpans.some(s => idx < s.end && s.start < idx + needle.length);
+  if (!injSpans.length || !needle) return false;
+  // 遍历全部命中位置（2026-11-06 审计）：payload 句在干净区与注入区各出现一次时，
+  // 模型引用注入区那份也必须判 void——首个 indexOf 只看第一处会漏。
+  // 上限 64 个命中位（R1 验证）：高度重复文本的最坏遍历在 Free plan CPU 预算下有理论顶爆面；
+  // 64 个连续命中仍不重叠即可判定干净，继续遍历只会更糟，截断是保守方向。
+  let from = 0;
+  for (let seen = 0; seen < 64; seen++) {
+    const idx = text.indexOf(needle, from);
+    if (idx < 0) return false;
+    if (injSpans.some(s => idx < s.end && s.start < idx + needle.length)) return true;
+    from = idx + 1;
+  }
+  return false;
 }
 
 /**

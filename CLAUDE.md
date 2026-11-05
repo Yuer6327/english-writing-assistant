@@ -32,7 +32,7 @@
 
 - **口径是「成功批改次数」**：只有拿到合法批改结果并落库前才 +1（`quota_events`），失败不扣。
 - 计数与规则在**本 Worker**（`src/utils/quota.ts`），不在 billing：成与否、一稿/二稿/三稿、每天一篇这些语义只有业务库知道。
-- 登录用户 10 次/日；游客 3 次/日（= 每天一篇 × 一稿二稿三稿，每稿一次）。付费档（DeepSeek/积分）与自备 Key **不占次数**。
+- 登录用户 10 次/日；游客 3 次/日（= 每天一篇 × 一稿二稿三稿，每稿一次）。付费档（DeepSeek/credit）、LongCat 限时免费档与自备 Key **不占次数**。
 - 免费档调 `billing.hold` 必须带 `skipQuota: true`：billing 已删除 writing 的 LLM 次数规则（`Yuer6327-billing/migrations/0002_quota_handoff.sql`），不带该参数会走「无价服务额度用尽 → 409」分支。
 
 ## 技术栈

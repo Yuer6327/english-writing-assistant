@@ -257,7 +257,7 @@ export async function refreshBalancePill() {
   try {
     const session = await getSession(true);
     if (typeof session?.wallet?.balance === 'number') {
-      pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} 积分`;
+      pill.textContent = `${(session.wallet.balance / 10000).toFixed(2)} credit`;
     }
   } catch { /* 余额刷新失败不影响主流程 */ }
 }
@@ -265,7 +265,8 @@ export async function refreshBalancePill() {
 // ── HTML escape ──
 export function escapeHtml(str) {
   if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  // ' 也转义：属性上下文之外防未来回归（2026-11-06 审计建议）
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /** 将 **粗体** 标记转为 <strong>（用于批改修改稿/精修片段渲染） */

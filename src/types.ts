@@ -117,7 +117,8 @@ export interface OcrVlmResult {
 
 /** AI 提供方配置（主模型 / 视觉模型） */
 export interface ApiConfig {
-  provider: 'byok' | 'agnes' | 'deepseek';
+  /** 'agnes' | 'deepseek' | 'longcat' | 'byok' | ...——由 billing catalog 单源下发，客户端不再枚举 */
+  provider: string;
   key: string;
   /** 单个端点（BYOK）或候选端点数组（Agnes 双端点，自动切换） */
   baseUrl: string | string[];

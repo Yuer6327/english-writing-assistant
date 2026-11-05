@@ -14,7 +14,7 @@ import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail, clientIp, rateLimitHit } from '../utils/rate-limit';
 import { callAI, extractJSON, friendlyAIError, isAIRateLimitError } from '../utils/ai';
-import { getVisionConfig, defaultLane, type Lane } from '../utils/api-config';
+import { getVisionConfig, defaultLane, aiCallOpts, type Lane } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
 import { checkGuestOcrGate, recordSuccess } from '../utils/quota';
@@ -106,7 +106,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
       }
       const text = parts.join('\n\n');
       if (!text.trim()) {
-        await billing.releaseQuietly(c.env, holdInfo.holdId);
+        await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
         return c.json({ error: '未识别到文字，请确认图片清晰或更换图片' }, 422);
       }
 
@@ -115,7 +115,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
 
       if (holdInfo.mode === 'hold') {
         try {
-          const s = await billing.settle(c.env, holdInfo.holdId!, { calls: images.length });
+          const s = await billing.settle(c.env, holdInfo.holdId!, { calls: images.length }, userId);
           settled = true;
           return c.json({
             text,
@@ -139,7 +139,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
       });
     } catch (err: any) {
       if (holdInfo.mode === 'hold' && !settled) {
-        await billing.releaseQuietly(c.env, holdInfo.holdId);
+        await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
       }
       console.error('[ocr:baidu] 识别失败:', err?.message ?? String(err));
       // 不透传上游原始报文（可能含端点/账号线索），统一走中文友好文案
@@ -164,13 +164,15 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     return c.json(fail.body, fail.status);
   }
 
-  // deepseek 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大
-  const maxOutput = vlmLane === 'deepseek' ? 8192 : 4096;
+  // 输出上限放大（混合推理 reasoning 占 max_tokens 预算）：目录车道读 catalog 字段，硬编码车道固定 4096
+  const maxOutput = cfg.entry
+    ? Math.max(4096 * cfg.entry.maxOutputFactor, cfg.entry.maxOutputMin ?? 0)
+    : 4096;
 
   let holdInfo: billing.HoldInfo;
   try {
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: estimateTextTokens(OCR_VLM_PROMPT) + estimateImageTokens(images, cfg.provider, cfg.model),
+      estInputTokens: estimateTextTokens(OCR_VLM_PROMPT) + estimateImageTokens(images, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate),
       maxOutputTokens: maxOutput,
       skipQuota: vlmLane === 'free',
     });
@@ -183,7 +185,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
 
   const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;
   if (holdInfo.mode !== 'byok' && lockToken === null) {
-    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
   const locked = holdInfo.mode !== 'byok';
@@ -199,7 +201,8 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     let lastUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', '', true, contentParts, maxOutput, 0.1, aiDeadline);
+        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', '', true, contentParts, maxOutput, 0.1, aiDeadline,
+          { ...aiCallOpts(cfg.entry), signal: c.req.raw.signal });
         lastUsage = raw.usage;
         const result = sanitizeOcrVlm(extractJSON(raw.content));
         if (!result.text.trim()) throw new Error('识别结果为空');
@@ -210,7 +213,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
             const s = await billing.settle(c.env, holdInfo.holdId!, {
               promptTokens: lastUsage?.prompt_tokens,
               completionTokens: lastUsage?.completion_tokens,
-            });
+            }, userId);
             charged = s.charged;
             settled = true;
           } catch (err) {
@@ -227,7 +230,7 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
         });
       } catch (err: any) {
         if (isAIRateLimitError(err)) {
-          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
           return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
         }
         lastErr = err?.message ?? String(err);
@@ -235,12 +238,12 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
         if (/^AI API error \d{3}|abort|timed? ?out|fetch failed|超时/i.test(lastErr)) throw err;
       }
     }
-    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     console.error('[ocr] VLM 识别失败（原始错误仅日志）:', lastErr.slice(0, 300));
     return c.json({ error: '手写识别失败，请稍后重试或更换识别引擎' }, 502);
   } catch (err: any) {
     if (holdInfo.mode === 'hold' && !settled) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     }
     return c.json({ error: friendlyAIError(err) }, 502);
   } finally {

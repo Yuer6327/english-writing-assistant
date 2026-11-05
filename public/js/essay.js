@@ -49,28 +49,33 @@ function setPanelControlsLocked(anchor, locked) {
   });
 }
 
-// ── 模型车道（free / deepseek / byok）：可用选项由 billing 决定 ──
-const laneInfo = { paidEnabled: false, relayEnabled: false, byokConfigured: false, loaded: false };
+// ── 模型车道：free / byok 客户端硬编码（首屏零额外请求，billing 不可用时仍可用）；
+//    其余车道由 billing 模型库单源下发（/api/billing/me 的 models 数组，懒加载）──
+const laneInfo = { models: [], byokConfigured: false, loaded: false };
 let reviewLane = null;       // 批改上次选择（内存记忆）
 let polishLane = null;       // 精修上次选择
 let lastCharge = null;       // { reviewId, points, lane } 本次批改消耗（renderReview 展示）
 
 async function loadLaneInfo() {
   if (laneInfo.loaded) return;
-  // 游客没有钱包/自备 Key，不去碰计费接口（那会 401 触发整页跳登录）
+  // 游客没有钱包/自备 Key，不去碰计费接口（那会 401 触发整页跳登录）；游客仅免费通道（硬编码）
   if (isGuest) { laneInfo.loaded = true; return; }
   try {
     const me = await api.billing.me();
-    laneInfo.paidEnabled = !!me.paid_enabled;
-    laneInfo.relayEnabled = !!me.relay_enabled;
+    laneInfo.models = Array.isArray(me.models) ? me.models.filter(m => m && m.lane && m.enabled) : [];
     laneInfo.byokConfigured = !!me.byok_configured;
     laneInfo.loaded = true;
-  } catch { /* billing 不可用时仅显示免费通道 */ }
+  } catch { /* billing 不可用时仅显示免费通道（硬编码） */ }
 }
 
 /** 默认车道：已配置我的 Key → byok，否则免费通道（与服务端默认规则一致） */
 function defaultLane() {
   return laneInfo.byokConfigured && !isGuest ? 'byok' : 'free';
+}
+
+/** 车道值是否合法：硬编码 free/byok + 目录下发的车道短名 */
+function isKnownLane(v) {
+  return v === 'free' || v === 'byok' || laneInfo.models.some(m => m.lane === v);
 }
 
 /** 剩余免费次数徽标文案 */
@@ -79,38 +84,37 @@ function remainingLabel() {
   return `剩余 ${sessionQuota.remaining}/${sessionQuota.limit}`;
 }
 
-/** 模型选择 <select> HTML（id 唯一）；value 归一到合法车道 */
+/** 模型选择 <select> HTML（id 唯一）；value 归一到合法车道。
+ *  免费档硬编码首位（含服务端配额），目录车道按 免费→付费 排序跟随其后，BYOK 恒在末位。 */
 function modelSelectHtml(id, remembered) {
   if (isGuest) {
     return `<select class="form-input" id="${id}" aria-label="模型通道（游客仅免费通道）" style="width:auto;padding:4px 8px;font-size:13px" title="游客只能使用免费通道">
       <option value="free">免费通道 · ${escapeHtml(remainingLabel())}</option>
     </select>`;
   }
-  const value = ['free', 'deepseek', 'deepseek-relay', 'byok'].includes(remembered)
-    ? remembered : defaultLane();
+  const value = isKnownLane(remembered) ? remembered : defaultLane();
+  const catalogOpts = laneInfo.models
+    .filter(m => m.lane !== 'free' && m.lane !== 'byok')
+    .sort((a, b) => (a.tier === 'paid') - (b.tier === 'paid'))
+    .map(m => `<option value="${escapeHtml(m.lane)}"${value === m.lane ? ' selected' : ''}>${escapeHtml(m.displayName)}</option>`)
+    .join('');
   const opts = [
     `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（今日剩余 ${sessionQuota ? sessionQuota.remaining : '—'} 次）</option>`,
-    laneInfo.paidEnabled
-      ? `<option value="deepseek"${value === 'deepseek' ? ' selected' : ''}>DeepSeek（积分）</option>` : '',
-    laneInfo.relayEnabled
-      ? `<option value="deepseek-relay"${value === 'deepseek-relay' ? ' selected' : ''}>DeepSeek V4.1（半价）</option>` : '',
+    catalogOpts,
     laneInfo.byokConfigured
       ? `<option value="byok"${value === 'byok' ? ' selected' : ''}>我的 Key（自备）</option>` : '',
   ].join('');
   return `<select class="form-input" id="${id}" aria-label="选择模型通道" style="width:auto;padding:4px 8px;font-size:13px">${opts}</select>`;
 }
 
-/** 选中积分档时的提示文案（选中 DeepSeek 时显示在按钮旁） */
-const PAID_HINT = '约 0.02~0.05 积分/次 · 按上游实际用量结算';
-const RELAY_HINT = '约 0.01~0.025 积分/次 · 官方半价 · 推理模型生成较慢（1~3 分钟）';
-
+/** 选中计费档时的提示文案：来自 billing 模型库（entry.hint，含价格量级/耗时），本地不再维护 */
 function bindPaidHint(selectEl, hintEl) {
   if (!selectEl || !hintEl) return;
   const sync = () => {
-    const v = selectEl.value;
-    const show = v === 'deepseek' || v === 'deepseek-relay';
-    hintEl.style.display = show ? 'inline' : 'none';
-    if (show) hintEl.textContent = v === 'deepseek-relay' ? RELAY_HINT : PAID_HINT;
+    const m = laneInfo.models.find(x => x.lane === selectEl.value);
+    const hint = m && m.hint;
+    hintEl.style.display = hint ? 'inline' : 'none';
+    if (hint) hintEl.textContent = hint;
   };
   selectEl.addEventListener('change', sync);
   sync();
@@ -121,7 +125,7 @@ function showInsufficientBalance() {
   wbModal(`
     <div style="text-align:center;padding:8px 0">
       <div style="font-size:34px;margin-bottom:10px">😔</div>
-      <div style="font-weight:600;font-size:16px;margin-bottom:14px">积分余额不足</div>
+      <div style="font-weight:600;font-size:16px;margin-bottom:14px">credit 余额不足</div>
       <div class="chip-row" style="justify-content:center;margin-bottom:18px">
         <span class="chip">兑换码充值</span>
         <span class="chip">自备 Key</span>
@@ -201,7 +205,7 @@ export async function init() {
   sessionQuota = session.quota || null;
   sessionName = session.username || '已登录';
   laneInfo.loaded = false;
-  laneInfo.paidEnabled = false;
+  laneInfo.models = [];
   laneInfo.byokConfigured = false;
   reviewLane = null;
   polishLane = null;
@@ -458,7 +462,7 @@ function renderDraftPanel() {
                <button class="btn" id="btn-new-draft" style="padding:5px 12px;font-size:13px" ${reviewPending || rewritePending || deletePending ? 'disabled' : ''} ${draftLocked ? 'title="游客每篇最多 3 稿，登录后可继续写"' : ''}>✍️ 写${cnNum[d.version] || d.version + 1}稿${draftLocked ? ' 🔒' : ''}</button>
                <button class="btn ${rewritePending ? 'btn-busy' : ''}" id="btn-rewrite" style="padding:5px 12px;font-size:13px" ${rewritePending ? 'disabled title="预计约 1 分钟"' : reviewPending || deletePending ? 'disabled' : ''} ${rewriteLocked ? 'title="全文润色需要登录"' : ''}>${rewritePending ? '<span class="spinner spinner-sm"></span><span>润色中</span><span class="busy-time">约 1 分钟</span>' : `全文润色${rewriteLocked ? ' 🔒' : ''}`}</button>
                <button class="btn" id="btn-del-draft" style="padding:5px 12px;font-size:13px" ${deletePending ? 'disabled' : ''}>${deletePending ? '删除中...' : '删除'}</button>
-               <span id="review-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>`}
+               <span id="review-paid-hint" class="muted" style="display:none;font-size:12px"></span>`}
         </div>
       </div>
       ${stale ? '<div style="font-size:12px;color:#d64545;margin-bottom:8px">⚠ 稿件在上次批改后已修改，建议重新批改</div>' : ''}
@@ -732,9 +736,9 @@ function renderReview() {
     { name: '结构', val: num(sub.organization), max: 4, basis: basis.organization },
   ];
   const gradeInfo = gradeFor(r.score);
-  // 本次批改的积分消耗（仅最新一次响应有值；0 = 免费/自备 Key）
+  // 本次批改的 credit 消耗（仅最新一次响应有值；0 = 免费/自备 Key）
   const chargeText = lastCharge && lastCharge.reviewId === rv.id
-    ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 10000).toFixed(2)} 积分` : ' · 免费')
+    ? (lastCharge.points > 0 ? ` · 本次消耗 ${(lastCharge.points / 10000).toFixed(2)} credit` : ' · 免费')
     : '';
 
   // 词数硬扣分（服务端判定；<100 词 −5、>500 词 −3，旧记录无该字段按 0）
@@ -889,7 +893,7 @@ function openDraftModal(mode, prefill) {
              </label>
              <div class="chip-row" style="margin-top:8px">
                <span class="chip">百度 5 次/日免费</span>
-               <span class="chip">大模型按量计积分</span>
+               <span class="chip">大模型按量计 credit</span>
              </div>`}
       </div>
       <button class="btn btn-primary" id="btn-ocr">开始识别</button>
@@ -1116,7 +1120,7 @@ function openPolishModal(fragment) {
     <div class="form-group" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <label class="form-label" style="margin:0">模型</label>
       ${modelSelectHtml('polish-model-select', polishLane)}
-      <span id="polish-paid-hint" class="muted" style="display:none;font-size:12px">${PAID_HINT}</span>
+      <span id="polish-paid-hint" class="muted" style="display:none;font-size:12px"></span>
     </div>
     <button class="btn btn-primary" id="btn-run-polish">开始精修</button>
     <div id="polish-result" style="margin-top:16px"></div>
@@ -1143,7 +1147,7 @@ function openPolishModal(fragment) {
       });
       if (gen !== generation || modal !== wbModalEl) return;
       const chargeNote = res.points_charged > 0
-        ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 10000).toFixed(2)} 积分</div>` : '';
+        ? `<div class="muted" style="font-size:12px;margin-bottom:8px">本次消耗 ${(res.points_charged / 10000).toFixed(2)} credit</div>` : '';
       renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
       idleButton(btn);
       btn.textContent = '重新精修';
@@ -1258,7 +1262,7 @@ async function runFullRewrite(e) {
 
   const r = res.result;
   const chargeNote = res.points_charged > 0
-    ? ` · 本次消耗 ${(res.points_charged / 10000).toFixed(2)} 积分` : '';
+    ? ` · 本次消耗 ${(res.points_charged / 10000).toFixed(2)} credit` : '';
   refreshBalancePill();
   const modal = wbModal(`
     <div class="form-group">

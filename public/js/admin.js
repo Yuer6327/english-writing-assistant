@@ -32,16 +32,16 @@ export async function init() {
   }
 
   root.innerHTML = `
-    <!-- 送积分 -->
+    <!-- 送 credit -->
     <div class="card" style="margin-bottom:20px">
-      <h3 style="margin-bottom:12px">送积分</h3>
+      <h3 style="margin-bottom:12px">送 credit</h3>
       <form id="f-gift" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
         <div class="form-group" style="flex:2;min-width:140px;margin-bottom:8px">
           <label class="form-label">用户名</label>
           <input type="text" class="form-input" id="gift-username" required placeholder="username">
         </div>
         <div class="form-group" style="flex:1;min-width:110px;margin-bottom:8px">
-          <label class="form-label">积分（负数为扣减）</label>
+          <label class="form-label">credit（负数为扣减）</label>
           <input type="number" class="form-input" id="gift-yuan" step="0.01" required placeholder="1.00">
         </div>
         <div class="form-group" style="flex:2;min-width:140px;margin-bottom:8px">
@@ -70,7 +70,7 @@ export async function init() {
       <h3 style="margin-bottom:12px">生成兑换码</h3>
       <form id="f-codes" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
         <div class="form-group" style="margin-bottom:8px">
-          <label class="form-label">面额（积分）</label>
+          <label class="form-label">面额（credit）</label>
           <select class="form-input" id="code-yuan">
             <option value="0.1">0.1</option>
             <option value="0.5">0.5</option>
@@ -99,7 +99,7 @@ export async function init() {
           <input type="text" class="form-input" id="manual-username" required placeholder="username">
         </div>
         <div class="form-group" style="flex:1;min-width:110px;margin-bottom:8px">
-          <label class="form-label">积分</label>
+          <label class="form-label">credit</label>
           <input type="number" class="form-input" id="manual-yuan" step="0.01" required placeholder="1.00">
         </div>
         <div class="form-group" style="flex:2;min-width:140px;margin-bottom:8px">
@@ -129,7 +129,7 @@ function fmtPoints(cents) {
 }
 
 function bindAdmin(root, gen) {
-  // ── 送积分 ──
+  // ── 送 credit ──
   root.querySelector('#f-gift').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = e.target.querySelector('button[type=submit]');
@@ -141,7 +141,7 @@ function bindAdmin(root, gen) {
         root.querySelector('#gift-note').value.trim() || undefined,
       );
       if (gen !== generation) return;
-      toast(`已赠送，当前余额 ${fmtPoints(res.balance)} 积分`, 'success');
+      toast(`已赠送，当前余额 ${fmtPoints(res.balance)} credit`, 'success');
       root.querySelector('#gift-yuan').value = '';
     } catch (err) {
       if (gen === generation) toast(err.message, 'error');
@@ -161,7 +161,7 @@ function bindAdmin(root, gen) {
     const tags = data.tags || [];
     return `
       <div style="font-size:14px;margin-bottom:8px">
-        余额 <strong style="font-size:18px">${fmtPoints(data.balance)}</strong> 积分
+        余额 <strong style="font-size:18px">${fmtPoints(data.balance)}</strong> credit
         · 标签：${tags.length ? tags.map(t => `<span class="badge badge-pending">${escapeHtml(t)}</span>`).join(' ') : '<span class="muted">无</span>'}
       </div>
       <form id="f-tags" data-username="${escapeHtml(username)}" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
@@ -172,7 +172,7 @@ function bindAdmin(root, gen) {
       </form>
       ${ledgerRows ? `<table style="width:100%;border-collapse:collapse;font-size:12px">
         <thead><tr style="color:var(--text-light);text-align:left">
-          <th style="padding:4px 8px">时间</th><th style="padding:4px 8px">账目</th><th style="padding:4px 8px">变动（积分）</th>
+          <th style="padding:4px 8px">时间</th><th style="padding:4px 8px">账目</th><th style="padding:4px 8px">变动（credit）</th>
         </tr></thead><tbody>${ledgerRows}</tbody></table>` : '<div class="muted" style="font-size:12px">暂无账目记录</div>'}`;
   };
 
@@ -224,7 +224,7 @@ function bindAdmin(root, gen) {
       const codesText = res.codes.join('\n');
       box.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-          <span class="muted" style="font-size:12px">面额 ${escapeHtml(yuan)} 积分 · ${res.codes.length} 张 · 批次 ${escapeHtml(res.batch)}</span>
+          <span class="muted" style="font-size:12px">面额 ${escapeHtml(yuan)} credit · ${res.codes.length} 张 · 批次 ${escapeHtml(res.batch)}</span>
           <button type="button" class="btn btn-sm" id="btn-copy-codes" style="padding:4px 12px;font-size:12px">复制全部</button>
         </div>
         <textarea class="form-input" rows="${Math.min(10, res.codes.length)}" readonly
@@ -274,7 +274,7 @@ function bindAdmin(root, gen) {
             <th style="padding:4px 8px;border-bottom:1px solid var(--border)">订单号</th>
             <th style="padding:4px 8px;border-bottom:1px solid var(--border)">用户</th>
             <th style="padding:4px 8px;border-bottom:1px solid var(--border)">渠道</th>
-            <th style="padding:4px 8px;border-bottom:1px solid var(--border)">积分</th>
+            <th style="padding:4px 8px;border-bottom:1px solid var(--border)">credit</th>
             <th style="padding:4px 8px;border-bottom:1px solid var(--border)">状态</th>
             <th style="padding:4px 8px;border-bottom:1px solid var(--border)">时间</th>
           </tr></thead>

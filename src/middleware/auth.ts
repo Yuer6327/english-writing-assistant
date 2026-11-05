@@ -85,6 +85,11 @@ async function takeoverGuestData(c: Ctx, userId: string): Promise<void> {
   if (!gid || !GUEST_ID_RE.test(gid)) return;
   const scope = `guest:${gid}`;
   try {
+    // user_flags 一并接管（2026-11-06 审计）：游客期打上的 forced_harden / seeded 等标记
+    // 不迁移会在登录后丢失（F3 累计硬化逃逸窗口）。OR IGNORE 保留成员已有标记。
+    await c.env.DB.prepare(
+      'INSERT OR IGNORE INTO user_flags (user_id, flag) SELECT ?, flag FROM user_flags WHERE user_id = ?',
+    ).bind(userId, scope).run();
     const cnt = await c.env.DB.prepare(
       'SELECT COUNT(*) AS n FROM essays WHERE user_id = ?',
     ).bind(scope).first<{ n: number }>();

@@ -36,12 +36,18 @@ export async function init() {
 // ============================================================
 // 账户与用量（余额 / 免费额度 / 兑换码 / 近期用量）
 // ============================================================
+// 服务标签：免费档/OCR/自备 Key 客户端硬编码（模型库单源约定的客户端例外）；
+// 目录车道（longcat/deepseek/...）由 /api/billing/me 的 models 数组动态补齐（initBillingSection），不再手工维护
 const SERVICE_LABELS = {
   'llm:agnes-flash': '批改（免费档）',
-  'llm:deepseek-flash': '批改（DeepSeek）',
   'ocr:baidu': '百度 OCR',
   'byok': '自备 Key',
 };
+let catalogLabels = {};   // billing 服务 id → displayName（来自 billing catalog，懒加载）
+
+function serviceLabel(id) {
+  return SERVICE_LABELS[id] || catalogLabels[id] || id;
+}
 
 function quotaBar(label, used, limit) {
   const pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 100;
@@ -59,7 +65,7 @@ function renderQuotaRows(el, quota, billingRows) {
     rows.push(quotaBar(quota.scope === 'guest' ? '批改（游客）' : '批改（免费通道）', quota.used, quota.limit));
   }
   for (const q of billingRows || []) {
-    rows.push(quotaBar(SERVICE_LABELS[q.service] || escapeHtml(q.service), q.used, q.limit));
+    rows.push(quotaBar(escapeHtml(serviceLabel(q.service)), q.used, q.limit));
   }
   const note = quota && quota.scope === 'guest'
     ? `<div class="muted" style="font-size:12px;margin-top:6px">游客：每天 ${quota.essay_limit} 篇 · 一稿/二稿/三稿各一次；登录后每天 10 次、不限篇数</div>`
@@ -93,6 +99,10 @@ export async function initBillingSection(gen = generation) {
   }
   if (gen !== generation) return;
 
+  // 模型库单源：目录车道标签随 me() 懒加载刷新（用量/额度表直接可用）
+  catalogLabels = {};
+  for (const m of me.models || []) catalogLabels[m.id] = m.displayName;
+
   balanceEl.textContent = (me.balance / 10000).toFixed(2);
 
   renderQuotaRows(quotaEl, session?.quota, me.quota?.writing || []);
@@ -104,8 +114,8 @@ export async function initBillingSection(gen = generation) {
   tbody.innerHTML = (me.recent_usage || []).map(u => `
     <tr>
       <td style="padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text-light);white-space:nowrap">${formatBeijingTime(u.created_at)}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${SERVICE_LABELS[u.service] || escapeHtml(u.service)}</td>
-      <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums">${(u.points_charged / 10000).toFixed(2)} 积分</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${escapeHtml(serviceLabel(u.service))}</td>
+      <td style="padding:6px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums">${(u.points_charged / 10000).toFixed(2)} credit</td>
       <td style="padding:6px 8px;border-bottom:1px solid var(--border)">${statusBadge(u.status)}</td>
     </tr>`).join('') || `<tr><td colspan="4" style="padding:12px 8px;color:var(--text-light)">暂无用量记录</td></tr>`;
 
@@ -122,7 +132,7 @@ export async function initBillingSection(gen = generation) {
       try {
         const res = await api.billing.redeem(code);
         if (gen !== generation) return;
-        toast(`兑换成功，到账 ${(res.points / 10000).toFixed(2)} 积分`, 'success');
+        toast(`兑换成功，到账 ${(res.points / 10000).toFixed(2)} credit`, 'success');
         input.value = '';
         await initBillingSection(gen);
       } catch (err) {

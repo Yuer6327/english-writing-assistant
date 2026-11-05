@@ -9,7 +9,7 @@ import type { Env, Vars } from '../types';
 import { userMiddleware } from '../middleware/auth';
 import { aiRateLimit, aiConfigFail, rateLimitHit, clientIp, memberWriteLimitHit } from '../utils/rate-limit';
 import { callAI, callAIStreaming, extractJSON, friendlyAIError, isAIRateLimitError, ContentPart, type AIResult } from '../utils/ai';
-import { getVisionConfig, resolveLane, laneFromBody, type Lane, type ResolvedConfig } from '../utils/api-config';
+import { getVisionConfig, resolveLane, laneFromBody, aiCallOpts, aiDeepOpts, type Lane, type ResolvedConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
 import { tryAcquire, releaseSlot } from '../utils/inflight';
 import {
@@ -40,18 +40,20 @@ const api = new Hono<{ Bindings: Env; Variables: Vars }>();
 // ── 常量 ──
 const MAX_ESSAY_CHARS = 20_000;
 
-/** deepseek-flash 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大 */
-/** deepseek-flash / deepseek-v4.1-flash 为混合推理模型，reasoning 计入 max_tokens 预算，输出上限放大
- *  （中转推理通道生成更慢更长，预算给得比 deepseek 档更宽） */
-const maxOutputFor = (lane: Lane, base: number): number => {
-  if (lane === 'deepseek') return Math.max(base * 2, 8192);
-  if (lane === 'deepseek-relay') return Math.max(base * 3, 16384);
-  return base;
+/** 输出上限 = 基础值 × 目录放大倍数（混合推理模型 reasoning 计入 max_tokens 预算，relay/longcat ×3、
+ *  deepseek ×2、下限 8192/16384）。倍数/下限由 billing catalog 单源下发（entry），客户端不再按车道枚举。 */
+const maxOutputFor = (entry: billing.CatalogEntry | null | undefined, base: number): number => {
+  // isFinite 防呆（R1 验证）：目录条目字段缺失/为 0 时 NaN 会让 max_tokens 整体省略
+  if (!entry || !Number.isFinite(entry.maxOutputFactor) || entry.maxOutputFactor <= 1) {
+    const min = entry && Number.isFinite(entry.maxOutputMin) ? entry.maxOutputMin! : 0;
+    return Math.max(base, min);
+  }
+  return Math.max(base * entry.maxOutputFactor, Number.isFinite(entry.maxOutputMin!) ? entry.maxOutputMin! : 0);
 };
 
-/** 车道时间预算（毫秒）：推理通道思考+生成更慢，心跳保活下放宽到 5 分钟 */
-const aiBudgetFor = (lane: Lane, startedAt: number): number =>
-  startedAt + (lane === 'deepseek-relay' ? 300_000 : 180_000);
+/** 车道时间预算（毫秒）：推理通道思考+生成更慢，心跳保活下放宽到 5 分钟（catalog budgetMs 下发） */
+const aiBudgetFor = (entry: billing.CatalogEntry | null | undefined, startedAt: number): number =>
+  startedAt + (entry?.budgetMs ?? 180_000);
 
 /** billing 错误 → HTTP 响应（402 等直接透传，code 供前端分流） */
 function billingFail(err: unknown): { body: { error: string; code?: string }; status: number } {
@@ -62,19 +64,25 @@ function billingFail(err: unknown): { body: { error: string; code?: string }; st
   return { body: { error: '计费服务暂不可用，请稍后重试', code: 'billing_unavailable' }, status: 503 };
 }
 
-/** 车道 → 对外标签（前端显示与响应 lane 字段） */
-function laneLabel(lane: Lane): 'free' | 'paid' | 'byok' {
-  return lane === 'deepseek' || lane === 'deepseek-relay' ? 'paid' : lane;
+/** 车道 → 对外标签（前端显示与响应 lane 字段）；目录车道按 tier（longcat 限时 0 元对外同 free） */
+function laneLabel(lane: Lane, entry?: billing.CatalogEntry | null): string {
+  if (entry) return entry.tier === 'paid' ? 'paid' : 'free';
+  return lane;
 }
 
 /** 校验图片数组：每项必须是位图 data URL（拒 SVG 等可携带脚本的 MIME），数量/体积封顶 */
-function validImages(images: unknown): { ok: true; images: string[] } | { ok: false; error: string } {
+function validImages(images: unknown): { ok: true; images: string[] } | { ok: false, error: string } {
   if (images === undefined || images === null) return { ok: true, images: [] };
   if (!Array.isArray(images)) return { ok: false, error: 'images 需为数组' };
   if (images.length > MAX_IMAGES) return { ok: false, error: `图片最多 ${MAX_IMAGES} 张` };
   for (const img of images) {
     if (typeof img !== 'string' || !/^data:image\/(png|jpe?g|webp|gif|bmp|heic|heif|avif);base64,/i.test(img)) {
       return { ok: false, error: '图片格式不支持（需 jpg/png/webp 等位图）' };
+    }
+    // base64 字符集校验（比 ocr.ts 更严：禁中间 = / 空白 / URL-safe 变体）：畸形编码在上游报错前就拒
+    const b64 = img.slice(img.indexOf(',') + 1);
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+      return { ok: false, error: '图片编码无效（需标准 base64）' };
     }
     if (img.length > MAX_IMAGE_CHARS) return { ok: false, error: '单张图片过大，请压缩后再上传' };
   }
@@ -497,7 +505,8 @@ api.post('/drafts/:id/review', userMiddleware, aiRateLimit, (c) => {
         const body = await res.json();
         controller.enqueue(enc.encode(`data: ${JSON.stringify({ status: res.status, body })}\n\n`));
       } catch (err) {
-        console.error('[review] SSE 包装层异常:', err instanceof Error ? err.message : err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[review] SSE 包装层异常:', msg);
         controller.enqueue(enc.encode(`data: ${JSON.stringify({ status: 500, body: { error: '服务器内部错误' } })}\n\n`));
       } finally {
         clearInterval(ping);
@@ -520,8 +529,6 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   const isGuest = c.get('isGuest');
   const body = ((await c.req.json<{ model_id?: string }>().catch(() => null)) ?? ({} as any));
   const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
-  // 流式 + 心跳下不再受 ~100s 边缘空闲限制；预算按车道放宽（推理通道 5 分钟）
-  const aiDeadline = aiBudgetFor(lane, startedAt);
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
 
@@ -590,6 +597,12 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     const fail = aiConfigFail(err);
     return c.json(fail.body, fail.status);
   }
+  // 流式 + 心跳下不再受 ~100s 边缘空闲限制；预算按车道放宽（推理通道 5 分钟，catalog budgetMs 下发）
+  const aiDeadline = aiBudgetFor(cfg.entry, startedAt);
+  // 客户端断开 → 取消全部在途上游调用（白烧共享 key 的资源口子，2026-11-06 审计 P2）。
+  // 批改链路一次最多 ~6 次上游调用，断开不取消等于每次断开白烧整条链。
+  const clientSignal = c.req.raw.signal;
+  const liveOpts = (o: ReturnType<typeof aiCallOpts>) => ({ ...o, signal: clientSignal });
 
   // ── 输入侧防护（提示词注入）──
   // 稿件入库时已剥过不可见字符，这里再洗一次兜住存量数据（幂等）。
@@ -614,7 +627,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   // 等于免费用平台额度刷 vision 调用（终判 P1-1）。顺序：hold → 锁 → 扫描/采样/主调用。
   // 免费档带 skipQuota：次数由 checkReviewGate/recordSuccess 按「成功」计数，不由 billing 扣。
   // 6144：issues 不再设 10 条上限（只求准确），给弱文长输出留足余量，避免 JSON 截断 → 重试
-  const maxOutput = maxOutputFor(lane, 6144);
+  const maxOutput = maxOutputFor(cfg.entry, 6144);
   // 预扣估算（此时尚未扫描题图）：题图按 主调用+扫描 两遍图 token 计，
   // 图内文字以文本并入 topic 的部分按 2 万字符上限的保守余量预冻结（settle 多退少补）
   const estImageTextTokens = 6000;
@@ -625,7 +638,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
       // 系统消息按内置默认（最大静态前缀）估：自定义模板时略高估，方向安全
       estInputTokens: estimateTextTokens(REVIEW_SYSTEM_PROMPT) + estUserBase
-        + estimateImageTokens(topicImages, cfg.provider, cfg.model) * (topicImages.length ? 2 : 0)
+        + estimateImageTokens(topicImages, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate) * (topicImages.length ? 2 : 0)
         + (topicImages.length ? estImageTextTokens : 2 * estUserBase),
       maxOutputTokens: maxOutput,
       skipQuota: lane === 'free',
@@ -639,7 +652,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   // 免费档也必须锁：否则连点会并发跑多次，成功后 3 次额度被瞬间吃光
   const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;
   if (holdInfo.mode !== 'byok' && lockToken === null) {
-    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     return c.json({ error: '已有批改任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
   const locked = holdInfo.mode !== 'byok';
@@ -651,9 +664,13 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   if (topicImages.length) {
     imageScan = await scanTopicImages(cfg.key, cfg.baseUrl, cfg.model, topicImages, {
       deadline: Math.min(Date.now() + 25_000, aiDeadline),
+      aiOpts: liveOpts(aiCallOpts(cfg.entry)),
     });
   }
-  harden = harden || imageScan?.report.level === 'high';
+  // 图内文字抽取失败 = 文本侧防线归零（fail-open），但仍把原图交给主调用 VLM：
+  // 攻击者可用"图内指令抑制抽取器"让指令直达评分模型 → 失败时按硬化口径收分
+  // （≤8/≤8/≤3 + 采样取最小），把 fail-open 从"完全不设防"降为"降级设防"（2026-11-06 审计 P2）。
+  harden = harden || imageScan?.report.level === 'high' || imageScan?.failed === true;
 
   // P1 降权呈现：图内文字以文本形式放进 <topic> 数据区（模型对文本数据区的边界
   // 服从度高于图内像素，等于给图内指令补一层隔离）；图内文字命中时同样 datamark。
@@ -734,35 +751,66 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       source: null as 'rule' | 'semantic' | null,
       detectorSpans: 0,   // 语义检测器摘到的 span 数（规则命中时为 0）
       overflow: false,    // 元话语覆盖率 >40%（放弃盲评，降级强制硬化）
+      topicHit: false,    // topic 通道语义检测摘到"对评分者说的话"（→ 强制硬化，2026-11-06 审计 P1）
+      topicSpans: 0,      // topic 通道语义摘到的 span 数（审计字段）
       scoresRaw: null as { content: number; language: number; organization: number } | null,
       scores: null as { content: number; language: number; organization: number } | null,
       argumentation: null as { has_examples: boolean; has_solution: boolean } | null,
     };
     const shadowChain = (async (): Promise<void> => {
-      if (topicImages.length) return;
       const chainStart = Date.now();
       try {
+        // 语义检测（clean 必跑——自适应攻击在规则下全漏；suspicious 也跑——防"诱饵占位
+        // 躲进 suspicious"的免检门；high 已硬化不跑省延迟）。正文与题目并行检测：
+        // 题目是学生可控文本且进入全部评分通道，此前只有规则层（2026-11-06 审计 P1）。
+        const essayDetP = !harden && !topicImages.length
+            && (injection.level === 'clean' || injection.level === 'suspicious')
+          ? callAI(cfg.key, cfg.baseUrl, cfg.model,
+              SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(essayText),
+              true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
+              Math.min(chainStart + 15_000, aiDeadline), liveOpts(aiCallOpts(cfg.entry)))
+            .then((det) => {
+              if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
+              return validateVerbatimSpans(essayText, extractJSON(det.content)?.spans);
+            })
+          : Promise.resolve(null as InjectionSpan[] | null);
+        const topicDetP = !harden && topicInjection.level !== 'high'
+          ? callAI(cfg.key, cfg.baseUrl, cfg.model,
+              SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(topicClean.text),
+              true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
+              Math.min(chainStart + 15_000, aiDeadline), liveOpts(aiCallOpts(cfg.entry)))
+            .then((det) => {
+              if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
+              return validateVerbatimSpans(topicClean.text, extractJSON(det.content)?.spans);
+            })
+          : Promise.resolve([] as InjectionSpan[]);
+        // allSettled（R1 验证）：任一检测拒绝时另一路的 auxUsage 记账 .then 仍要跑完，
+        // 否则窗口内 settle 的 calls/用量会少计一路
+        const [essayR, topicR] = await Promise.allSettled([essayDetP, topicDetP] as const);
+        const essayFound = essayR.status === 'fulfilled' ? essayR.value : null;
+        const topicFound = topicR.status === 'fulfilled' ? topicR.value : [];
+        if (topicFound.length) {
+          shadowState.topicHit = true;
+          shadowState.topicSpans = topicFound.length;
+        }
+
+        // 有题图：正文盲评 B 不跑（题图扫描已覆盖多模态通道，避免延迟叠加），
+        // topic 语义命中已置 topicHit → 主流程强制硬化兜底。
+        if (topicImages.length) return;
+
         let spans: InjectionSpan[] = [];
         if (injection.level !== 'clean' && injection.spans.length) {
           spans = [...injection.spans];
           shadowState.source = 'rule';
         }
-        // 语义检测：clean 必跑（自适应攻击在规则下全漏）；suspicious 也跑
-        // （规则只命中诱饵时，真 payload 靠它摘出）；high（已硬化）不跑，省延迟。
-        if (!harden && (injection.level === 'clean' || injection.level === 'suspicious')) {
-          const det = await callAI(cfg.key, cfg.baseUrl, cfg.model,
-            SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(essayText),
-            true, undefined, maxOutputFor(lane, 400), 0.1,
-            Math.min(chainStart + 15_000, aiDeadline));
-          if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
-          const found = validateVerbatimSpans(essayText, extractJSON(det.content)?.spans);
-          shadowState.detectorSpans = found.length;
-          if (found.length) {
+        if (essayFound) {
+          shadowState.detectorSpans = essayFound.length;
+          if (essayFound.length) {
             // 覆盖率按合并后的 span 集算（规则 + 语义，去重叠）。
             // 超过 40% → 整篇大半是元话语，B 版本失真（遮蔽删文评分失真，RobustJudge 教训）：
             // 彻底放弃盲评（含已有的规则 span，行为与文档口径一致），改由强制硬化兜底。
             const merged = [...spans];
-            for (const s of found) {
+            for (const s of essayFound) {
               if (!merged.some(m => s.start < m.end && m.start < s.end)) merged.push(s);
             }
             const covered = merged.reduce((a, s) => a + (s.end - s.start), 0);
@@ -775,13 +823,24 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
             }
           }
         }
-        if (!spans.length || !shadowState.source) { shadowState.source = null; return; }
-        const redacted = redactSpans(essayText, spans);
-        if (redacted === essayText) { shadowState.source = null; return; }
-        const bUser = buildScoreOnlyUser(topic, redacted, countWords(essayText), false);
+        // B 版本的题目：规则 + 语义 span 合并后 redact（与正文同等待遇）；
+        // 只把题目内容灌进题图转写段之后的固定结构（imageTopicPart 是系统转写，原样保留）
+        let topicForB = topicBase;
+        if (topicFound.length) {
+          const mergedTopic = [...topicInjection.spans];
+          for (const s of topicFound) {
+            if (!mergedTopic.some(m => s.start < m.end && m.start < s.end)) mergedTopic.push(s);
+          }
+          topicForB = redactSpans(topicClean.text, mergedTopic) + imageTopicPart;
+          if (!shadowState.source) shadowState.source = 'semantic';
+        }
+        if ((!spans.length && !topicFound.length) || !shadowState.source) { shadowState.source = null; return; }
+        const redacted = spans.length ? redactSpans(essayText, spans) : essayText;
+        if (redacted === essayText && topicForB === topicBase) { shadowState.source = null; return; }
+        const bUser = buildScoreOnlyUser(topicForB, redacted, countWords(essayText), false);
         const res = await callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT,
-          bUser, true, undefined, maxOutputFor(lane, 900), 0.2,
-          Math.min(chainStart + 40_000, aiDeadline));
+          bUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.2,
+          Math.min(chainStart + 40_000, aiDeadline), liveOpts(aiCallOpts(cfg.entry)));
         if (res.usage) { auxUsage = mergeUsage(auxUsage, res.usage); auxCallsOk++; }
         const j = extractJSON(res.content);
         if (!j || typeof j !== 'object' || !j.subscores) { shadowState.source = null; return; }
@@ -809,9 +868,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     if (scoreDeadline - Date.now() > 5_000) {
       const scoreUser = buildScoreOnlyUser(topic, essayForPrompt, countWords(essayText), harden);
       const rescores = await Promise.allSettled([
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(lane, 900), 0.6, scoreDeadline),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
+        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
       ]);
       for (const r of rescores) {
         if (r.status !== 'fulfilled') {
@@ -847,7 +906,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     // 覆盖率悬崖（检测器摘出的元话语占正文 >40%）→ 强制硬化：
     // "payload 越大审查越少"的激励必须反过来。采样跑在原口径下，
     // 定档/交付分在下面补封顶；harden 翻转同时作用于聚合、主调用钳制与审计。
-    if (shadowState.overflow) harden = true;
+    // topic 通道语义命中（payload 藏在题目里）同样升级硬化。
+    if (shadowState.overflow || shadowState.topicHit) harden = true;
 
     // 3 个有效样本且为内置默认模板（有注入位）→ 中位数定档；布尔判定取多数（平票/全缺视为未知 → 不钳制）
     // 注入命中时改取最小值：三次采样都会被同一段注入污染，中位数救不了；取最小值才逼近"干净时该给的分"
@@ -894,8 +954,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       }
     }
 
-    // 覆盖率悬崖升级 harden 后，采样是未硬化口径 → 定档分补封顶（shadowUsed 已封顶，幂等）
-    if (shadowState.overflow && agreed) {
+    // 覆盖率悬崖/topic 语义命中升级 harden 后，采样是未硬化口径 → 定档分补封顶（shadowUsed 已封顶，幂等）
+    if ((shadowState.overflow || shadowState.topicHit) && agreed) {
       agreed = clampSubscores({}, agreed, INJECTION_SCORE_CAPS);
     }
 
@@ -926,12 +986,12 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           ? baseUser
           : `${baseUser}\n\n【重试提醒】上一次返回不合法（${lastErr}）。请严格按上述 JSON 格式输出，quote 必须逐字取自作文原文。`;
         const raw = await callAIStreaming(
-          cfg.key, cfg.baseUrl, cfg.model, reviewSystem, userPrompt, true, contentParts, maxOutput, 0.2, aiDeadline);
+          cfg.key, cfg.baseUrl, cfg.model, reviewSystem, userPrompt, true, contentParts, maxOutput, 0.2, aiDeadline, liveOpts(aiDeepOpts(cfg.entry)));
         lastUsage = raw.usage;
         const parsed = extractJSON(raw.content);
         if (parsed && typeof parsed === 'object' && parsed.error === 'illegible') {
           // 模型明确判定作文无法辨认：重试必然同样失败，释放预扣并友好返回（finally 释放并发锁）
-          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
           console.error('[review] 模型判定作文正文无法辨认（illegible）');
           return c.json({
             error: '作文正文基本无法辨认（可能因手写不清或识别失败），请核对原文或换一张更清晰的照片后重试',
@@ -956,7 +1016,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         break;
       } catch (err: any) {
         if (isAIRateLimitError(err)) {
-          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
           return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
         }
         lastErr = err?.message ?? String(err);
@@ -966,7 +1026,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       }
     }
     if (!result) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
       console.error(`[review] AI 输出校验失败（${attemptsUsed} 次）: ${lastErr.slice(0, 300)}`);
       return c.json({ error: '批改失败：AI 返回格式不符合要求，请稍后重试' }, 502);
     }
@@ -991,8 +1051,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         result.subscores.content + result.subscores.language + result.subscores.organization
         - result.word_count_penalty);
     }
-    // 覆盖率悬崖升级 harden 后，采样是未硬化口径 → 中位数补封顶
-    if (shadowState.overflow && !agreed) {
+    // 覆盖率悬崖/topic 语义命中升级 harden 后，采样是未硬化口径 → 中位数补封顶
+    if ((shadowState.overflow || shadowState.topicHit) && !agreed) {
       result.subscores = clampSubscores({}, result.subscores, INJECTION_SCORE_CAPS);
       result.score = Math.max(0,
         result.subscores.content + result.subscores.language + result.subscores.organization
@@ -1040,7 +1100,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
           // 主调用（含一次 JSON 重试的可能）+ 成功的采样 + 盲评链路（语义检测 / B 版打分）
           calls: 1 + sampleCallsOk + auxCallsOk,
-        });
+        }, userId);
         charged = s.charged;
         settled = true;
       } catch (err) {
@@ -1053,8 +1113,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       result.improvement.score_delta = result.score - prevReview.score;
     }
 
-    const model = cfg.provider === 'agnes' ? `${cfg.model}（免费通道）`
-      : cfg.provider === 'deepseek' ? `${cfg.model}（按量计费）` : cfg.model;
+    // 展示名以 catalog displayName 为准（单源）；free/byok 硬编码车道沿用旧格式
+    const model = cfg.entry?.displayName ?? (cfg.provider === 'agnes' ? `${cfg.model}（免费通道）` : cfg.model);
 
     const meta = JSON.stringify({
       elapsed_ms: Date.now() - startedAt,
@@ -1081,7 +1141,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         spans_marked_topic: topicInjection.level !== 'clean' ? topicInjection.spans.length : 0,
         invisible_removed: cleaned.removed,
         // F1：语义检测 + 双通道盲评的审计（shadow.used = 已按 B 版本分数交付）
-        semantic: { spans: shadowState.detectorSpans },
+        semantic: { spans: shadowState.detectorSpans, topic_spans: shadowState.topicSpans, topic_hit: shadowState.topicHit },
         shadow: shadowState.source ? {
           source: shadowState.source,
           sum_a: shadowSumA,
@@ -1117,7 +1177,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       insert = insertResult as any;
       // 游客并发重试时第二笔不重复写结果、不计次，直接释放。
       if (isGuest && lane === 'free' && insert?.meta.changes === 0) {
-        if (holdInfo.mode === 'hold' && !settled) await billing.releaseQuietly(c.env, holdInfo.holdId);
+        if (holdInfo.mode === 'hold' && !settled) await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
         return c.json({
           error: '这稿已经批改过了。写下一篇（二稿/三稿）才能再批改——游客每天 3 次，一稿、二稿、三稿各一次。',
           code: 'already_reviewed',
@@ -1154,14 +1214,14 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           flagged: harden || shadowUsed,
         }
         : undefined,
-      points_charged: charged,          // 微积分（前端 ÷10000 展示为积分）
-      lane: laneLabel(lane),            // free / paid / byok
+      points_charged: charged,          // 微积分（前端 ÷10000 展示为 credit）
+      lane: laneLabel(lane, cfg.entry), // free / paid / byok
       quota: await quotaState(c.env.DB, userId, isGuest),
     });
   } catch (err: any) {
     // 外层兜底：任何未结算的意外失败都释放预扣
     if (holdInfo.mode === 'hold' && !settled) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     }
     console.error('[review] 未预期失败:', err?.message ?? err);
     return c.json({ error: friendlyAIError(err) }, 502);
@@ -1178,7 +1238,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
   // 精修/润色对游客关闭（免费通道的 token 成本只留给 3 次批改）
   const denied = memberOnly(c);
   if (denied) return denied;
-  const aiDeadline = Date.now() + 90_000;
+  const startedAt = Date.now();
   const userId = c.get('userId');
   const essayId = parseId(c.req.param('id'));
   if (essayId === null) return c.json({ error: '作文不存在' }, 404);
@@ -1188,7 +1248,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
 
   // ── 入参校验一律前置到预扣费之前 ──
   // 旧实现把片段长度校验放在 hold 之后，早退时既没 settle 也没 release，
-  // 冻结的积分要等 cron 过期才回滚（用户会看到"没批改却扣了额度"）。
+  // 冻结的 credit 要等 cron 过期才回滚（用户会看到"没批改却扣了额度"）。
   const isFragment = body.mode === 'fragment';
   const fragment = strField(body.fragment).trim();
   const instruction = strField(body.instruction).trim().slice(0, 1000) || '无特别要求，按常规标准精修';
@@ -1235,7 +1295,13 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
     return c.json(fail.body, fail.status);
   }
 
-  const maxOutput = maxOutputFor(lane, isFragment ? 3000 : 4096);
+  const maxOutput = maxOutputFor(cfg.entry, isFragment ? 3000 : 4096);
+  // 时间预算按车道下发（推理通道思考 1~3 分钟）：90s 固定值会掐死 LongCat 思考开的全
+  // 文润色（2026-11-06 审计 P1）。流式调用不受单请求 75s 超时约束，只用这个总预算。
+  const aiDeadline = aiBudgetFor(cfg.entry, startedAt);
+  // 客户端断开 → 取消上游（与批改同口径）
+  const clientSignal = c.req.raw.signal;
+  const liveOpts = (o: ReturnType<typeof aiCallOpts>) => ({ ...o, signal: clientSignal });
 
   // ── 预扣费（片段 / 全文输出上限）──
   let holdInfo: billing.HoldInfo;
@@ -1256,7 +1322,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
 
   const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;
   if (holdInfo.mode !== 'byok' && lockToken === null) {
-    await billing.releaseQuietly(c.env, holdInfo.holdId);
+    await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     return c.json({ error: '已有 AI 任务进行中，请等待完成后再试', code: 'concurrent_limit' }, 429);
   }
   const locked = holdInfo.mode !== 'byok';
@@ -1281,13 +1347,14 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
           const userPrompt = attempt === 0
             ? filled
             : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}），请严格按 JSON 格式输出。`;
-          const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4, aiDeadline);
+          // 片段精修也走流式（流式不受 75s 单请求超时约束；relay 车道 streamOnly 仅流式可靠）
+          const raw = await callAIStreaming(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4, aiDeadline, liveOpts(aiCallOpts(cfg.entry)));
           lastUsage = raw.usage;
           parsedResult = sanitizeFragmentPolish(extractJSON(raw.content));
           break;
         } catch (err: any) {
           if (isAIRateLimitError(err)) {
-            await billing.releaseQuietly(c.env, holdInfo.holdId);
+            await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
             return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
           }
           lastErr = err?.message ?? String(err);
@@ -1295,7 +1362,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
         }
       }
       if (!parsedResult) {
-        await billing.releaseQuietly(c.env, holdInfo.holdId);
+        await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
         throw new Error(lastErr || '精修失败');
       }
 
@@ -1306,7 +1373,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
             completionTokens: lastUsage?.completion_tokens,
             promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
             promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
-          });
+          }, userId);
           charged = s.charged;
           settled = true;
         } catch (err) {
@@ -1320,13 +1387,13 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
       ).bind(essayId, contextDraftId, userId, fragment, instruction, JSON.stringify(parsedResult)).run();
       return c.json({
         polish_id: insert.meta.last_row_id as number, mode: 'fragment', result: parsedResult,
-        points_charged: charged, lane: laneLabel(lane),
+        points_charged: charged, lane: laneLabel(lane, cfg.entry),
       });
     }
 
-    // ── 全文润色 ──
+    // ── 全文润色（深度调用：按 catalog thinkingBudget 开思考）──
     if (!contextText) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
       return c.json({ error: '该作文还没有稿件，无法润色' }, 400);
     }
     const filled = fillTemplate(FULL_REWRITE_PROMPT, {
@@ -1343,13 +1410,15 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
         const userPrompt = attempt === 0
           ? filled
           : `${filled}\n\n【重试提醒】上一次返回不合法（${lastErr}），请严格按 JSON 格式输出。`;
-        const raw = await callAI(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4, aiDeadline);
-        lastUsage = raw.usage;
-        parsedResult = sanitizeFullRewrite(extractJSON(raw.content), contextText);
+          // 全文润色走流式 + 思考预算（aiDeepOpts）：75s 非流式硬超时 < LongCat 思考 ~130s，
+          // 非流式在该车道必挂（2026-11-06 审计 P1）
+          const raw = await callAIStreaming(cfg.key, cfg.baseUrl, cfg.model, '', userPrompt, true, undefined, maxOutput, 0.4, aiDeadline, liveOpts(aiDeepOpts(cfg.entry)));
+          lastUsage = raw.usage;
+          parsedResult = sanitizeFullRewrite(extractJSON(raw.content), contextText);
         break;
       } catch (err: any) {
         if (isAIRateLimitError(err)) {
-          await billing.releaseQuietly(c.env, holdInfo.holdId);
+          await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
           return c.json({ error: friendlyAIError(err), rate_limited: true }, 429);
         }
         lastErr = err?.message ?? String(err);
@@ -1358,7 +1427,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
       }
     }
     if (!parsedResult) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
       throw new Error(lastErr || '润色失败');
     }
 
@@ -1369,7 +1438,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
           completionTokens: lastUsage?.completion_tokens,
           promptCacheHitTokens: lastUsage?.prompt_cache_hit_tokens,
           promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
-        });
+        }, userId);
         charged = s.charged;
         settled = true;
       } catch (err) {
@@ -1383,11 +1452,11 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
     ).bind(essayId, contextDraftId, userId, JSON.stringify(parsedResult)).run();
     return c.json({
       polish_id: insert.meta.last_row_id as number, mode: 'full', result: parsedResult,
-      points_charged: charged, lane: laneLabel(lane),
+      points_charged: charged, lane: laneLabel(lane, cfg.entry),
     });
   } catch (err: any) {
     if (holdInfo.mode === 'hold' && !settled) {
-      await billing.releaseQuietly(c.env, holdInfo.holdId);
+      await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
     }
     return c.json({ error: friendlyAIError(err) }, 502);
   } finally {

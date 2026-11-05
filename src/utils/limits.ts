@@ -7,12 +7,17 @@ export const IMAGE_TOKEN_ESTIMATE = 1600;
 /** DeepSeek 官方文档：每张图片消耗 token 上限 1024 */
 export const DEEPSEEK_IMAGE_TOKEN_ESTIMATE = 1024;
 
-/** 图片 token 按张估算，不能按 base64 字符数折算。 */
+/** 图片 token 按张估算，不能按 base64 字符数折算。
+ *  perImage：catalog 下发的每张估值（如 DeepSeek 1024）；未传时按 provider/model 正则推断（free/byok 硬编码车道）。 */
 export function estimateImageTokens(
   images: string[],
   provider?: string,
   model?: string,
+  perImage?: number | null,
 ): number {
+  if (typeof perImage === 'number' && Number.isFinite(perImage) && perImage > 0) {
+    return images.length * perImage;
+  }
   const isDeepSeek = provider === 'deepseek' || /deepseek/i.test(model ?? '');
   return images.length * (isDeepSeek ? DEEPSEEK_IMAGE_TOKEN_ESTIMATE : IMAGE_TOKEN_ESTIMATE);
 }

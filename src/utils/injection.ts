@@ -48,7 +48,7 @@ export interface InjectionReport {
 // 保留 \t \n \r（分段与词数统计依赖）；其余控制字符与格式化字符一律剥离。
 // 这是攻击者把指令藏进"看起来正常"的作文里的主要通道（OWASP Cheat Sheet: Invisible characters）。
 const INVISIBLE_RE =
-  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB]/g;
+  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0100}-\u{E01EF}\u{1D173}-\u{1D17A}\u{1BCA0}-\u{1BCA3}]/gu;
 
 // Unicode Tag 区（U+E0000–E007F）：用于把整段文字"透明化"传给模型（不可见但可读），
 // 正常输入绝不会出现，单独计为强信号。
@@ -229,9 +229,14 @@ export function scanInjection(text: string, invisibleRemoved = 0, invisibleTagge
   let hits = 0;
   let strongHit = false;
 
+  // 换行归一扫描（2026-11-06 审计）：规则窗口 [^。！？\n] 会被"关键词间插换行"整段逃逸
+  // （"ignore all previous\ninstructions"）。把 \n 等长替换为顿号后扫描，命中坐标 1:1
+  // 映射回原文（不改变长度，spans 可直接用于 datamark/redact）。
+  const scanText = text.replace(/\n/g, '、');
+
   for (const rule of RULES) {
     // 每条规则自带 /g；matchAll 不共享 lastIndex，避免并发/重入串状态
-    for (const m of text.matchAll(rule.re)) {
+    for (const m of scanText.matchAll(rule.re)) {
       const start = m.index ?? 0;
       const matched = m[0] ?? '';
       if (matched.length < 2) continue;

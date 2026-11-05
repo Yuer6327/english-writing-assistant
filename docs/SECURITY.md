@@ -133,3 +133,27 @@ node scripts/security/attack-billing.mjs   # billing 23 用例（:8789，需 --t
 - 生产探针：`/api/health` ok；游客态配额按北京日正确；chunked 大请求被边缘归一化后仍被业务 400 拒；`dev-session` 生产 404；`yuer-billing.<subdomain>.workers.dev` 不可达（公网入口关闭实测）；生产两 Worker `INTERNAL_TOKEN` 已配置（`wrangler secret list` 确认）。
 - 已知边缘行为：生产静态页 `X-Frame-Options: SAMEORIGIN` 来自 zone 级边缘注入（Worker 层已强制 DENY，被边缘覆盖；SAMEORIGIN 同样阻断第三方嵌入，属可接受取值，如需 DENY 须在 Cloudflare Zone Transform Rule 调整）。
 - 用户侧待办：auth 平台 admin 账号开启 2FA + 短会话（评审 G4，无法从代码侧核实）；可选配 `ALERT_WEBHOOK` secret 让资金对账告警推到手机。
+
+## 七、第 8 轮攻防（2026-11-06，LongCat 接入后全量复扫 + 修复）
+
+4 路进攻 subagent（跨服务信任边界 / billing 资金业务 / 应用面含注入纵深 / 新增改动回归）+ 双仓回归套件。修复明细：
+
+**billing（资金安全）**
+- [P1] 对账毒丸：无钱包行的 broken hold 使 reconcile 整体崩溃静默失效 → ensureWallet + COALESCE + 单行容错（失败计 alert）。
+- [P2] settle/release 退款 batch 缺 NOT EXISTS 守卫 × cron 补退 = 双退款竞态（实测复现余额凭空 +frozen）→ 与 expireHolds 同款守卫。
+- [P2] gift 日限 check-then-act 可并发打穿（实测 8 并发铸 150 credit）→ 守卫内联进资金 batch（原子）；/admin/recharge、/admin/balance/set、/admin/codes 全部强制 operator（此前账本可匿名入账，且 auth 扣减功能因缺 operator 实际坏损）。
+- [P2] 兑换码单批面值总额无上限（200×100万）→ 钉 1000 credit/批 + operator。
+- [P3] HOLD_TTL 5min == relay/longcat budgetMs 300s → 迟到 settle 白嫖 → TTL 提到 10min；webhook 口令不再回退 INTERNAL_TOKEN；孤儿补入加幂等守卫；hold 数值入参必须 number 类型；actualCostMicro 改 ceil（对齐"成本向上取整"口径）；settle/release 支持可选 userId 归属校验（essay 侧已传）；BYOK baseUrl 校验下沉 byok.set；0006 迁移为 llm:longcat 种 50/日保险丝。
+
+**writing（应用面）**
+- [P1] 题目通道只有规则层：topic 进全部评分通道但语义检测/盲评/证据耦合均不覆盖 → 正文与题目语义检测并行；B 版本题目按合并 span redact；topic 语义命中 → 强制硬化（≤8/≤8/≤3）。
+- [P2] SSE 客户端断开不取消上游（断连白烧 ~6 次调用/次）→ c.req.raw.signal 经 AICallOpts.signal 桥接全部 AI fetch（批改/润色/OCR）。
+- [P2] `<topic>/<essay>` 数据区可被正文闭合逃逸 → neutralizeDataClosers 主链路统一中和。
+- [P2] 题图抽取 fail-open 后图内指令直达评分模型 → failed 时升级硬化（降级设防）。
+- [P3] 流式 usage 丢缓存拆分 → deepseek/relay 系统性多扣费（N=1 违约）→ 流式/非流式共用 parseUsage（hit/miss 双形状）；全文/片段润色改流式 + catalog 预算（75s 死线掐死 LongCat 思考）；noRetry 车道真正被 ai.ts 消费；HARDCODED_LANES 原型链（constructor）改 Object.hasOwn；getCatalog 形状校验防毒缓存；laneFromBody 对显式目录车道在 billing 抖动/停用时显式报错（不再静默降级扣免费次数）；evidence 重叠判定遍历全部命中位；规则窗口换行归一扫描；stripInvisible 补 VS 补充区/1D173/1BCA0；essays 图片 base64 字符集校验；admin limit 下限钳制；escapeHtml 补 '；takeover 迁移 user_flags（F3 标记不丢失）。
+
+**auth**：gift/setBalance/createCodes 传 operator（actor.id），修复后台扣减功能坏损。
+
+**接受风险（记录不修，路线图）**：共享 INTERNAL_TOKEN = 全站 BYOK 明文密钥单点（结构性，缓解方向 = 密钥不出 billing / per-caller 令牌）；游客 wg cookie 客户端自选（128-bit 熵 + guest:ip 日限兜底）；dev-session 常量测试令牌（双门禁 + 生产 404）；限流 per-isolate（Free plan 无 DO/WAF 配置，靠 CF 平台层）。
+
+**套件适配**：attack-billing.mjs 补 operator + cron 端点改 `/cdn-cgi/local/scheduled`（wrangler 4.x）。回归：billing 23/23 PASS；writing 37 用例重跑见下。

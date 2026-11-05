@@ -95,7 +95,7 @@ admin.post('/gift', async (c) => {
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
   // 单笔上界 100 万元（1e10 微积分）：1e300 级输入会落成 SQLite REAL（实测账实核对失明）
-  if (!Number.isFinite(points) || points === 0 || Math.abs(points) > 1e10) return c.json({ error: '积分需为非零数值且单笔 ≤ 100 万元' }, 400);
+  if (!Number.isFinite(points) || points === 0 || Math.abs(points) > 1e10) return c.json({ error: 'credit 需为非零数值且单笔 ≤ 100 万元' }, 400);
 
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
@@ -157,7 +157,7 @@ admin.post('/orders/manual', async (c) => {
   const body = ((await c.req.json<{ username?: string; points_yuan?: number; note?: string }>().catch(() => null)) ?? ({} as any));
   if (!body.username?.trim()) return c.json({ error: '请输入用户名' }, 400);
   const points = Math.round((Number(body.points_yuan) || 0) * 10000);
-  if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: '积分需为正数且单笔 ≤ 100 万元' }, 400);
+  if (!Number.isFinite(points) || points <= 0 || points > 1e10) return c.json({ error: 'credit 需为正数且单笔 ≤ 100 万元' }, 400);
   const userId = await userIdByUsername(c.env, body.username);
   if (!userId) return c.json({ error: `用户不存在：${body.username}` }, 404);
   try {
@@ -169,7 +169,8 @@ admin.post('/orders/manual', async (c) => {
 });
 
 admin.get('/orders', async (c) => {
-  const limit = Math.min(200, parseInt(c.req.query('limit') || '50', 10) || 50);
+  // 下限钳 1（2026-11-06 审计）：parseInt('-5') 直传 billing 会变成 SQLite 无限 LIMIT
+  const limit = Math.max(1, Math.min(200, parseInt(c.req.query('limit') || '50', 10) || 50));
   try {
     return c.json(await billing.adminOrders(c.env, limit));
   } catch (err) {
@@ -184,7 +185,8 @@ admin.get('/usage', async (c) => {
     userId = (await userIdByUsername(c.env, username)) ?? undefined;
     if (!userId) return c.json({ error: `用户不存在：${username}` }, 404);
   }
-  const limit = Math.min(200, parseInt(c.req.query('limit') || '50', 10) || 50);
+  // 下限钳 1（2026-11-06 审计）：parseInt('-5') 直传 billing 会变成 SQLite 无限 LIMIT
+  const limit = Math.max(1, Math.min(200, parseInt(c.req.query('limit') || '50', 10) || 50));
   try {
     return c.json(await billing.adminUsage(c.env, userId, limit));
   } catch (err) {
