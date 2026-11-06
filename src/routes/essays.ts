@@ -27,9 +27,10 @@ import {
   enforceEvidenceCoupling, shouldDeliverShadowB,
 } from '../utils/validate';
 import {
-  stripInvisible, scanInjection, markSuspiciousSpans, summarizeInjection,
+  stripInvisible, scanInjection, markSuspiciousSpans, summarizeInjection, mergeSpans,
   redactSpans, validateVerbatimSpans, type InjectionReport, type InjectionSpan,
 } from '../utils/injection';
+import { preCleanChannel, type PreCleanOutcome } from '../utils/preclean';
 import { shouldForceHarden } from '../utils/audit';
 import { scanTopicImages, type ImageTextScan } from '../utils/image-text';
 import { seedSampleEssay } from '../sample/seed';
@@ -667,6 +668,20 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   }
   const locked = holdInfo.mode !== 'byok';
 
+  // ── 第9轮纵深：第二意见预清洗（agnes，恒可用、不依赖限时免费档）──
+  // 单检测器漏检 = 零响应（无 span → 无 B 版盲评 → 无标记 → 无硬化），LongCat/免费档
+  // 实测注入可抬分。预清洗统一走 agnes 免费模型：非 agnes 车道是跨模型第二意见；
+  // free 车道与既有检测器同模型，复用 cfg（省一次解析与全局闸门占位），靠 PRECLEAN
+  // 提示词的变体侧重补盲区。解析失败（停用/限流）fail-open 跳过，绝不影响主链路。
+  let precleanCfg: ResolvedConfig | null = cfg.provider === 'agnes' ? cfg : null;
+  if (!precleanCfg) {
+    try {
+      precleanCfg = await resolveLane(c.env, userId, 'free');
+    } catch (err) {
+      console.error('[review] 预清洗车道解析失败（跳过）:', err instanceof Error ? err.message : err);
+    }
+  }
+
   // F2-P0：题图是文本规则完全看不见的通道 —— 批改前先抽图内文字，过同一套扫描。
   // 失败 fail-open 照常批改（拒评等于告诉攻击者"图里有字被发现了"）。
   // 在 hold/锁之后执行：失败与余额不足都不再烧平台 key。
@@ -763,6 +778,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       overflow: false,    // 元话语覆盖率 >40%（放弃盲评，降级强制硬化）
       topicHit: false,    // topic 通道语义检测摘到"对评分者说的话"（→ 强制硬化，2026-11-06 审计 P1）
       topicSpans: 0,      // topic 通道语义摘到的 span 数（审计字段）
+      precleanSpans: 0,   // 预清洗 essay 通道摘到的 span 数（审计字段，第9轮）
+      topicPreSpans: 0,   // 预清洗 topic 通道摘到的 span 数（审计字段，第9轮）
+      precleanFailed: 0,  // 预清洗调用失败路数（fail-open，审计字段，第9轮）
       scoresRaw: null as { content: number; language: number; organization: number } | null,
       scores: null as { content: number; language: number; organization: number } | null,
       argumentation: null as { has_examples: boolean; has_solution: boolean } | null,
@@ -773,8 +791,10 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         // 语义检测（clean 必跑——自适应攻击在规则下全漏；suspicious 也跑——防"诱饵占位
         // 躲进 suspicious"的免检门；high 已硬化不跑省延迟）。正文与题目并行检测：
         // 题目是学生可控文本且进入全部评分通道，此前只有规则层（2026-11-06 审计 P1）。
-        const essayDetP = !harden && !topicImages.length
-            && (injection.level === 'clean' || injection.level === 'suspicious')
+        const essayDetGate = !harden && !topicImages.length
+          && (injection.level === 'clean' || injection.level === 'suspicious');
+        const topicDetGate = !harden && topicInjection.level !== 'high';
+        const essayDetP = essayDetGate
           ? callAI(cfg.key, cfg.baseUrl, cfg.model,
               SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(essayText),
               true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
@@ -784,7 +804,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
               return validateVerbatimSpans(essayText, extractJSON(det.content)?.spans);
             })
           : Promise.resolve(null as InjectionSpan[] | null);
-        const topicDetP = !harden && topicInjection.level !== 'high'
+        const topicDetP = topicDetGate
           ? callAI(cfg.key, cfg.baseUrl, cfg.model,
               SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(topicClean.text),
               true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
@@ -794,14 +814,42 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
               return validateVerbatimSpans(topicClean.text, extractJSON(det.content)?.spans);
             })
           : Promise.resolve([] as InjectionSpan[]);
+        // 第二意见预清洗（第9轮）：同一套门禁，agnes 按另一套措辞再检一遍。
+        // preCleanChannel 绝不 reject（失败返回 ok:false，fail-open），allSettled 只防意外。
+        const essayPreP = essayDetGate && precleanCfg
+          ? preCleanChannel(precleanCfg, essayText, {
+              deadline: Math.min(chainStart + 15_000, aiDeadline),
+              aiOpts: liveOpts(aiCallOpts(precleanCfg.entry)),
+            })
+          : Promise.resolve(null as PreCleanOutcome | null);
+        const topicPreP = topicDetGate && precleanCfg
+          ? preCleanChannel(precleanCfg, topicClean.text, {
+              deadline: Math.min(chainStart + 15_000, aiDeadline),
+              aiOpts: liveOpts(aiCallOpts(precleanCfg.entry)),
+            })
+          : Promise.resolve(null as PreCleanOutcome | null);
         // allSettled（R1 验证）：任一检测拒绝时另一路的 auxUsage 记账 .then 仍要跑完，
         // 否则窗口内 settle 的 calls/用量会少计一路
-        const [essayR, topicR] = await Promise.allSettled([essayDetP, topicDetP] as const);
+        const [essayR, topicR, essayPreR, topicPreR] = await Promise.allSettled(
+          [essayDetP, topicDetP, essayPreP, topicPreP] as const);
         const essayFound = essayR.status === 'fulfilled' ? essayR.value : null;
         const topicFound = topicR.status === 'fulfilled' ? topicR.value : [];
-        if (topicFound.length) {
+        const essayPre = essayPreR.status === 'fulfilled' ? essayPreR.value : null;
+        const topicPre = topicPreR.status === 'fulfilled' ? topicPreR.value : null;
+        if (essayPre) {
+          if (essayPre.usage) { auxUsage = mergeUsage(auxUsage, essayPre.usage); auxCallsOk++; }
+          if (!essayPre.ok) shadowState.precleanFailed++;
+        }
+        if (topicPre) {
+          if (topicPre.usage) { auxUsage = mergeUsage(auxUsage, topicPre.usage); auxCallsOk++; }
+          if (!topicPre.ok) shadowState.precleanFailed++;
+        }
+        const essayPreFound = essayPre?.ok ? essayPre.spans : [];
+        const topicPreFound = topicPre?.ok ? topicPre.spans : [];
+        if (topicFound.length || topicPreFound.length) {
           shadowState.topicHit = true;
           shadowState.topicSpans = topicFound.length;
+          shadowState.topicPreSpans = topicPreFound.length;
         }
 
         // 有题图：正文盲评 B 不跑（题图扫描已覆盖多模态通道，避免延迟叠加），
@@ -813,38 +861,33 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           spans = [...injection.spans];
           shadowState.source = 'rule';
         }
-        if (essayFound) {
-          shadowState.detectorSpans = essayFound.length;
-          if (essayFound.length) {
-            // 覆盖率按合并后的 span 集算（规则 + 语义，去重叠）。
-            // 超过 40% → 整篇大半是元话语，B 版本失真（遮蔽删文评分失真，RobustJudge 教训）：
-            // 彻底放弃盲评（含已有的规则 span，行为与文档口径一致），改由强制硬化兜底。
-            const merged = [...spans];
-            for (const s of essayFound) {
-              if (!merged.some(m => s.start < m.end && m.start < s.end)) merged.push(s);
-            }
-            const covered = merged.reduce((a, s) => a + (s.end - s.start), 0);
-            if (covered > essayText.length * 0.4) {
-              shadowState.overflow = true;   // 覆盖率悬崖 → 放弃盲评，主流程强制硬化
-              spans = [];
-            } else {
-              spans = merged;
-              if (!shadowState.source) shadowState.source = 'semantic';
-            }
+        // 正文检测 span（语义 + 预清洗）合并去重叠，与规则 span 再合并。
+        // 覆盖率按合并后的 span 集算。超过 40% → 整篇大半是元话语，B 版本失真
+        // （遮蔽删文评分失真，RobustJudge 教训）：彻底放弃盲评（含已有的规则 span，
+        // 行为与文档口径一致），改由强制硬化兜底。
+        shadowState.detectorSpans = essayFound?.length ?? 0;
+        shadowState.precleanSpans = essayPreFound.length;
+        const detected = mergeSpans(essayFound ?? [], essayPreFound);
+        if (detected.length) {
+          const merged = mergeSpans(spans, detected);
+          const covered = merged.reduce((a, s) => a + (s.end - s.start), 0);
+          if (covered > essayText.length * 0.4) {
+            shadowState.overflow = true;   // 覆盖率悬崖 → 放弃盲评，主流程强制硬化
+            spans = [];
+          } else {
+            spans = merged;
+            if (!shadowState.source) shadowState.source = 'semantic';
           }
         }
-        // B 版本的题目：规则 + 语义 span 合并后 redact（与正文同等待遇）；
+        // B 版本的题目：规则 + 语义 + 预清洗 span 合并后 redact（与正文同等待遇）；
         // 只把题目内容灌进题图转写段之后的固定结构（imageTopicPart 是系统转写，原样保留）
         let topicForB = topicBase;
-        if (topicFound.length) {
-          const mergedTopic = [...topicInjection.spans];
-          for (const s of topicFound) {
-            if (!mergedTopic.some(m => s.start < m.end && m.start < s.end)) mergedTopic.push(s);
-          }
+        if (topicFound.length || topicPreFound.length) {
+          const mergedTopic = mergeSpans(topicInjection.spans, [...topicFound, ...topicPreFound]);
           topicForB = redactSpans(topicClean.text, mergedTopic) + imageTopicPart;
           if (!shadowState.source) shadowState.source = 'semantic';
         }
-        if ((!spans.length && !topicFound.length) || !shadowState.source) { shadowState.source = null; return; }
+        if ((!spans.length && !topicFound.length && !topicPreFound.length) || !shadowState.source) { shadowState.source = null; return; }
         const redacted = spans.length ? redactSpans(essayText, spans) : essayText;
         if (redacted === essayText && topicForB === topicBase) { shadowState.source = null; return; }
         const bUser = buildScoreOnlyUser(topicForB, redacted, countWords(essayText), false);
@@ -1126,6 +1169,16 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     // 展示名以 catalog displayName 为准（单源）；free/byok 硬编码车道沿用旧格式
     const model = cfg.entry?.displayName ?? (cfg.provider === 'agnes' ? `${cfg.model}（免费通道）` : cfg.model);
 
+    // 模型质量观测（第9轮）：3 采样的分项极差。分散度异常放大 = 弱模型抖动或注入污染
+    // 的信号；本轮只审计不干预，为后续"分散度过高 → 聚合降级取最小"提供数据依据。
+    const sampleSpread = sampleSignals.length >= 2
+      ? {
+        content: Math.max(...sampleSignals.map(s => s.subscores.content)) - Math.min(...sampleSignals.map(s => s.subscores.content)),
+        language: Math.max(...sampleSignals.map(s => s.subscores.language)) - Math.min(...sampleSignals.map(s => s.subscores.language)),
+        organization: Math.max(...sampleSignals.map(s => s.subscores.organization)) - Math.min(...sampleSignals.map(s => s.subscores.organization)),
+      }
+      : null;
+
     const meta = JSON.stringify({
       elapsed_ms: Date.now() - startedAt,
       attempts: attemptsUsed,
@@ -1135,6 +1188,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       sample_completion_tokens: sampleUsage?.completion_tokens ?? null,
       sample_calls_ok: sampleCallsOk,
       score_samples: scoreSamples,
+      sample_spread: sampleSpread,
       issues_total: result.issues.length,
       issues_unlocated: result.issues.filter(i => i.located === false).length,
       prompt_source: promptSource,
@@ -1152,6 +1206,12 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         invisible_removed: cleaned.removed,
         // F1：语义检测 + 双通道盲评的审计（shadow.used = 已按 B 版本分数交付）
         semantic: { spans: shadowState.detectorSpans, topic_spans: shadowState.topicSpans, topic_hit: shadowState.topicHit },
+        // 第9轮：预清洗第二意见审计（essay/topic span 各自计数；failed = 调用失败路数）
+        preclean: precleanCfg ? {
+          essay_spans: shadowState.precleanSpans,
+          topic_spans: shadowState.topicPreSpans,
+          failed: shadowState.precleanFailed,
+        } : undefined,
         shadow: shadowState.source ? {
           source: shadowState.source,
           sum_a: shadowSumA,

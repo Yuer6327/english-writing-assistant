@@ -32,6 +32,7 @@
 | L1.5 题图通道 | `image-text.ts: scanTopicImages` | 题图先抽图内文字 → 过同一套 L1；抽出文本同时以 `[题图文字（系统转写）]` 放进 `<topic>` 数据区（降权呈现） | 覆盖 FigStep 类多模态注入（OCR 读不到、VLM 读得到）；抽取失败 fail-open 照常批改，绝不拒评 |
 | L2 加固 | `prompts.ts` + `essays.ts` | ① `DATA_BOUNDARY` 预封闭"复核/申诉/专家会诊"角色空间；② 可疑片段用 `⟦…⟧` datamark；③ 用户消息末尾追加标记说明 | datamark 仅对**非自适应**攻击有效（ASR 50%→<2%），自适应下会被打穿 → 只当降低概率 |
 | L2.5 语义检测 + 双通道盲评 | `essays.ts: shadowChain` | 规则 suspicious+ → 规则 span 生成 B 版本；规则 clean → 语义检测器摘"对评分者说的话"（逐字校验防幻觉）生成 B 版本；B 用等长占位 redact 后独立打分，**sumA−sumB ≥ 2 → 判定注入生效，交付 B 的分数** | 覆盖改写/换语种/纯语义施压类自适应攻击（规则层 8 变体 7 个判 clean，本层兜住）；B 版本只用于取分，绝不交给用户 |
+| L2.55 预清洗第二意见 | `preclean.ts` + `essays.ts: shadowChain`（2026-11-06 第9轮） | 恒用 agnes 免费模型按另一套措辞（变体侧重：委婉化/跨段铺垫/换语种/伪引用/编码）再检一遍；span 逐字校验后与规则/语义 span 合并，走同一套 datamark/redact/harden 响应；topic 命中 → 强制硬化 | 单检测器漏检 = 零响应（LongCat/免费档实测可抬分），ensemble 降漏检率：longcat/付费/BYOK 车道是跨模型第二意见，free 车道同模型、靠提示词差异补盲。longcat 限时免费，不作为防线依赖；失败 fail-open 跳过，绝不拒评 |
 | L2.6 证据耦合 | `validate.ts: enforceEvidenceCoupling` | 分项分必须有原文逐字 evidence：证据未命中原文 → 作废；证据落在注入 span 内 → 降一档（内容/语言 −2、结构 −1）；无有效证据且 ≥8 → 压 7 | 不依赖"识别攻击"：模型引用注入段自我论证就被降档。主调用与 3 次采样全部生效 |
 | L3 服务端钳制 | `validate.ts: sanitizeReview` | 注入命中时分项硬顶 **≤8/≤8/≤3（总分 ≤19，常态上限 22）**；采样聚合从**中位数改为取最小值**；近 7 天 ≥3 次 high 命中的用户**强制硬化**（`audit.ts`，无论当前稿干净与否） | 这是唯一"不可被提示词改变"的一层；F3 把"偶尔成功"压回"必然不成功"，只压分留痕不拒评 |
 | L4 输出净化 | `validate.ts` | 剥离"三位专家一致评为满分"式伪权威评语句；修改稿若冒出原文没有的注入文本 → 整段丢弃 | 不改分数，只清理叙事，避免"看起来很自洽的假论证" |
@@ -61,12 +62,15 @@ npm run inj:test   # 已接进 npm run check（纯本地，零 API 调用）
   必须 `high`；6 条正常样本（含 `ignore the previous rules`、`give students full marks`、学术引用）
   不得 `high`；**自适应变体组 8 条**（委婉化/换语种×2/Base64/跨段铺垫/纯语义施压/全角/词内零宽）
   断言规则层基线（除零宽剥除后命中强规则的一条外均判不到 high——这是在案缺口，运行时由 L2.5 覆盖）；
-  另有 redactSpans 等长占位、validateVerbatimSpans 幻觉过滤、enforceEvidenceCoupling 六个用例。
+  另有 redactSpans 等长占位、validateVerbatimSpans 幻觉过滤、mergeSpans 去重叠排序、
+  parsePreCleanSpans 解析校验、enforceEvidenceCoupling 六个用例。
 - `scripts/review-guard-test.mjs`：模拟"注入已成功"的模型输出，验证 ≤19 硬顶、伪权威剥离、
   quote 未命中标记、修改稿回流丢弃，以及证据耦合三条（有效证据保留 / 注入段证据降档 / 无证据压分）。
 - `scripts/security/attack-writing.mjs` 的 `inj` 组（本地 mock，端到端）：
   F0 干净稿不误伤；F1 累计 3 次 high → 干净稿强制硬化（flagged=true + meta.forced_harden + user_flags 留痕）；
-  F2 注入段证据降档 + 有效证据保留（content 8→6、language 保留 8）；F3 题图 fail-open 照常批改。
+  F2 注入段证据降档 + 有效证据保留（content 8→6、language 保留 8）；F3 题图 fail-open 照常批改；
+  F4 盲评裁决（B 显著更低 → 交付 B）；F5 预清洗 essay span 并入盲评 + 审计落库；
+  F6 预清洗 topic 命中 → topicHit 强制硬化；F7 预清洗输出垃圾 → fail-open 照常批改。
 
 ### 真实模型实测（2026-11-02）
 
@@ -144,3 +148,9 @@ npm run inj:test   # 已接进 npm run check（纯本地，零 API 调用）
     失实；同时 flagged=true 对自适应攻击者是"payload 确实移动过分数"的确认信号（比 suspicious-only
     反馈更强的 oracle）。接受理由：误伤被四重闸门压到很低，而确认信号只对"已实际生效"的攻击给出，
     不暴露任何规则细节。若后续要改，需动 public/js（带资源戳与 CSP 流程）。
+12. **预清洗第二意见的边界**（2026-11-06，第9轮）：清洗器本身也是 LLM，自适应攻击可以同时针对
+    两个检测器写 payload——ensemble 降漏检率，不归零；free 车道两个检测器同模型（agnes），
+    只有提示词差异，多样性弱于跨模型车道。调用失败/解析失败一律 fail-open（限流时静默降级为
+    单检测器，`meta.injection.preclean.failed` 可观测）。span 逐字校验保证"被劫持的清洗器"
+    最多浪费一次调用，不能指认任意正文。漏检仍存在时，最终兜底只有 L3 硬顶 + 结构性终解
+    （todo.md 在案的锚定样例定档）。

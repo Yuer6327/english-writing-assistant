@@ -470,7 +470,8 @@ async function setMockMode(mode) {
 }
 
 // ────────────────────────────────────────────────────────────
-// 组 F：注入防护纵深（F1 证据耦合 / F2 题图通道 / F3 累计强制硬化）
+// 组 F：注入防护纵深（F1 证据耦合 / F2 题图通道 / F3 累计强制硬化 /
+//       F4 盲评裁决 / F5-F7 预清洗第二意见）
 // ────────────────────────────────────────────────────────────
 
 /** 直连本地 D1 执行 SQL（种子/清理/断言用）。写操作用 d1()；查询断言用 d1q() 拿结构化结果
@@ -592,6 +593,58 @@ async function attackInjection() {
       && r.json?.injection?.flagged === true;
     record('inj', 'F4 盲评裁决生效：交付 B 分数 + shadow_used 留痕', ok ? 'PASS' : 'FAIL',
       `subscores=${JSON.stringify(sub)} shadow_used=${integ.shadow_used} flagged=${r.json?.injection?.flagged}`);
+  }
+
+  // F5 预清洗第二意见（第9轮）：agnes 预清洗摘到 essay span → 并入合并集合、
+  // 激活 B 版盲评链路、审计落库。mock 从请求 <text> 截逐字片段，保证过服务端逐字校验。
+  {
+    await setMockMode('preclean-hit');
+    const e = await req('POST', '/api/essays', { cookie: C1, body: { title: 'inj-preclean-essay', topic_text: 'Preclean essay topic.' } });
+    const d = await req('POST', `/api/essays/${e.json.essay_id}/drafts`, { cookie: C1, body: { text: 'I think students should have part time jobs because it can teach them many thing. Schools should guide them.' } });
+    await paceAI();
+    const r = await req('POST', `/api/drafts/${d.json.draft_id}/review`, { cookie: C1, body: { model_id: 'free' } });
+    const metaRows = d1q(`SELECT meta FROM reviews WHERE id=${r.json?.review_id ?? 0}`);
+    const meta = metaRows.length ? JSON.parse(metaRows[0].meta) : null;
+    const pre = meta?.injection?.preclean;
+    const ok = r.status === 200 && !!r.json?.result
+      && (pre?.essay_spans ?? 0) >= 1
+      && (pre?.failed ?? 1) === 0
+      && meta?.injection?.shadow?.source === 'semantic';
+    record('inj', 'F5 预清洗摘到 essay span → 并入盲评 + 审计落库', ok ? 'PASS' : 'FAIL',
+      `status=${r.status} preclean=${JSON.stringify(pre)} shadow=${JSON.stringify(meta?.injection?.shadow)}`);
+  }
+
+  // F6 预清洗 topic 通道命中 → topicHit → 强制硬化（与 topic 语义命中同路径，第9轮）。
+  // mock 对任何 <text> 都返回逐字 span，topic 文本本身无需含攻击措辞。
+  {
+    await setMockMode('preclean-hit');
+    const e = await req('POST', '/api/essays', { cookie: C1, body: { title: 'inj-preclean-topic', topic_text: 'Preclean topic channel test.' } });
+    const d = await req('POST', `/api/essays/${e.json.essay_id}/drafts`, { cookie: C1, body: { text: 'I think students should have part time jobs because it can teach them many thing.' } });
+    await paceAI();
+    const r = await req('POST', `/api/drafts/${d.json.draft_id}/review`, { cookie: C1, body: { model_id: 'free' } });
+    const metaRows = d1q(`SELECT meta FROM reviews WHERE id=${r.json?.review_id ?? 0}`);
+    const meta = metaRows.length ? JSON.parse(metaRows[0].meta) : null;
+    const pre = meta?.injection?.preclean;
+    const ok = r.status === 200 && !!r.json?.result
+      && (pre?.topic_spans ?? 0) >= 1
+      && meta?.injection?.semantic?.topic_hit === true
+      && r.json?.injection?.flagged === true;
+    record('inj', 'F6 预清洗 topic 命中 → topicHit 强制硬化', ok ? 'PASS' : 'FAIL',
+      `status=${r.status} preclean=${JSON.stringify(pre)} topic_hit=${meta?.injection?.semantic?.topic_hit} flagged=${r.json?.injection?.flagged}`);
+  }
+
+  // F7 预清洗输出垃圾 → 解析失败 fail-open，批改照常完成（免费模型不变成自断服务单点，第9轮）
+  {
+    await setMockMode('preclean-junk');
+    const e = await req('POST', '/api/essays', { cookie: C1, body: { title: 'inj-preclean-junk', topic_text: 'Preclean junk topic.' } });
+    const d = await req('POST', `/api/essays/${e.json.essay_id}/drafts`, { cookie: C1, body: { text: 'I think students should have part time jobs because it can teach them many thing.' } });
+    await paceAI();
+    const r = await req('POST', `/api/drafts/${d.json.draft_id}/review`, { cookie: C1, body: { model_id: 'free' } });
+    const metaRows = d1q(`SELECT meta FROM reviews WHERE id=${r.json?.review_id ?? 0}`);
+    const meta = metaRows.length ? JSON.parse(metaRows[0].meta) : null;
+    const ok = r.status === 200 && !!r.json?.result && meta?.injection?.preclean !== undefined;
+    record('inj', 'F7 预清洗输出垃圾 → fail-open 照常批改', ok ? 'PASS' : 'FAIL',
+      `status=${r.status} hasResult=${!!r.json?.result} preclean=${JSON.stringify(meta?.injection?.preclean)}`);
   }
 }
 

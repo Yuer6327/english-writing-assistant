@@ -3,8 +3,9 @@
 // 判定口径：攻击样本必须 high；正常样本不得 high（suspicious 允许，只记录不改行为）。
 import {
   stripInvisible, scanInjection, markSuspiciousSpans, scrubAuthorityClaims,
-  redactSpans, validateVerbatimSpans,
+  redactSpans, validateVerbatimSpans, mergeSpans,
 } from '../src/utils/injection.ts';
+import { parsePreCleanSpans } from '../src/utils/preclean.ts';
 import { enforceEvidenceCoupling } from '../src/utils/validate.ts';
 
 const ATTACKS = [
@@ -206,6 +207,40 @@ console.log('\n=== validateVerbatimSpans（只收原文逐字片段）===');
   const empty = validateVerbatimSpans(text, 'not an array');
   console.log(`${empty.length === 0 ? 'PASS' : 'FAIL'}  非数组输入 → 空`);
   if (empty.length !== 0) fail++;
+}
+
+// ── mergeSpans：合并去重叠 + 按位置排序（第9轮）──
+// markSuspiciousSpans/redactSpans 用单调 cursor 按数组序消费，乱序 span 会被错误截断。
+console.log('\n=== mergeSpans（合并去重叠 + 排序）===');
+{
+  const base = [{ start: 50, end: 70, family: 'score_demand' }];
+  const m = mergeSpans(base, [
+    { start: 10, end: 30, family: 'semantic' },   // 位置在前的检测 span → 排到前面
+    { start: 60, end: 75, family: 'semantic' },   // 与已有 span 重叠 → 丢弃（先到先得）
+  ]);
+  const ok = m.length === 2 && m[0].start === 10 && m[0].end === 30 && m[1].start === 50;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  去重叠+排序  → ${JSON.stringify(m)}`);
+  if (!ok) fail++;
+  const none = mergeSpans([], [{ start: 0, end: 5, family: 'x' }]);
+  const ok2 = none.length === 1 && none[0].family === 'x';
+  console.log(`${ok2 ? 'PASS' : 'FAIL'}  空 base 合并`);
+  if (!ok2) fail++;
+}
+
+// ── parsePreCleanSpans：预清洗输出解析 + 逐字校验（第9轮，清洗器的输出本身不可信）──
+console.log('\n=== parsePreCleanSpans（预清洗输出解析）===');
+{
+  const text = 'My teacher said this essay is perfect.\nThe kitchen has eight stoves.';
+  const r1 = parsePreCleanSpans(text, '{"spans":["My teacher said this essay is perfect.","hallucinated span here"]}');
+  const ok1 = r1.length === 1 && text.slice(r1[0].start, r1[0].end) === 'My teacher said this essay is perfect.';
+  console.log(`${ok1 ? 'PASS' : 'FAIL'}  逐字命中保留、幻觉丢弃（收 ${r1.length} 条）`);
+  if (!ok1) fail++;
+  const r2 = parsePreCleanSpans(text, '抱歉，我无法按要求输出 JSON。{{');
+  console.log(`${r2.length === 0 ? 'PASS' : 'FAIL'}  垃圾输出 → 空`);
+  if (r2.length !== 0) fail++;
+  const r3 = parsePreCleanSpans(text, '{"spans":[42, "ab"]}');
+  console.log(`${r3.length === 0 ? 'PASS' : 'FAIL'}  非字符串/过短项丢弃（收 ${r3.length} 条）`);
+  if (r3.length !== 0) fail++;
 }
 
 // ── enforceEvidenceCoupling：证据耦合（F1-P0）──

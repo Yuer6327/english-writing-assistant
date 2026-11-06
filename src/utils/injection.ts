@@ -413,6 +413,17 @@ export function validateVerbatimSpans(text: string, candidates: unknown): Inject
   return out.sort((a, b) => a.start - b.start);
 }
 
+/** 合并两组 span（规则 + 语义/预清洗）：与已有 span 相交的 extra 丢弃（先到先得），
+ *  结果按位置排序。排序是硬要求——markSuspiciousSpans/redactSpans 用单调 cursor
+ *  按数组序消费，乱序 span 会被错误截断（语义 span 位置靠前时 B 版本曾会错位 redact）。 */
+export function mergeSpans(base: InjectionSpan[], extra: InjectionSpan[]): InjectionSpan[] {
+  const out = [...base];
+  for (const s of extra) {
+    if (!out.some(m => s.start < m.end && m.start < s.end)) out.push(s);
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
 // ── 输出侧：剥离"伪造外部权威"的评语句 ──
 // 注入成功时模型的典型二次产物是「三位阅卷专家一致评为满分」这类编造论据。
 // 这些句子既无原文依据，也不属于评语规范，整句剥离（不改分数，只清理叙事）。

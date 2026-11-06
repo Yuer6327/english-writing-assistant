@@ -10,6 +10,9 @@
 //   { "mode": "xss" }                      返回带 HTML/事件属性的字段（测前端转义）
 //   { "mode": "greedy" }                   返回超大 usage（测计费钳制）
 //   { "mode": "overflow" }                 返回超长字符串与越界分数（测 sanitize）
+//   { "mode": "shadowlow" }                B 版本请求（含 redacted）返回低分（测盲评裁决）
+//   { "mode": "preclean-hit" }             预清洗请求返回 <text> 内逐字 span（测第9轮预清洗）
+//   { "mode": "preclean-junk" }            预清洗请求返回非 JSON 垃圾（测 fail-open）
 // ============================================================
 import http from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
@@ -99,9 +102,12 @@ function reviewPayload(kind) {
 
 let calls = 0;
 const server = http.createServer((req, res) => {
-  let body = '';
-  req.on('data', (c) => { body += c; });
+  // 按 Buffer 收集后一次性转 utf8：workerd 的 fetch 走 chunked 传输，
+  // 逐块字符串拼接会把跨块边界的多字节中文撕成乱码（preclean 特征串匹配因此失效）
+  const chunks = [];
+  req.on('data', (c) => { chunks.push(c); });
   req.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf8');
     calls++;
     const { mode } = readMode();
     const usage = mode === 'greedy'
@@ -133,10 +139,42 @@ const server = http.createServer((req, res) => {
     // 返回明显更低的分数，让 essays.ts 的 shouldDeliverShadowB(sumA, sumBRaw) 触发
     // （端到端锁住 shadow.used=true 路径）
     const reqText = JSON.stringify(payload.messages ?? payload);
-    const isShadowB = mode === 'shadowlow' && reqText.includes('redacted');
     if (process.env.MOCK_LOG) {
-      console.log(`[mock-ai] mode=${mode} stream=${!!payload.stream} len=${reqText.length} shadowB=${isShadowB} head=${reqText.slice(0, 120)}`);
+      const preclean = reqText.includes('第二意见');
+      console.log(`[mock-ai] mode=${mode} stream=${!!payload.stream} len=${reqText.length} shadowB=${mode === 'shadowlow' && reqText.includes('redacted')} preclean=${preclean} head=${reqText.slice(0, 120)}`);
     }
+    // 第二意见预清洗请求（essays.ts PRECLEAN_SYSTEM_PROMPT 首行特征串，勿改）：
+    //   preclean-hit  → 从请求 <text> 数据区截一段逐字片段返回（保证能过服务端逐字校验）
+    //   preclean-junk → 返回非 JSON 垃圾（测解析失败 fail-open）
+    //   其余模式      → {"spans":[]}（既有用例的检测路径行为不变）
+    if (reqText.includes('第二意见')) {
+      let content = '{"spans":[]}';
+      if (mode === 'preclean-hit') {
+        // 从解析后的 user 消息取 <text> 数据区（真实换行）。不能在 reqText（整体
+        // JSON.stringify）上匹配：系统提示词规则段自身含 `<text>` 字样，会先被命中。
+        const userMsg = (payload.messages ?? []).find(m => m?.role === 'user');
+        const um = typeof userMsg?.content === 'string' ? userMsg.content : reqText;
+        const m = um.match(/<text>\n([\s\S]*?)\n<\/text>/);
+        const inner = m?.[1] ?? '';
+        // 取第一个足够长的行截 80 字符内做 span（保证服务端逐字校验能命中）
+        const line = inner.split('\n').find(s => s.trim().length >= 60) ?? inner;
+        const span = line.trim().slice(0, 80).trim();
+        if (span.length >= 4) content = JSON.stringify({ spans: [span] });
+      } else if (mode === 'preclean-junk') {
+        content = '抱歉，我无法按要求输出 JSON。{{';
+      }
+      if (payload.stream) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' });
+        for (const c of content.match(/[\s\S]{1,120}/g) ?? [content]) {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: c } }] })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ usage })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+      return send(200, { choices: [{ message: { content } }], usage });
+    }
+    const isShadowB = mode === 'shadowlow' && reqText.includes('redacted');
     if (payload.stream) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' });
       const kindS = isShadowB ? 'shadow-low-score' : (mode === 'ok' ? 'ok' : mode);
