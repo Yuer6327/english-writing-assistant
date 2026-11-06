@@ -49,7 +49,7 @@ function setPanelControlsLocked(anchor, locked) {
   });
 }
 
-// ── 模型车道：free / byok 客户端硬编码（首屏零额外请求，billing 不可用时仍可用）；
+// ── 模型车道：longcat / free / byok 客户端硬编码（首屏零额外请求，billing 不可用时仍可用）；
 //    其余车道由 billing 模型库单源下发（/api/billing/me 的 models 数组，懒加载）──
 const laneInfo = { models: [], byokConfigured: false, loaded: false };
 let reviewLane = null;       // 批改上次选择（内存记忆）
@@ -58,23 +58,43 @@ let lastCharge = null;       // { reviewId, points, lane } 本次批改消耗（
 
 async function loadLaneInfo() {
   if (laneInfo.loaded) return;
-  // 游客没有钱包/自备 Key，不去碰计费接口（那会 401 触发整页跳登录）；游客仅免费通道（硬编码）
+  // 游客没有钱包/自备 Key，不去碰计费接口（那会 401 触发整页跳登录）；
+  // 游客可选车道（LongCat / 免费通道）全部硬编码在 modelSelectHtml
   if (isGuest) { laneInfo.loaded = true; return; }
   try {
     const me = await api.billing.me();
     laneInfo.models = Array.isArray(me.models) ? me.models.filter(m => m && m.lane && m.enabled) : [];
     laneInfo.byokConfigured = !!me.byok_configured;
     laneInfo.loaded = true;
-  } catch { /* billing 不可用时仅显示免费通道（硬编码） */ }
+  } catch { /* billing 不可用时仅显示硬编码车道（longcat/free/byok） */ }
 }
 
-/** 默认车道：已配置我的 Key → byok，否则免费通道（与服务端默认规则一致） */
+/** LongCat 体验档是否可选：游客不请求 billing 恒可用（停用由服务端 409 兜底）；
+ *  登录用户在 billing/me 返回且目录中无启用 longcat 时隐藏（模型库单源的启停仍归 billing）。 */
+function longcatAvailable() {
+  if (isGuest) return true;
+  return !laneInfo.loaded || laneInfo.models.some(m => m.lane === 'longcat');
+}
+
+/** 游客 LongCat 今日剩余体验次数（无配额数据时按 1 次 = 尚未使用） */
+function longcatLeft() {
+  if (!sessionQuota || sessionQuota.longcat_limit == null) return 1;
+  return Math.max(0, sessionQuota.longcat_limit - (sessionQuota.longcat_used ?? 0));
+}
+
+/** 默认车道：LongCat（限时免费档，硬编码默认，不请求 billing）；
+ *  游客当日体验次数用完 → 免费通道；登录用户目录停用 longcat → byok/免费通道。 */
 function defaultLane() {
+  if (longcatAvailable()) {
+    if (!isGuest) return 'longcat';
+    if (longcatLeft() > 0) return 'longcat';
+  }
   return laneInfo.byokConfigured && !isGuest ? 'byok' : 'free';
 }
 
-/** 车道值是否合法：硬编码 free/byok + 目录下发的车道短名 */
+/** 车道值是否合法：硬编码 longcat（目录停用时不算）/free/byok + 目录下发的车道短名 */
 function isKnownLane(v) {
+  if (v === 'longcat') return longcatAvailable();
   return v === 'free' || v === 'byok' || laneInfo.models.some(m => m.lane === v);
 }
 
@@ -85,20 +105,30 @@ function remainingLabel() {
 }
 
 /** 模型选择 <select> HTML（id 唯一）；value 归一到合法车道。
- *  免费档硬编码首位（含服务端配额），目录车道按 免费→付费 排序跟随其后，BYOK 恒在末位。 */
+ *  LongCat 体验档硬编码默认首位（不请求 billing），免费档硬编码其次（含服务端配额），
+ *  目录车道按 免费→付费 排序跟随其后，BYOK 恒在末位。 */
 function modelSelectHtml(id, remembered) {
+  const lcName = laneInfo.models.find(m => m.lane === 'longcat')?.displayName || 'LongCat（免费）';
   if (isGuest) {
-    return `<select class="form-input" id="${id}" aria-label="模型通道（游客仅免费通道）" style="width:auto;padding:4px 8px;font-size:13px" title="游客只能使用免费通道">
-      <option value="free">免费通道 · ${escapeHtml(remainingLabel())}</option>
+    const left = longcatLeft();
+    // 体验次数用完后不再记忆 longcat（自动落回免费通道），避免选中即报错
+    const value = remembered === 'longcat' && left <= 0 ? 'free'
+      : isKnownLane(remembered) ? remembered : defaultLane();
+    const lcSel = value === 'longcat' ? ' selected' : '';
+    return `<select class="form-input" id="${id}" aria-label="模型通道" style="width:auto;padding:4px 8px;font-size:13px" title="LongCat 每天 1 次体验；免费通道每天 3 次（一稿/二稿/三稿各一次）">
+      <option value="longcat"${lcSel}>${escapeHtml(lcName)} · ${left > 0 ? `今日剩 ${left} 次` : '今日已用完'}</option>
+      <option value="free"${lcSel ? '' : ' selected'}>免费通道 · ${escapeHtml(remainingLabel())}</option>
     </select>`;
   }
   const value = isKnownLane(remembered) ? remembered : defaultLane();
   const catalogOpts = laneInfo.models
-    .filter(m => m.lane !== 'free' && m.lane !== 'byok')
+    .filter(m => m.lane !== 'free' && m.lane !== 'byok' && m.lane !== 'longcat')  // longcat 已硬编码首位
     .sort((a, b) => (a.tier === 'paid') - (b.tier === 'paid'))
     .map(m => `<option value="${escapeHtml(m.lane)}"${value === m.lane ? ' selected' : ''}>${escapeHtml(m.displayName)}</option>`)
     .join('');
   const opts = [
+    longcatAvailable()
+      ? `<option value="longcat"${value === 'longcat' ? ' selected' : ''}>${escapeHtml(lcName)}</option>` : '',
     `<option value="free"${value === 'free' ? ' selected' : ''}>免费通道（今日剩余 ${sessionQuota ? sessionQuota.remaining : '—'} 次）</option>`,
     catalogOpts,
     laneInfo.byokConfigured
@@ -164,7 +194,7 @@ function showLoginPrompt(title, desc) {
 }
 
 const GUEST_LIMIT_CODES = new Set([
-  'login_required', 'guest_quota_exhausted', 'guest_draft_reviewed',
+  'login_required', 'guest_quota_exhausted', 'guest_draft_reviewed', 'guest_longcat_limit',
   'guest_essay_limit', 'guest_draft_limit', 'guest_ocr_limit', 'guest_ip_limit',
 ]);
 
@@ -272,10 +302,11 @@ function renderSessionBanner() {
   const q = sessionQuota;
   const chips = q
     ? (isGuest
-      ? `<span class="chip accent">今日剩余 ${q.remaining}/${q.limit} 次批改</span>
+      ? `<span class="chip accent">免费批改 ${q.remaining}/${q.limit} 次</span>
+         ${q.longcat_limit != null ? `<span class="chip accent">LongCat 体验 ${Math.max(0, q.longcat_limit - (q.longcat_used ?? 0))}/${q.longcat_limit} 次</span>` : ''}
          <span class="chip">一稿二稿三稿 · 每稿一次</span>`
       : `<span class="chip accent">今日剩余 ${q.remaining}/${q.limit} 次免费批改</span>
-         <span class="chip">付费通道不计次</span>`)
+         <span class="chip">LongCat / 付费通道不计次</span>`)
     : '';
   el.innerHTML = isGuest
     ? `<div class="session-bar session-guest"><span class="session-who">游客试用</span>${chips}
@@ -443,7 +474,9 @@ function renderDraftPanel() {
   const draftLocked = isGuest && sessionQuota?.draft_limit !== null && sessionQuota?.draft_limit !== undefined
     && d.version >= sessionQuota.draft_limit;
   const rewriteLocked = isGuest;
-  const reviewExhausted = !!sessionQuota && sessionQuota.remaining <= 0;
+  // 游客「全用完」= 免费通道与 LongCat 体验档都没了（LongCat 还有 1 次时仍可批）
+  const reviewExhausted = !!sessionQuota && sessionQuota.remaining <= 0
+    && (!isGuest || longcatLeft() <= 0);
 
   el.innerHTML = `
     <div class="card">

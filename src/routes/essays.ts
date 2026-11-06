@@ -528,7 +528,13 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   const userId = c.get('userId');
   const isGuest = c.get('isGuest');
   const body = ((await c.req.json<{ model_id?: string }>().catch(() => null)) ?? ({} as any));
-  const lane: Lane = isGuest ? 'free' : await laneFromBody(c.env, userId, body.model_id);
+  // 游客车道：免费档（缺省/free）或 LongCat 体验档（每日 1 次，UTC+8）；其余车道仍需登录。
+  // longcat 的 catalog 校验（停用 409 / 目录不可用 503 / 未知车道）交给下方 resolveLane 的
+  // aiConfigFail 兜底——不在此处调 laneFromBody 是为了避免多打一次 billing。
+  const rawLane = typeof body.model_id === 'string' ? body.model_id : '';
+  const lane: Lane = isGuest
+    ? (rawLane === 'longcat' ? 'longcat' : 'free')
+    : await laneFromBody(c.env, userId, body.model_id);
   const draftId = parseId(c.req.param('id'));
   if (draftId === null) return c.json({ error: '稿件不存在' }, 404);
 
@@ -544,14 +550,18 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   }>();
   if (!essay) return c.json({ error: '作文不存在' }, 404);
 
-  // 游客只能用免费通道（没有钱包/自备 Key）；付费通道需要登录
-  if (isGuest && body.model_id && body.model_id !== 'free') {
-    return c.json({ error: '游客只能使用免费通道，登录后可选 DeepSeek 或自备 Key', code: 'login_required' }, 403);
+  // 游客车道白名单：免费通道 或 LongCat 体验档；付费通道/自备 Key 需要登录
+  if (isGuest && rawLane && rawLane !== 'free' && rawLane !== 'longcat') {
+    return c.json({ error: '游客可使用 LongCat 体验通道（每日 1 次）或免费通道，更多模型请登录', code: 'login_required' }, 403);
   }
 
   // 次数门禁（业务侧口径：成功才计数）——放在调 AI 之前，避免白烧 token
   if (guestIpLimitHit(c, 'review', 15)) {
     return c.json({ error: '今日批改次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
+  }
+  // LongCat 是体验档（比免费通道贵），IP 级软兜底单独收口：清 cookie 重置游客 id 也最多刷 3 次/天
+  if (lane === 'longcat' && guestIpLimitHit(c, 'longcat', 3)) {
+    return c.json({ error: '今日 LongCat 体验次数过多，请明天再试或登录使用', code: 'guest_ip_limit' }, 429);
   }
   const gate = await checkReviewGate(c.env.DB, userId, isGuest, { lane, draftId });
   if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
@@ -1154,22 +1164,35 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       integrity: result.integrity ?? null,
     });
 
-    // 结果与成功计次同一事务；游客「每稿一次」由唯一索引和条件插入硬约束。
-    const stmts = [isGuest && lane === 'free'
+    // 结果与成功计次同一事务；游客「每稿一次」由唯一索引和条件插入硬约束
+    // （每稿一次跨车道：LongCat 批过的稿，免费通道也不再受理）。
+    const isGuestLane = isGuest && (lane === 'free' || lane === 'longcat');
+    // 游客 LongCat 追加日额度守卫：当天已有 kind='longcat' 计数则不再写结果
+    // （并发同过预检时，后到者在此落空；唯一索引 uq_quota_guest_longcat_day 是最后防线）
+    const guardSql = isGuestLane
+      ? ` WHERE NOT EXISTS (
+             SELECT 1 FROM quota_events
+              WHERE user_id = ? AND draft_id = ? AND kind IN ('review', 'longcat')
+           )` + (lane === 'longcat' ? `
+             AND NOT EXISTS (
+               SELECT 1 FROM quota_events
+                WHERE user_id = ? AND day = ? AND kind = 'longcat'
+             )` : '')
+      : '';
+    const guardArgs: unknown[] = isGuestLane
+      ? (lane === 'longcat' ? [userId, draftId, userId, beijingDay()] : [userId, draftId])
+      : [];
+    const stmts = [isGuestLane
       ? c.env.DB.prepare(
         `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text, meta)
-         SELECT ?, ?, ?, ?, ?, ?, ?
-           WHERE NOT EXISTS (
-             SELECT 1 FROM quota_events
-              WHERE user_id = ? AND draft_id = ? AND kind = 'review'
-           )`,
-      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, essayText, meta,
-        userId, draftId)
+         SELECT ?, ?, ?, ?, ?, ?, ?${guardSql}`,
+      ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, essayText, meta, ...guardArgs)
       : c.env.DB.prepare(
         `INSERT INTO reviews (draft_id, essay_id, user_id, result, model, reviewed_text, meta)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).bind(draftId, draft.essay_id, userId, JSON.stringify(result), model, essayText, meta)];
     if (lane === 'free') stmts.push(successStmt(c.env.DB, userId, 'review', draft.essay_id, draftId));
+    if (isGuest && lane === 'longcat') stmts.push(successStmt(c.env.DB, userId, 'longcat', draft.essay_id, draftId));
 
     let insert: { meta: { last_row_id: number | null; changes: number } } | null = null;
     try {
@@ -1183,7 +1206,15 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           code: 'already_reviewed',
         }, 409);
       }
-      if (isGuest && lane === 'free' && (quotaResult as any)?.meta?.changes === 0) {
+      // 游客 LongCat：条件插入落空 = 对手已占用「每稿一次」或「每日 1 次」，按日额度口径回 409
+      if (isGuest && lane === 'longcat' && insert?.meta.changes === 0) {
+        if (holdInfo.mode === 'hold' && !settled) await billing.releaseQuietly(c.env, holdInfo.holdId, userId);
+        return c.json({
+          error: '这稿已经批改过了，或今日 LongCat 体验次数（1 次/天）已被占用；请改用免费通道或登录后重试。',
+          code: 'guest_longcat_limit',
+        }, 409);
+      }
+      if (isGuestLane && (quotaResult as any)?.meta?.changes === 0) {
         console.error('[review] 游客额度写入被唯一约束拦截（结果已落库但未计次）');
       }
     } catch (err) {

@@ -7,9 +7,11 @@
 // 计数写入 quota_events，只在拿到合法批改结果并落库前 +1。
 //
 // 规则：
-//   游客（未登录，设备 cookie 标识）：每天 3 次，且必须是「当天唯一一篇作文的
-//        一稿/二稿/三稿」——每篇最多 3 稿、每稿最多成功批改 1 次。
-//   登录用户：每天 10 次。
+//   游客（未登录，设备 cookie 标识）：免费通道每天 3 次，且必须是「当天唯一一篇作文的
+//        一稿/二稿/三稿」——每篇最多 3 稿、每稿最多成功批改 1 次（跨车道：LongCat 批过的稿
+//        同样不能再批）。
+//   登录用户：免费通道每天 10 次。
+//   LongCat 限时免费档：游客每天 1 次（独立限额，不占免费通道 3 次）；登录用户不占次数。
 //   付费通道（DeepSeek/credit）与自备 Key：按量计费，不占免费次数。
 // ============================================================
 
@@ -17,6 +19,8 @@ import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 
 export const GUEST_DAILY_REVIEWS = 3;
 export const MEMBER_DAILY_REVIEWS = 10;
+/** 游客 LongCat 体验档：每天 1 次（UTC+8，与 free 次数相互独立） */
+export const GUEST_DAILY_LONGCAT = 1;
 
 /** 游客额外约束：每天 1 篇、每篇最多 3 稿；每日 OCR 3 次（仅百度通道） */
 export const GUEST_DAILY_ESSAYS = 1;
@@ -29,7 +33,7 @@ export function beijingDay(now: Date = new Date()): string {
 }
 
 export type QuotaScope = 'guest' | 'member';
-export type QuotaKind = 'review' | 'ocr';
+export type QuotaKind = 'review' | 'ocr' | 'longcat';
 
 export interface QuotaState {
   scope: QuotaScope;
@@ -38,6 +42,9 @@ export interface QuotaState {
   limit: number;
   used: number;
   remaining: number;
+  /** 游客 LongCat 体验档（登录用户为 null：LongCat 不计次） */
+  longcat_limit: number | null;
+  longcat_used: number | null;
   /** 游客专属约束（登录用户为 null / false） */
   essay_limit: number | null;
   essay_used: number | null;
@@ -70,10 +77,10 @@ async function essaysToday(db: D1Database, userId: string, day: string): Promise
   return row?.n ?? 0;
 }
 
-/** 该稿是否已经有成功批改记录（游客「每稿只能一次」的判据） */
+/** 该稿是否已经有成功批改记录（游客「每稿只能一次」的判据；LongCat 批过同样算数） */
 async function draftReviewed(db: D1Database, userId: string, draftId: number): Promise<boolean> {
   const row = await db.prepare(
-    "SELECT 1 AS x FROM quota_events WHERE user_id = ? AND draft_id = ? AND kind = 'review' LIMIT 1",
+    "SELECT 1 AS x FROM quota_events WHERE user_id = ? AND draft_id = ? AND kind IN ('review', 'longcat') LIMIT 1",
   ).bind(userId, draftId).first();
   return !!row;
 }
@@ -90,6 +97,8 @@ export async function quotaState(db: D1Database, userId: string, isGuest: boolea
     limit,
     used,
     remaining: Math.max(0, limit - used),
+    longcat_limit: isGuest ? GUEST_DAILY_LONGCAT : null,
+    longcat_used: isGuest ? await usedCount(db, userId, day, 'longcat') : null,
     essay_limit: isGuest ? GUEST_DAILY_ESSAYS : null,
     essay_used: isGuest ? await essaysToday(db, userId, day) : null,
     draft_limit: isGuest ? GUEST_MAX_DRAFTS : null,
@@ -121,14 +130,33 @@ export function successStmt(
 // ── 对外：门禁 ──
 
 /**
- * 批改前门禁。lane 为 'free' 时才受次数限制；
- * 付费(BYOK/DeepSeek) 只返回状态，不做次数判定。
+ * 批改前门禁。lane 为 'free' 时受免费次数限制；游客 'longcat' 受每日 1 次体验档限制
+ * （不占免费次数，但每稿一次的约束跨车道生效）；付费(BYOK/DeepSeek)只返回状态，不做次数判定。
  */
 export async function checkReviewGate(
   db: D1Database, userId: string, isGuest: boolean,
   opts: { lane: string; draftId: number },
 ): Promise<GateResult> {
   const state = await quotaState(db, userId, isGuest);
+
+  // 游客 LongCat 体验档：每天 1 次（成功才计数，见 successStmt kind='longcat'）
+  if (opts.lane === 'longcat') {
+    if (!isGuest) return { ok: true, state };
+    if (await draftReviewed(db, userId, opts.draftId)) {
+      return {
+        ok: false, status: 403, code: 'guest_draft_reviewed',
+        error: '这稿已经批改过了。写下一篇（二稿/三稿）才能再批改——每稿只评一次（LongCat 与免费通道共用）。',
+      };
+    }
+    if (state.longcat_used! >= GUEST_DAILY_LONGCAT) {
+      return {
+        ok: false, status: 403, code: 'guest_longcat_limit',
+        error: `游客每天可体验 ${GUEST_DAILY_LONGCAT} 次 LongCat 批改，今日已用完；登录后 LongCat 不限次数，或改用免费通道（今日剩余 ${state.remaining} 次）。`,
+      };
+    }
+    return { ok: true, state };
+  }
+
   if (opts.lane !== 'free') return { ok: true, state };
 
   if (isGuest && await draftReviewed(db, userId, opts.draftId)) {
