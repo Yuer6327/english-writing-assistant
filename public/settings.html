@@ -67,9 +67,6 @@
 
         <form id="form-agnes" style="display:none">
           <div class="chip-row" style="margin-bottom:16px">
-            <span class="chip">⟳ 自动切换端点</span>
-            <span class="chip"><code>apihub.agnes-ai.cn</code></span>
-            <span class="chip"><code>apihub.agnes-ai.com</code></span>
             <span class="chip"><code>agnes-3.0-flash</code></span>
             <span class="chip">🖼 支持看图</span>
           </div>
@@ -124,6 +121,10 @@
           <div id="billing-quota" style="flex:1;min-width:200px;font-size:13px;color:var(--text-soft);line-height:2"></div>
         </div>
 
+        <div role="note" style="background:var(--primary-soft);border:1px solid rgba(48,86,211,.25);border-radius:var(--radius);padding:10px 14px;font-size:14px;font-weight:600;color:var(--primary);margin-bottom:16px">
+          暂未开放充值，请联系站长
+        </div>
+
         <form id="billing-redeem-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
           <div class="form-group" style="flex:1;min-width:180px;margin-bottom:8px">
             <label class="form-label" for="billing-code-input">兑换码充值</label>
@@ -131,12 +132,6 @@
           </div>
           <button type="submit" class="btn btn-primary" id="billing-redeem-btn" style="margin-top:26px">兑换</button>
         </form>
-        <div class="chip-row" style="margin-bottom:16px">
-          <span class="chip">兑换码充值</span>
-          <span class="chip">credit 不过期</span>
-          <span class="chip">不可提现</span>
-        </div>
-
         <div style="font-size:13px;font-weight:600;margin-bottom:8px">近 20 次用量</div>
         <div style="overflow-x:auto">
           <table id="billing-usage-table" aria-label="近期用量记录" style="width:100%;border-collapse:collapse;font-size:12px">
