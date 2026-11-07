@@ -25,10 +25,11 @@ export async function init() {
   const user = await requireAuth();
   if (!user || gen !== generation) return;
 
-  // 三个区域的数据与 DOM 相互独立，并行加载、各自处理失败
+  // 三个区域的数据与 DOM 相互独立，并行加载、各自处理失败；
+  // 计费区直接复用 requireAuth 已返回的会话（不再单独 api.me() 重拉一遍）
   await Promise.all([
     initApiSection(gen),
-    initBillingSection(gen),
+    initBillingSection(gen, user),
     initPromptSection(gen),
   ]);
 }
@@ -73,15 +74,15 @@ function renderQuotaRows(el, quota, billingRows) {
   el.innerHTML = (rows.join('') || '<span class="muted" style="font-size:12px">暂无额度配置</span>') + note;
 }
 
-export async function initBillingSection(gen = generation) {
+export async function initBillingSection(gen = generation, session = null) {
   const balanceEl = document.getElementById('billing-balance');
   const quotaEl = document.getElementById('billing-quota');
   const tbody = document.getElementById('billing-usage-body');
   if (!balanceEl) return;
 
-  // 批改次数先渲染：它不依赖 billing，计费服务抖动时也要能看到剩余次数
-  let session = null;
-  try { session = await api.me(); } catch { /* 忽略，下面按 billing 结果兜底 */ }
+  // 批改次数先渲染：它不依赖 billing，计费服务抖动时也要能看到剩余次数。
+  // session 复用 requireAuth() 返回的会话（含 quota），不再单独拉 /api/auth/me；
+  // 直接调用本函数的旧路径（无 session）按 null 兜底，仅少渲染额度行。
   if (gen !== generation) return;
   if (session?.quota) renderQuotaRows(quotaEl, session.quota, null);
 
@@ -134,7 +135,7 @@ export async function initBillingSection(gen = generation) {
         if (gen !== generation) return;
         toast(`兑换成功，到账 ${(res.points / 10000).toFixed(2)} credit`, 'success');
         input.value = '';
-        await initBillingSection(gen);
+        await initBillingSection(gen, session);
       } catch (err) {
         if (gen === generation) toast(err.message, 'error');
       } finally {

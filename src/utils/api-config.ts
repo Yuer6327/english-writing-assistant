@@ -2,12 +2,16 @@
 // api-config.ts — AI 车道解析（模型库单源 = billing catalog）
 // 车道约定（2026-11-05 定）：
 //   · 免费档 'free'（llm:agnes-flash）与 'byok' 伪车道在客户端**硬编码**——
-//     首屏零额外请求、billing 不可用时免费链路仍可用，AGNES_* 常量为此保留；
+//     首屏零额外请求，AGNES_* 常量为此保留；
 //   · 其余车道（longcat/deepseek/...）以 billing /internal/catalog 为唯一源，
 //     本文件不再维护车道表（旧 LANE_SERVICE 已删除）——加模型只改 billing catalog。
 // BYOK 凭证与上游密钥均已上收 yuer-billing（加密存储、跨项目复用）；
 // 本文件只负责：车道选择 → 车道归一（catalog 校验）→ 经 Service Binding
 // 取明文配置（仅内网），并保留 Agnes 全局共享额度的限流闸门。
+// billing 不可用时的免费链路（2026-11-07 审查 #3 口径修订，现在为真）：
+//   免费车道不发目录请求；config 走 isolate 缓存（全局 5min）+ 失败回退旧缓存，
+//   批改侧免费车道 hold 为 fire-and-forget——billing 短暂宕机时免费批改照常
+//   （仅 isolate 冷启动 + 从未成功取过 agnes 配置的窗口除外：key 由 billing 托管）。
 // ============================================================
 
 import type { Env, ApiConfig } from '../types';
@@ -61,6 +65,47 @@ export async function getCatalog(env: Env): Promise<CatalogEntry[]> {
   return items;
 }
 
+// ── billing.config isolate 缓存（2026-11-07 审查 #1：省掉每次 AI 请求 1 次跨 Worker 往返）──
+// 缓存键设计（实读 resolveLane→billing.config 返回形状后定）：
+//   · 非 byok 服务（agnes/deepseek/longcat/...）：key/baseUrl/model 均为平台级共享凭证，
+//     与 userId 无关（billing 按 modelId 确定性下发）→ 全局键 `g:${serviceId}`，TTL 5min（与 catalog 对齐）；
+//   · byok：key/baseUrl/model/vision 全部随用户 → 用户键 `u:${userId}`，TTL 60s。
+// 用户在设置页保存 BYOK 后由 routes/settings.ts 调 invalidateUserConfig(userId) 立即失效
+// （同 isolate 即时生效；跨 isolate 最多滞后 60s，可接受）。账单/余额等用户态不在此缓存。
+const configCache = new Map<string, { at: number; cfg: billing.ModelConfig }>();
+const CONFIG_GLOBAL_TTL_MS = 5 * 60_000;
+const CONFIG_USER_TTL_MS = 60_000;
+const CONFIG_CACHE_MAX = 500;
+
+/** billing.config 缓存优先；失败时回退过期旧条目（stale grace——billing 短暂宕机不中断免费链路，
+ *  代价最多是 5min/60s 内的旧凭证，凭证轮换由 billing 保证旧 key 短期仍有效）。 */
+async function getConfigCached(env: Env, userId: string, serviceId: string): Promise<billing.ModelConfig> {
+  const isGlobal = serviceId !== 'byok';
+  const key = isGlobal ? `g:${serviceId}` : `u:${userId}`;
+  const ttl = isGlobal ? CONFIG_GLOBAL_TTL_MS : CONFIG_USER_TTL_MS;
+  const hit = configCache.get(key);
+  if (hit && Date.now() - hit.at < ttl) return hit.cfg;
+  try {
+    const cfg = await billing.config(env, userId, serviceId);
+    // 形状防御：关键字段缺失不缓存（防止把坏响应钉住整个 TTL，同 getCatalog 教训）
+    if (!cfg || typeof cfg.key !== 'string' || typeof cfg.model !== 'string' || !cfg.baseUrl) return cfg;
+    if (configCache.size >= CONFIG_CACHE_MAX) configCache.clear();
+    configCache.set(key, { at: Date.now(), cfg });
+    return cfg;
+  } catch (err) {
+    if (hit) {
+      console.error('[api-config] config 拉取失败，回退过期缓存:', err instanceof Error ? err.message : err);
+      return hit.cfg;
+    }
+    throw err;
+  }
+}
+
+/** 用户相关配置缓存失效（settings 保存 BYOK / 切回 Agnes 后调用） */
+export function invalidateUserConfig(userId: string): void {
+  configCache.delete(`u:${userId}`);
+}
+
 /** 解析后的配置：ApiConfig + 计费所需的服务档位 id + 目录条目（硬编码车道为 null） */
 export interface ResolvedConfig extends ApiConfig {
   /** billing 服务档位（hold/settle 用）；byok 视觉模型解析后仍为 'byok' */
@@ -101,7 +146,9 @@ export async function resolveLane(env: Env, userId: string, lane: Lane): Promise
   // Agnes 全局共享额度闸门：只拦免费车道（BYOK / 付费档不吃共享桶）
   if (lane === 'free' && agnesGlobalRateHit()) throw new AgnesRateLimitError();
   const { serviceId, entry } = await laneToService(env, lane);
-  const cfg = await billing.config(env, userId, serviceId);
+  const cached = await getConfigCached(env, userId, serviceId);
+  // 克隆后再做 env 感知改写，避免污染缓存对象（agnes dev mock 只对本请求生效）
+  const cfg = { ...cached };
   if (cfg.provider === 'agnes') cfg.baseUrl = agnesBaseUrls(env);
   return {
     provider: cfg.provider,

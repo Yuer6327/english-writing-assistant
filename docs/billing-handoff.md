@@ -100,7 +100,7 @@ enabled = true
 port = 8789
 ```
 
-Secrets：`ENCRYPTION_KEY`（新造 ≥32 字符随机串，勿复用 essay 的）、`AGNES_API_KEY`（值从 essay 迁移：`wrangler secret put --name english-writing-assistant` 处查看不可行，直接向用户要原始值或让用户自己 put）、`DEEPSEEK_API_KEY`（暂无）、可选 `INTERNAL_TOKEN`（内部调用共享口令，见 3.6）。
+Secrets：`ENCRYPTION_KEY`（新造 ≥32 字符随机串，勿复用 essay 的）、`AGNES_API_KEY`（值从 essay 迁移：`wrangler secret put --name english-writing-assistant` 处查看不可行，直接向用户要原始值或让用户自己 put）、`DEEPSEEK_API_KEY`（暂无）、内部令牌见 §3.7（原文所写「可选 `INTERNAL_TOKEN` 共享口令」已作废：2026-11-07 起 per-caller 令牌，旧 `INTERNAL_TOKEN` 退役）。
 
 ### 3.3 migrations/0001_init.sql（完整）
 
@@ -234,34 +234,7 @@ INSERT INTO quota_rules (project, service, group_key, period, limit_n) VALUES
 
 ### 3.4 catalog.ts 规格
 
-```ts
-interface ServiceDef {
-  id: string;                    // 内部服务 id（对外暴露的唯一标识）
-  kind: 'llm' | 'percall';
-  tier: 'free' | 'paid';
-  enabled: boolean;              // disabled 时 hold/config 返回 409 model_disabled
-  heavy: boolean;                // 受"同用户在飞 1 笔"并发锁限制
-  vision: boolean;
-  jsonMode: boolean;             // 请求是否带 response_format
-  secretName?: string;           // 'AGNES_API_KEY' | 'DEEPSEEK_API_KEY'
-  baseUrl: string | string[];    // 数组 = essay ai.ts 的多端点 failover
-  upstreamModel: string;
-  // 定价（分）：llm 为 分/1k tokens；percall 为 分/次。= 上游成本 × N
-  price: { inputPer1k?: number; outputPer1k?: number; perCall?: number } | null;
-  priceN?: number;
-  note?: string;
-}
-```
-
-初始三条 + 一个伪模型：
-1. `llm:agnes-flash` — free / enabled / heavy / vision:true / **jsonMode:false**（Agnes 不支持 response_format）/ baseUrl 双端点数组 `['https://apihub.agnes-ai.cn/v1','https://apihub.agnes-ai.com/v1']` / upstreamModel `agnes-3.0-flash` / secret AGNES_API_KEY / price null（免费）。
-2. `llm:deepseek-flash` — paid / **enabled:false（无 Key）** / heavy / vision:true / jsonMode:true（启用时实测核验，见 §9.2）/ baseUrl `https://api.deepseek.com/v1` / upstreamModel `deepseek-flash` / secret DEEPSEEK_API_KEY / price null（拿到控制台单价后填，N 先按 2）。
-3. `ocr:baidu` — kind percall / tier free-quota（额度内免费，超出按次）/ enabled:true / heavy:false / price `{perCall: 10000}`（10000 微积分 = 1 积分）。
-4. 伪模型 `byok` — 不入目录；`config/hold` 遇到 `modelId='byok'` 走 byok_keys 解析，零计费。
-
-另外导出 `PROJECTS = ['writing']`（未来加 'reading'）与 `estimateHoldCost(service, estInputTokens, maxOutputTokens)`。
-
-> ⚠️ 本节及 §3.5 的旧字段名/公式（`inputPer1k/outputPer1k`、「最低 1 分」、settle 向上取整到分、TTL 5 分钟）是设计稿历史口径，**以实现为准**：price 为三档 `{inputHitPer1k, inputMissPer1k, outputPer1k, perCall}`（微积分/1k）；结算按上游 usage 缓存拆分三档计价、成本 ceil 到微积分（`actualCostMicro`）；hold TTL 10 分钟（> relay/longcat budgetMs 300s）；settle/release 带退款行 NOT EXISTS 守卫与可选 userId 归属校验；gift/recharge/setBalance/codes 强制 operator + 日限/批上限。现行契约见 §3.4.1 与 billing 仓库源码。
+> ⚠️ 本节是设计稿历史口径（ServiceDef 旧字段、双档 price、「最低 1 分」等均已被实现取代），**整段原文已移至文末「附录：历史口径（已作废）」**。现行权威：billing 仓库 `src/catalog.ts`（所有子项目共用的唯一模型库，见 §3.4.1）与 §3.6 契约；新项目接入还要在 `PROJECTS` 常量加一行（见 §9.3）。
 
 ### 3.4.1 模型库单源契约（2026-11-05 增补）
 
@@ -281,44 +254,48 @@ interface ServiceDef {
 
 ### 3.5 行为规格
 
-**钱包/账本（wallet.ts）**
-- 所有余额变更走 `credit_ledger`（只追加）+ `wallets.balance` 缓存，同一 D1 `batch()` 内完成。扣减模板：
-  `UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?` → 影响行数 0 = 余额不足（402）；随后插 ledger（含 balance_after = 旧值 − delta）。
-- **hold(userId, project, service, est)**：免费额度判定（quota.check）命中 → 直接扣 quota_usage 并返回 `mode:'free'`；否则按 estimateHoldCost 冻结（同上模板，先 `INSERT INTO wallets ... ON CONFLICT(user_id) DO NOTHING` 保证行存在）。hold id = UUID，TTL 5 分钟。
-- **settle(holdId, usage)**：实际成本 micro = f(usage)（llm：`(in*inputPer1k + out*outputPer1k)/1000 * 10000` 微点；percall：perCall*10000 微点）；实扣分 = `max(1, ceil(micro/100))`（向上取整到分）；若 frozen > 实扣，差额以 ledger type=refund 入账；holds.status='settled'；写 usage_logs。**幂等**：hold 已 settled/released 时直接返回原结果（200）。
-- **release(holdId)**：ledger type=refund 退回 frozen，status='released'。幂等同上。
-- **cron（scheduled handler）**：`UPDATE holds SET status='expired' WHERE status='active' AND expires_at < now`，逐条退回 frozen（batch）。
-- **gift(userId, points, note)**：ledger type=gift（管理员手动送分，可为任意非零分值）。
-- **redeem(userId, code)**：单 batch 内 `UPDATE redemption_codes SET status='used', used_by=? WHERE code=? AND status='unused'`（行数 0 → 409 已用/404 无效）→ wallet 入账 → ledger type=recharge ref=code → order(channel='redeem_code', status='delivered')。
+> ⚠️ 本节是设计稿历史口径（hold TTL 5 分钟、结算向上取整到「分」、gift 无 operator/日限、redeem 无对账兜底等均已被实现取代），**整段原文已移至文末「附录：历史口径（已作废）」**。现行权威：billing 仓库 `src/wallet.ts` / `src/quota.ts` / `src/byok.ts` 源码与 §3.6 契约（hold TTL 10 分钟、结算 ceil 到微积分、settle/release 退款行 NOT EXISTS 幂等守卫与必填 userId 归属校验（缺失 400，不匹配 404）、gift/recharge/setBalance/codes 强制 operator + 日限/批上限、hold 支持 idempotencyKey）。
 
-**额度（quota.ts）**
-- 规则匹配：project + service + 用户标签组（多标签时任一命中取 limit 最大；无标签用 'default'）+ period。
-- period key：`new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })`；monthly 用 `'YYYY-MM'`（同 timezone）。
-- 扣减：`INSERT INTO quota_usage ... ON CONFLICT(user_id, project, service, period) DO UPDATE SET used = used + 1 RETURNING used`，used > limit_n 则拒绝（返回 free 配额已用尽 → 上层走 hold）。
-
-**BYOK（byok.ts）**
-- AES-256-GCM，与 essay `src/utils/crypto.ts` 完全同构（key = SHA-256(ENCRYPTION_KEY)，格式 `base64(iv):base64(ct)`）——迁移时无需格式转换，只需**用 billing 的新密钥重新加密**。
-- `set(userId, {key, baseUrl, model, vision?})`、`get(userId)`（解密为明文配置，仅经内网返回）、`has(userId)`。
-
-### 3.6 内部 API 契约（全部经 Service Binding；可校验 `X-Internal-Token`）
+### 3.6 内部 API 契约（全部经 Service Binding；鉴权 = per-caller 内部令牌，见 §3.7）
 
 | 端点 | 请求 | 成功响应 | 错误 |
 |---|---|---|---|
-| `POST /internal/hold` | `{userId, project, service, modelId?, estInputTokens?, maxOutputTokens?, calls?}` | `{mode:'free', quotaRemaining}` / `{mode:'hold', holdId, frozen}` / `{mode:'byok'}` | 402 `{error,code:'insufficient_balance'}`；409 `{code:'model_disabled'}`；404 未知服务 |
-| `POST /internal/holds/:id/settle` | `{promptTokens?, completionTokens?, calls?}` | `{charged, refunded, balance}`（幂等） | 404 |
-| `POST /internal/holds/:id/release` | — | `{refunded, balance}`（幂等） | 404 |
+| `POST /internal/hold` | `{userId, project, service, modelId?, estInputTokens?, maxOutputTokens?, calls?, idempotencyKey?}` | `{mode:'free', quotaRemaining}` / `{mode:'hold', holdId, frozen}` / `{mode:'byok'}` | 402 `{error,code:'insufficient_balance'}`；409 `{code:'model_disabled'}` / `{code:'quota_exhausted'}`（免费档当日额度用尽）；503 `{code:'secret_missing'}`（服务端上游密钥未配置，fail-closed）；404 未知服务/项目 |
+| `POST /internal/holds/:id/settle` | `{userId, promptTokens?, completionTokens?, promptCacheHitTokens?, promptCacheMissTokens?, calls?}`（**`userId` 必填**，2026-11-07 B2：缺失 400；与 hold.user_id 不匹配 404 不泄漏存在性——调用方必须传会话用户） | `{charged, refunded, balance}`（幂等） | 400 缺 userId；404 不存在/不归属 |
+| `POST /internal/holds/:id/release` | `{userId}`（**必填**，同 settle） | `{refunded, balance}`（幂等） | 400 缺 userId；404 不存在/不归属 |
 | `GET /internal/wallet/:userId` | — | `{balance}`（无行则建 0 余额行） | — |
 | `GET /internal/config/:userId/:modelId` | — | `{provider:'agnes'\|'deepseek'\|'byok', key, baseUrl: string\|string[], model, vision?: {key, baseUrl, model} \| null}`（明文 key 仅内网返回） | 404 未知模型；409 model_disabled；404 未配置 byok |
 | `POST /internal/redeem` | `{userId, code}` | `{balance, points}` | 404/409/429 |
 | `POST /admin/gift` | `{userId, points, note}` | `{balance}` | — |
-| `POST /admin/byok/set` | `{userId, key?, baseUrl, model, visionKey?, visionBaseUrl?, visionModel?}`（key 省略=保留旧值） | `{ok}` | — |
+| `POST /internal/byok/set` | `{userId, key?, baseUrl, model, visionKey?, visionBaseUrl?, visionModel?, clear?}`（key 省略=保留旧值；`clear:true` 删除记录切回免费通道；vision 三字段整体缺省=保留旧 vision 配置、传空串=显式清除） | `{ok}` | 400 缺 userId / 缺 baseUrl·model（非 clear）/ baseUrl 非环回非 https / 字段类型非法 |
 | `POST /admin/codes` | `{points, count, batch?}` | `{codes: string[]}`（一次性返回，明码不落日志） | — |
 | `POST /admin/orders/manual` | `{userId, points, note}` | `{orderId}`（channel=manual，直接 delivered+入账） | — |
+| （channel 校验，2026-11-07 B3） | 三个充值入口（`/admin/recharge`、`/admin/orders/manual`、`/webhooks/recharge`）的 `channel` 统一按形状白名单 `^[a-z][a-z0-9_-]{0,31}$` 校验：非法 400 `invalid_channel`。**仍是开放枚举**——未来新渠道（alipay/stripe/…）无需改 billing 代码，起名遵守该形状即可；manual/auto/redeem_code 等现值全兼容 | — | 400 |
 | `GET /admin/user/:userId` | — | `{balance, tags, recent_ledger, recent_usage}` | — |
 | `POST /admin/tags` | `{userId, add?: string[], remove?: string[]}` | `{tags}` | — |
 | `GET /admin/orders?limit=` / `GET /admin/usage?userId=&limit=` | — | 行数组 | — |
 
-说明：`hold` 的默认 modelId 规则在 billing 内实现——请求未带 modelId 时：byok_keys 有记录 → 'byok'，否则 'llm:agnes-flash'（与 essay 现状行为一致）。
+说明：
+- `POST /internal/byok/set`（2026-11-07 变更）：原 `POST /admin/byok/set` 已随 per-caller 令牌拆分**删除**（审查 §4.3 #8）——BYOK 保存是用户自助操作而非铸币面，走 WRITING 令牌即可，`userId` 取调用方声明的会话用户（`src/routes/settings.ts` 经 `billing.byokSet` 调用，请求/响应形状与旧 admin 端点逐字段一致）。
+- `hold` 的默认 modelId 规则在 billing 内实现——请求未带 modelId 时：byok_keys 有记录 → 'byok'，否则 'llm:agnes-flash'（与 essay 现状行为一致）。
+- `idempotencyKey`（2026-11-07 增补，可选，≤128 字符）：**同用户**同 key 且原 hold 仍 active → 直接返回原 hold（响应形状不变，防网络重试双冻结）；原 hold 已终态（settled/released/expired）→ 视为新 hold 正常走。幂等键按 `(idempotency_key, user_id)` 作用域（billing 迁移 0008）——跨用户同 key 各自独立成 hold，因此消费方不得用可预测/共享的 key（如常量字符串），应含 userId 维度或随机成分。消费方本轮可不发送；只对 mode='hold'（真冻结）路径生效，free/byok 无 hold 行可复用。
+- **免费档用量可见性（2026-11-07 实查，消除两份审查报告的冲突）**：mode='free' 的 hold **会**落一条 0 元 usage 行——三条免费路径（skipQuota 放行 / 免费额度命中 / 无规则免费放行）都在放行前 `INSERT INTO usage_logs`，`status='free'`、`micro_points=0`、`points_charged=0`（Yuer6327-billing `src/wallet.ts:164-191`，三条 INSERT 分别在 165-168 / 175-178 / 187-190 行）；byok 路径同样落行（`status='byok'`，wallet.ts:147-150）。因此 `/internal/usage`、`/admin/usage` 与账户页**能看到免费档调用次数**；只有被拒绝的请求（409 quota_exhausted 等）不留行。
+
+### 3.7 内部令牌模型（per-caller，2026-11-07 起；旧共享 `INTERNAL_TOKEN` 退役）
+
+三把令牌，各管一扇门；载体头统一 `X-Internal-Token`，billing 侧恒定时间比较、对应路由未配置令牌时 503 fail-closed（无旁路）：
+
+| 令牌 | 持有方（持有并发送） | 可调范围 | 不可调 |
+|---|---|---|---|
+| `WRITING_INTERNAL_TOKEN` | english-writing-assistant（writing 消费方） | `/internal/*`（hold/settle/release/wallet/config/catalog/overview/usage/me/redeem） | `/admin/*`、`/webhooks/*` |
+| `AUTH_INTERNAL_TOKEN` | fuwari-cf/auth（统一登录后台） | `/admin/*`（充值/送分/兑换码/标签/查账）与 `/internal/*`（账号页余额、个人用量） | `/webhooks/*` |
+| `RECHARGE_TOKEN` | 外部支付渠道（未来；载体头 `X-Recharge-Token`，也接受 `X-Internal-Token` 头名但值必须等于本口令） | 仅 `/webhooks/recharge` | 其余一切路由 |
+
+规则要点：
+- `/admin/*`（铸币面）**只认** `AUTH_INTERNAL_TOKEN`；writing 令牌打 /admin 返回 401。
+- `/internal/*` 两把令牌任一有效即放行。
+- 令牌值必须互不相同（泄露不串联）；两把内部令牌都必须配置，缺配置对应路由整体 503。
+- **轮换流程**：`wrangler secret put`（billing Worker）与消费方 Worker 先后 put 同一新值——先后窗口内请求 401，调用方按既有重试语义重发即可恢复；轮换 RECHARGE_TOKEN 需与渠道方协调，避免回调 401。线上旧 `INTERNAL_TOKEN` secret 的删除由部署阶段统一做（代码守卫已移除，残留不生效）。
 
 ## 4. 作文 App（essay）后端改造规格
 
@@ -326,7 +303,7 @@ interface ServiceDef {
 
 1. **`src/types.ts`**：`Env` 加 `BILLING: Fetcher`；`Vars` 加 `role: string`；`AGNES_API_KEY` 注释标记 deprecated（迁移期保留可选）。
 2. **`wrangler.toml`**：文件末尾追加 `[[services]]`（binding = "BILLING"，service = "yuer-billing"）。注意现有 `routes = [...]` 内联数组必须保持在一切 `[[table]]` 段之前。
-3. **`src/utils/billing.ts`（新建）**：`env.BILLING.fetch` 封装，方法一一对应 §3.6；非 2xx 抛错并挂 `err.code`；可选带 `X-Internal-Token`（secret INTERNAL_TOKEN，双方可先留空）。
+3. **`src/utils/billing.ts`（新建）**：`env.BILLING.fetch` 封装，方法一一对应 §3.6；非 2xx 抛错并挂 `err.code`；可选带 `X-Internal-Token`（secret INTERNAL_TOKEN，双方可先留空）。（2026-11-07：secret 名已改为 **`WRITING_INTERNAL_TOKEN`**，per-caller 令牌模型见 §3.7；本节其余为历史实施记录。）
 4. **`src/utils/ai.ts`**：`callAI` 返回值 `Promise<string>` → `Promise<{content: string, usage?: {prompt_tokens: number, completion_tokens: number}}>`。`callAIFetch` 从 `data.usage` 取值随 content 一起返回；多端点/重试路径透传"成功那次"的 usage（失败重试的中间成本不单独计费，吸收进 N）。4 个调用点同步改：essays.ts 批改循环（~L383）、polish fragment（~L484）、polish full（~L516）、ocr.ts vlm 循环。**其余逻辑（1015 排班、response_format 回退、extractJSON、超时）一律不动**。
 5. **`src/utils/api-config.ts`**：`getUserApiKey`/`getVisionConfig` **签名不变**，实现改为 `billing.resolveModel(userId, 'free'|'byok')`（agnes 的 `agnesGlobalRateHit()` 检查保留在解析路径，抛 `AgnesRateLimitError`）；新增 `resolveLane(env, userId, modelId: 'free'|'deepseek'|'byok')` 供路由用。AGNES_BASE_URLS/AGNES_MODEL 常量保留（前端展示用）。
 6. **`src/middleware/auth.ts`**（~L23-38）：SQL 已查出 `u.role`，补 `c.set('role', row.role)` 一行。
@@ -409,9 +386,11 @@ interface ServiceDef {
 
 `wrangler secret put DEEPSEEK_API_KEY`（yuer-billing）→ catalog 中 `llm:deepseek-flash` enabled 改 true → 从控制台取实际单价填 price（N 先按 2）→ 实测核验：json mode（response_format 是否稳定）、图像输入（**图片只能放 user 消息，仅视觉模型接受，违规直接 HTTP 400 不降级**——构造消息时注意）、按实测单价修订价格。
 
-### 9.3 阅读助手将来接入
+### 9.3 新消费方（阅读助手等）将来接入
 
-新增 `services` binding → project 用 `'reading'` → 在 billing 配 reading 的 quota_rules → BYOK 自动共享（平台级）。essay 的 `callAI` 改造（返回 usage）届时可直接抄。
+新增 `services` binding → project 用 `'reading'` → **billing 侧 `PROJECTS` 常量（Yuer6327-billing `src/catalog.ts`，`export const PROJECTS = ['writing']` 一行）要加一行 `'reading'`**——`/internal/hold` 对不在 PROJECTS 里的 project 直接 404 unknown_project → 在 billing 配 reading 的 quota_rules → BYOK 自动共享（平台级）。essay 的 `callAI` 改造（返回 usage）届时可直接抄。
+
+**鉴权（per-caller 令牌模型，见 §3.7）**：新消费方要有一把自己的令牌（如 `READING_INTERNAL_TOKEN`，billing 侧 Env + 守卫名单 + `wrangler secret put`、消费方侧 put 同值各一次）；该令牌可调 `/internal/*`，不可调 `/admin/*` 与 `/webhooks/*`。不要复用 writing/auth 的令牌。
 
 ## 10. 上游事实（2026-10 查证，实施时复核）
 
@@ -419,3 +398,59 @@ interface ServiceDef {
 - **Agnes（免费档）**：`agnes-3.0-flash`，双端点 `apihub.agnes-ai.cn`（大陆）/ `apihub.agnes-ai.com`（国际）各自独立限流；被 Cloudflare 1015 边缘限流时响应带精确 `retry-after`；**不支持 response_format**（essay ai.ts 已有跳过机制与 1015 排班，勿破坏）；账户 RPM 约 20/分钟（全局共享）。
 - **百度 OCR**：AK/SK 换 access_token（30 天有效）；端点降级链 handwriting → accurate_basic → general；错误码 17/18/19 = 额度耗尽；handwriting 约 200 次一次性、accurate 约 1000 次/月（免费额度）。
 - **auth 平台**：users.role 现用于权限判定（admin）；生产 Turnstile 开启；essay 对 auth-db 为只读直查，**不要**往 auth-db 写任何计费数据。
+
+## 附录：历史口径（已作废）
+
+> 以下为 2026-10-25 设计稿 §3.4/§3.5 原文，仅供考古对照；**实施一律以 billing 仓库源码、§3.4.1、§3.6 与 §3.7 为准**（旧字段名/公式/TTL/鉴权模型均已取代，见 §3.4、§3.5 原位置的指路行）。
+
+### A.1 catalog.ts 规格（原 §3.4）
+
+```ts
+interface ServiceDef {
+  id: string;                    // 内部服务 id（对外暴露的唯一标识）
+  kind: 'llm' | 'percall';
+  tier: 'free' | 'paid';
+  enabled: boolean;              // disabled 时 hold/config 返回 409 model_disabled
+  heavy: boolean;                // 受"同用户在飞 1 笔"并发锁限制
+  vision: boolean;
+  jsonMode: boolean;             // 请求是否带 response_format
+  secretName?: string;           // 'AGNES_API_KEY' | 'DEEPSEEK_API_KEY'
+  baseUrl: string | string[];    // 数组 = essay ai.ts 的多端点 failover
+  upstreamModel: string;
+  // 定价（分）：llm 为 分/1k tokens；percall 为 分/次。= 上游成本 × N
+  price: { inputPer1k?: number; outputPer1k?: number; perCall?: number } | null;
+  priceN?: number;
+  note?: string;
+}
+```
+
+初始三条 + 一个伪模型：
+1. `llm:agnes-flash` — free / enabled / heavy / vision:true / **jsonMode:false**（Agnes 不支持 response_format）/ baseUrl 双端点数组 `['https://apihub.agnes-ai.cn/v1','https://apihub.agnes-ai.com/v1']` / upstreamModel `agnes-3.0-flash` / secret AGNES_API_KEY / price null（免费）。
+2. `llm:deepseek-flash` — paid / **enabled:false（无 Key）** / heavy / vision:true / jsonMode:true（启用时实测核验，见 §9.2）/ baseUrl `https://api.deepseek.com/v1` / upstreamModel `deepseek-flash` / secret DEEPSEEK_API_KEY / price null（拿到控制台单价后填，N 先按 2）。
+3. `ocr:baidu` — kind percall / tier free-quota（额度内免费，超出按次）/ enabled:true / heavy:false / price `{perCall: 10000}`（10000 微积分 = 1 积分）。
+4. 伪模型 `byok` — 不入目录；`config/hold` 遇到 `modelId='byok'` 走 byok_keys 解析，零计费。
+
+另外导出 `PROJECTS = ['writing']`（未来加 'reading'）与 `estimateHoldCost(service, estInputTokens, maxOutputTokens)`。
+
+> ⚠️ 本节及 §3.5 的旧字段名/公式（`inputPer1k/outputPer1k`、「最低 1 分」、settle 向上取整到分、TTL 5 分钟）是设计稿历史口径，**以实现为准**：price 为三档 `{inputHitPer1k, inputMissPer1k, outputPer1k, perCall}`（微积分/1k）；结算按上游 usage 缓存拆分三档计价、成本 ceil 到微积分（`actualCostMicro`）；hold TTL 10 分钟（> relay/longcat budgetMs 300s）；settle/release 带退款行 NOT EXISTS 守卫与可选 userId 归属校验；gift/recharge/setBalance/codes 强制 operator + 日限/批上限。现行契约见 §3.4.1 与 billing 仓库源码。
+
+### A.2 行为规格（原 §3.5）
+
+**钱包/账本（wallet.ts）**
+- 所有余额变更走 `credit_ledger`（只追加）+ `wallets.balance` 缓存，同一 D1 `batch()` 内完成。扣减模板：
+  `UPDATE wallets SET balance = balance - ? WHERE user_id = ? AND balance >= ?` → 影响行数 0 = 余额不足（402）；随后插 ledger（含 balance_after = 旧值 − delta）。
+- **hold(userId, project, service, est)**：免费额度判定（quota.check）命中 → 直接扣 quota_usage 并返回 `mode:'free'`；否则按 estimateHoldCost 冻结（同上模板，先 `INSERT INTO wallets ... ON CONFLICT(user_id) DO NOTHING` 保证行存在）。hold id = UUID，TTL 5 分钟。
+- **settle(holdId, usage)**：实际成本 micro = f(usage)（llm：`(in*inputPer1k + out*outputPer1k)/1000 * 10000` 微点；percall：perCall*10000 微点）；实扣分 = `max(1, ceil(micro/100))`（向上取整到分）；若 frozen > 实扣，差额以 ledger type=refund 入账；holds.status='settled'；写 usage_logs。**幂等**：hold 已 settled/released 时直接返回原结果（200）。
+- **release(holdId)**：ledger type=refund 退回 frozen，status='released'。幂等同上。
+- **cron（scheduled handler）**：`UPDATE holds SET status='expired' WHERE status='active' AND expires_at < now`，逐条退回 frozen（batch）。
+- **gift(userId, points, note)**：ledger type=gift（管理员手动送分，可为任意非零分值）。
+- **redeem(userId, code)**：单 batch 内 `UPDATE redemption_codes SET status='used', used_by=? WHERE code=? AND status='unused'`（行数 0 → 409 已用/404 无效）→ wallet 入账 → ledger type=recharge ref=code → order(channel='redeem_code', status='delivered')。
+
+**额度（quota.ts）**
+- 规则匹配：project + service + 用户标签组（多标签时任一命中取 limit 最大；无标签用 'default'）+ period。
+- period key：`new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })`；monthly 用 `'YYYY-MM'`（同 timezone）。
+- 扣减：`INSERT INTO quota_usage ... ON CONFLICT(user_id, project, service, period) DO UPDATE SET used = used + 1 RETURNING used`，used > limit_n 则拒绝（返回 free 配额已用尽 → 上层走 hold）。
+
+**BYOK（byok.ts）**
+- AES-256-GCM，与 essay `src/utils/crypto.ts` 完全同构（key = SHA-256(ENCRYPTION_KEY)，格式 `base64(iv):base64(ct)`）——迁移时无需格式转换，只需**用 billing 的新密钥重新加密**。
+- `set(userId, {key, baseUrl, model, vision?})`、`get(userId)`（解密为明文配置，仅经内网返回）、`has(userId)`。

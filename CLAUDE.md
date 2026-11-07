@@ -10,7 +10,7 @@
 
 - **https://writing.yuer6327.top/**（zone 内 Workers 路由 `writing.yuer6327.top/*`，见 wrangler.toml `routes`）
 - DNS 由 [dns-guard](D:\fuwari-cf\dns-guard) 统一守护：灰云 CNAME→优选候选（当前 www.shopify.com），故障自动切换/恢复，与其他子域同步
-- **统一认证**（无本地账户）：登录/注册/退出跳转 https://auth.yuer6327.top，后端直查平台 `auth-db`（binding `AUTH_DB`）的 sessions 表；cookie 名 `s`，`token_hash = sha256(cookie 值)` hex。**平台用户 id 是 UUID 字符串**，本库所有 user_id 列均为 TEXT
+- **统一认证**（无本地账户）：登录/注册/退出跳转 https://auth.yuer6327.top；会话校验走 **auth 的 `POST /internal/validate`**（Service Binding `AUTH`，2026-11-07 起不再直查 auth-db），请求 `{"s":"<原始 cookie 值>"}` + 头 `X-Internal-Token: <AUTH_VALIDATE_TOKEN>`，响应 `{"v":1,"valid":true,"user":{...}}` / `{"v":1,"valid":false}`（401=本仓令牌错，503=auth 库异常）。cookie 名 `s`。**平台用户 id 是 UUID 字符串**，本库所有 user_id 列均为 TEXT
 - 新用户首次访问 GET /api/essays 时惰性预置示例作文（一次性，标记在 user_flags.seeded）
 
 ## 项目定位
@@ -42,7 +42,7 @@
 | 后端 | Cloudflare Workers + Hono 4（TypeScript，`src/index.ts` 入口） |
 | 数据库 | Cloudflare D1（SQLite），幂等迁移 `migrations/` + `scripts/migrate.js`（顺序执行，state 存 `.wrangler/migration-state.json`） |
 | 前端 | `public/` 原生 HTML/CSS/JS（ES Modules，**无构建步骤**），Workers Assets 直接服务 |
-| 认证 | **统一认证平台 auth.yuer6327.top**（同根域共享 `s` cookie，直查 auth-db sessions；无本地登录/注册接口） |
+| 认证 | **统一认证平台 auth.yuer6327.top**（同根域共享 `s` cookie；会话校验经 Service Binding `AUTH` 调 `/internal/validate` + isolate 60s 缓存；无本地登录/注册接口） |
 | 密钥 | BYOK AES-256-GCM 加密存 D1；平台级 Secret 走 `wrangler secret put` / `.dev.vars` |
 | AI | OpenAI Chat Completions 兼容格式；多模态走 `content` 数组（`image_url` data URL） |
 
@@ -60,6 +60,7 @@
 │   ├── types.ts               # Env / Vars / ReviewResult 等业务类型
 │   ├── middleware/
 │   │   ├── auth.ts            # ★ 会话：authMiddleware（必须登录）/ userMiddleware（登录或游客）
+│   │   │                      #   validate 客户端 + 60s isolate 缓存 + 降级语义（见下）
 │   │   │                      #   游客 cookie wg、登录后接管游客数据
 │   │   └── security.ts        # ★ 安全响应头 + CSP + CORS 白名单 + 写操作同源校验
 │   ├── routes/
@@ -67,7 +68,7 @@
 │   │   ├── essays.ts          # ★ 核心：作文+稿件 CRUD / 批改 / 精修 / 全文润色（挂 /api）
 │   │   ├── ocr.ts             # 双通道手写识别（vlm / baidu，挂 /api/ocr）
 │   │   ├── prompts.ts         # 提示词模板：按模式（genre）独立读写
-│   │   └── settings.ts        # BYOK（主模型+可选视觉模型）/ Agnes 切换
+│   │   └── settings.ts        # BYOK（主模型+可选视觉模型）/ Agnes 切换（走 /internal/byok/set）
 │   ├── utils/
 │   │   ├── quota.ts           # ★ 批改次数额度（成功计数 / 游客规则 / 每日 10 次）
 │   │   ├── ai.ts              # ★ callAI 调用层：多端点 failover、response_format 回退、
@@ -122,14 +123,14 @@
 
 | 面 | 机制 | 注意 |
 |---|---|---|
-| 会话 | `authMiddleware`（必须登录）/ `userMiddleware`（登录或游客） | `/api/auth/me` **恒 200**（`logged_in` 区分），否则游客一进站就被弹登录；游客专属能力返回 **403 `code=login_required`**（前端弹登录引导，而非整页跳转） |
+| 会话 | `authMiddleware`（必须登录）/ `userMiddleware`（登录或游客）；校验走 auth `/internal/validate`（binding `AUTH`）+ sha256(s) 60s isolate 缓存（≤1000 条，超限清空；valid:false 不缓存，封禁/登出生效延迟 ≤60s） | `/api/auth/me` **恒 200**（`logged_in` 区分），否则游客一进站就被弹登录；游客专属能力返回 **403 `code=login_required`**（前端弹登录引导，而非整页跳转）。**降级语义**：userMiddleware 无 `s` cookie 直接游客（不发调用）、`valid:false` → 游客、auth 网络/5xx/令牌错 → 按游客放行（fail-open 仅限本来允许游客的路由）；authMiddleware 任何 auth 异常 → **503 fail-closed** |
 | 游客身份 | cookie `wg`（HttpOnly/SameSite=Lax/90 天，https 才加 Secure） | 清 cookie 可重置次数 → 另有 IP 级内存兜底（`guest:ip:*`）；登录后静默接管 `guest:<id>` 名下的作文/稿件/批改/精修 |
 | 响应头 | `middleware/security.ts` 统一注入 CSP / X-Frame-Options / nosniff / Referrer-Policy / Permissions-Policy / HSTS | **CSP 内联脚本走 sha256，不用 `unsafe-inline`**；改 `public/*.html` 里的 `<script>` 后必须 `npm run csp:hash` 看新哈希并更新 `INLINE_SCRIPT_HASHES`，否则 `npm run csp:check`（CI 已接）会挂 |
 | 静态资源 | `[assets] run_worker_first = true` | 关掉的话静态文件由边缘直接返回、**绕过 Worker，安全头对 HTML 全部失效**（本地 `wrangler dev` 同样如此，别只看配置文件就以为生效） |
 | CORS | 白名单反射（自身源 + `FRONTEND_ORIGIN` 逗号列表） | `FRONTEND_ORIGIN="*"` 现在表示"仅同源"，不再反射任意 Origin；响应带 `Vary: Origin` |
 | CSRF | 非 GET 请求校验 Origin/Referer 同源 | 无 Origin 的请求（curl/服务端）放行，认证仍靠 Cookie |
-| 调试后门 | `GET /api/auth/dev-session` | 需 `.dev.vars` 里 `ENABLE_DEV_SESSION=1` **且** 本地 auth-db 有测试会话行才发 Cookie；生产不配置该变量 → 恒 404。**不要用 Host 判断**：`wrangler dev` 会把请求 URL/Host 重写成 `routes` 里的生产域名 |
-| 计费 | `hold → settle/release` | **入参校验必须放在 `hold` 之前**，否则 400 早退会留下未释放的冻结额度（要等 cron 过期才对账）；免费档带 `skipQuota`，次数由 `quota_events` 计 |
+| 调试后门 | `GET /api/auth/dev-session` | 单门禁：`.dev.vars` 里 `ENABLE_DEV_SESSION=1` 即发测试 cookie `s=test-cookie-1`（HttpOnly+Secure；该值是否有效由会话校验端 auth dev / 本地 stub 判定）；生产永不配置该变量 → 恒 404。**不要用 Host 判断**：`wrangler dev` 会把请求 URL/Host 重写成 `routes` 里的生产域名 |
+| 计费 | `hold → settle/release`（令牌：本仓只持 `WRITING_INTERNAL_TOKEN`，billing `/admin/*` 已对本仓关闭，管理入口迁统一认证后台） | **入参校验必须放在 `hold` 之前**，否则 400 早退会留下未释放的冻结额度（要等 cron 过期才对账）；免费档带 `skipQuota`，次数由 `quota_events` 计；**免费/0 元车道（免费档、游客 LongCat）hold 为 fire-and-forget**（`executionCtx.waitUntil` + catch 记日志，仅作 billing 侧 0 元用量统计，billing 宕机不影响批改）；付费车道 hold 失败 fail-closed（503/402） |
 | 入参 | 自增 id 统一走 `parseId()`；文本长度封顶 | 新增/修改稿件同为 `MAX_ESSAY_CHARS`；BYOK 端点只允许 https（本地环回除外） |
 | 提示词注入 | `utils/injection.ts` 三层：入库剥不可见字符 → 规则族检测（只标记不硬拦）→ 高置信时 datamark + 服务端分项硬顶 ≤8/≤8/≤3 | **威胁模型是"用户本人就是攻击者"**（学生给自己刷分），所以措辞类防御不算边界，真边界是 `sanitizeReview` 的钳制。详见 `docs/INJECTION.md`；改规则后必跑 `npm run inj:test` |
 
@@ -165,20 +166,23 @@ cd ../english-writing-assistant && node node_modules/wrangler/bin/wrangler.js de
 ```
 本地无真实 Agnes key 时，可临时把 billing `catalog.ts` 的 agnes `baseUrl` 指向一个假 `/v1/chat/completions`（返回合法批改 JSON），**测完必须还原**（`.wrangler/mock-llm.cjs` 有现成实现）。curl 访问本机要加 `--noproxy '*'`（本机装了全局代理）。
 
-**本地联调统一认证**：AUTH_DB 走本地 sqlite（与生产隔离），需先造最小表+测试会话；配好 `ENABLE_DEV_SESSION=1` 后浏览器直接访问 `/api/auth/dev-session` 即可拿到 cookie 值 `test-cookie-1`：
+**本地联调统一认证**：会话校验已改走 auth `/internal/validate`（AUTH_DB 直查绑定已删除），两种本地姿势：
 
 ```bash
-# 本地 auth-db 造 users/sessions 表并插入测试会话（cookie 值 test-cookie-1，
-# token_hash = sha256('test-cookie-1') = 95496838ab4f1634...）
-npx wrangler d1 execute auth-db --local --command "CREATE TABLE ...; INSERT ..."
-# 之后 curl -H "Cookie: s=test-cookie-1" http://127.0.0.1:8788/api/essays
+# 姿势 A（auth dev 就绪时）：起 auth Worker（service 名必须是 auth，与 wrangler.toml
+# [[services]] 对应），走 wrangler dev registry，无需额外配置。
+# 姿势 B（auth 未就绪）：.dev.vars 配 DEV_AUTH_URL 指向本地 stub（须同时 ENABLE_DEV_SESSION=1），
+#   stub 实现 POST /internal/validate：校验 X-Internal-Token，body {"s":"..."}，
+#   对 test-cookie-1 / test-cookie-2 返回 {"v":1,"valid":true,"user":{...}}，其余 {"v":1,"valid":false}。
+# 浏览器拿测试 cookie：访问 /api/auth/dev-session（ENABLE_DEV_SESSION=1 时发放 s=test-cookie-1）
+curl -H "Cookie: s=test-cookie-1" http://127.0.0.1:8788/api/essays
 ```
 
 > ⚠️ `wrangler dev` 会把请求的 Host/Origin 重写成 `routes` 里的生产域名（`http://writing.yuer6327.top`），
 > 所以本地按 Host 判断"是不是本地请求"一定失败；需要区分环境请用环境变量开关。
 > 另：`XDG_CONFIG_HOME` 指向项目内可写目录，可避免沙箱内 wrangler 写日志目录 EPERM。
 
-**生产 secrets**（wrangler secret put）：ENCRYPTION_KEY、AGNES_API_KEY、BAIDU_OCR_AK / BAIDU_OCR_SK（复用 english-reading-assistant 的百度应用，AppID 8096172，均已配置）。
+**生产 secrets**（wrangler secret put）：ENCRYPTION_KEY、AGNES_API_KEY、BAIDU_OCR_AK / BAIDU_OCR_SK（复用 english-reading-assistant 的百度应用，AppID 8096172，均已配置）、**WRITING_INTERNAL_TOKEN**（调 billing /internal/*，生产必配）、**AUTH_VALIDATE_TOKEN**（调 auth /internal/validate，生产必配）。
 
 ## 新增题型（扩展指南）
 
@@ -192,3 +196,9 @@ npx wrangler d1 execute auth-db --local --command "CREATE TABLE ...; INSERT ..."
 - 批改/润色为一次性 JSON 调用（无流式），免费通道实测 18-75 秒，前端按钮有"批改中（约 10-30 秒）"提示
 - 图片以 data URL 存 D1 文本列（≤3 张×300KB，个人工具规模够用；超出应换 R2）
 - 删除中间稿件后 version 出现空号，Tab 按剩余 version 展示（不重排，保持批改记录引用稳定）
+
+## 运维须知
+
+- 封禁/登出的生效延迟 ≤60s：会话校验结果在 isolate 内存缓存 60s（TTL 内旧登录态仍可见），到期自动生效，无需手动清缓存
+- SSE 断开的取消路径（client signal → 上游 AI 取消 → hold release）本地 workerd 验证不了——wrangler dev 不对客户端断开触发 request.signal，需生产抽测（观察 holds 是否残留、账实是否一致；残留由 cron 过期释放兜底）
+- 游客 LongCat 的 IP 多样性兜底依赖 Cloudflare 边缘强制覆写 CF-Connecting-IP：本地/自建反代环境下该头可被客户端伪造，线上防护前提是流量确实经 CF 边缘进入

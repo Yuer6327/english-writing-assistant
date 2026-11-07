@@ -611,7 +611,8 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   // 流式 + 心跳下不再受 ~100s 边缘空闲限制；预算按车道放宽（推理通道 5 分钟，catalog budgetMs 下发）
   const aiDeadline = aiBudgetFor(cfg.entry, startedAt);
   // 客户端断开 → 取消全部在途上游调用（白烧共享 key 的资源口子，2026-11-06 审计 P2）。
-  // 批改链路一次最多 ~6 次上游调用，断开不取消等于每次断开白烧整条链。
+  // 批改链路一次最多 ~10 次上游调用（3 采样 + 双通道语义检测 + 双通道预清洗 + B 盲评
+  // + 主调用含一次严格重试），断开不取消等于每次断开白烧整条链。
   const clientSignal = c.req.raw.signal;
   const liveOpts = (o: ReturnType<typeof aiCallOpts>) => ({ ...o, signal: clientSignal });
 
@@ -644,19 +645,35 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   const estImageTextTokens = 6000;
   const estUserBase = estimateTextTokens(topicBase) + estimateTextTokens(essayText) + 3000
     + (prevReview ? 1500 : 0);
+  const holdOpts = {
+    // 系统消息按内置默认（最大静态前缀）估：自定义模板时略高估，方向安全
+    estInputTokens: estimateTextTokens(REVIEW_SYSTEM_PROMPT) + estUserBase
+      + estimateImageTokens(topicImages, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate) * (topicImages.length ? 2 : 0)
+      + (topicImages.length ? estImageTextTokens : 2 * estUserBase),
+    maxOutputTokens: maxOutput,
+    skipQuota: lane === 'free',
+  };
   let holdInfo: billing.HoldInfo;
-  try {
-    holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      // 系统消息按内置默认（最大静态前缀）估：自定义模板时略高估，方向安全
-      estInputTokens: estimateTextTokens(REVIEW_SYSTEM_PROMPT) + estUserBase
-        + estimateImageTokens(topicImages, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate) * (topicImages.length ? 2 : 0)
-        + (topicImages.length ? estImageTextTokens : 2 * estUserBase),
-      maxOutputTokens: maxOutput,
-      skipQuota: lane === 'free',
-    });
-  } catch (err) {
-    const fail = billingFail(err);
-    return c.json(fail.body, fail.status as 402);
+  if (lane === 'free' || (isGuest && lane === 'longcat')) {
+    // ── 免费/0 元车道：hold 改 fire-and-forget（2026-11-07 审查 F2/§4.3 #2）──
+    // 这些车道在 billing 侧本就是 0 元（免费档 skipQuota；游客 LongCat 限时免费档
+    // 返回 mode:'free'），hold 的唯一作用是让 billing 记一笔 0 元用量（报表）。
+    // 本地立即按 mode:'free' 继续，hold 丢进 waitUntil 后台执行、失败仅记日志——
+    // billing 宕机时免费批改完全可用；并发锁照常获取（免费档也必须锁）。
+    holdInfo = { mode: 'free' };
+    c.executionCtx.waitUntil(
+      billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts)
+        .catch((err) => console.error('[review] 免费车道 hold（0 元用量统计）失败（不影响批改）:',
+          err instanceof Error ? err.message : err)),
+    );
+  } else {
+    // 付费/BYOK 车道 fail-closed 不动：hold 失败（含 billing 宕机 503、余额不足 402）直接拒绝
+    try {
+      holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts);
+    } catch (err) {
+      const fail = billingFail(err);
+      return c.json(fail.body, fail.status as 402);
+    }
   }
 
   // heavy 并发锁：同用户在飞 1 笔（免费档与付费档占用；BYOK 不占）
@@ -725,6 +742,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
 
   let settled = false;
   let charged = 0;
+  let balance: number | null = null;   // settle 回传的结算后余额（微积分；免费/失败路径为 null）
   try {
     // ── 分项分采样（先行）：3 次独立「只打分」小调用，与正式批改同一口径（RUBRIC_BLOCK）──
     // self-consistency：温度 0.6 保证样本多样性；3 个有效样本取中位数「定档」，
@@ -1155,6 +1173,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
           calls: 1 + sampleCallsOk + auxCallsOk,
         }, userId);
         charged = s.charged;
+        balance = typeof s.balance === 'number' ? s.balance : null;
         settled = true;
       } catch (err) {
         console.error('[review] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
@@ -1306,6 +1325,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         }
         : undefined,
       points_charged: charged,          // 微积分（前端 ÷10000 展示为 credit）
+      balance,                          // settle 回传的结算后余额（微积分；前端直刷余额胶囊免重拉 me）
       lane: laneLabel(lane, cfg.entry), // free / paid / byok
       quota: await quotaState(c.env.DB, userId, isGuest),
     });
@@ -1395,20 +1415,31 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
   const liveOpts = (o: ReturnType<typeof aiCallOpts>) => ({ ...o, signal: clientSignal });
 
   // ── 预扣费（片段 / 全文输出上限）──
+  const estBase = estimateTextTokens(
+    essay.topic_text + (contextText || '') + (isFragment ? fragment : ''));
+  const holdOpts = {
+    estInputTokens: estBase,
+    maxOutputTokens: maxOutput,
+    // 免费档的每日次数由本 Worker 的 quota_events 管（批改才计数，精修/润色不计次），
+    // billing 侧不再对它做次数判定（writing 的 LLM 次数规则已删除）
+    skipQuota: lane === 'free',
+  };
   let holdInfo: billing.HoldInfo;
-  try {
-    const estBase = estimateTextTokens(
-      essay.topic_text + (contextText || '') + (isFragment ? fragment : ''));
-    holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: estBase,
-      maxOutputTokens: maxOutput,
-      // 免费档的每日次数由本 Worker 的 quota_events 管（批改才计数，精修/润色不计次），
-      // billing 侧不再对它做次数判定（writing 的 LLM 次数规则已删除）
-      skipQuota: lane === 'free',
-    });
-  } catch (err) {
-    const fail = billingFail(err);
-    return c.json(fail.body, fail.status as 402);
+  if (lane === 'free') {
+    // 免费车道与批改同口径：hold 改 fire-and-forget（0 元用量统计，billing 宕机不影响精修/润色）
+    holdInfo = { mode: 'free' };
+    c.executionCtx.waitUntil(
+      billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts)
+        .catch((err) => console.error('[polish] 免费车道 hold（0 元用量统计）失败（不影响润色）:',
+          err instanceof Error ? err.message : err)),
+    );
+  } else {
+    try {
+      holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts);
+    } catch (err) {
+      const fail = billingFail(err);
+      return c.json(fail.body, fail.status as 402);
+    }
   }
 
   const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;
@@ -1420,6 +1451,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
 
   let settled = false;
   let charged = 0;
+  let balance: number | null = null;   // settle 回传的结算后余额（微积分；免费/失败路径为 null）
   try {
     if (isFragment) {
       // ── 片段精修（fragment / instruction 已在扣费前校验）──
@@ -1466,6 +1498,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
             promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
           }, userId);
           charged = s.charged;
+          balance = typeof s.balance === 'number' ? s.balance : null;
           settled = true;
         } catch (err) {
           console.error('[polish] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
@@ -1478,7 +1511,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
       ).bind(essayId, contextDraftId, userId, fragment, instruction, JSON.stringify(parsedResult)).run();
       return c.json({
         polish_id: insert.meta.last_row_id as number, mode: 'fragment', result: parsedResult,
-        points_charged: charged, lane: laneLabel(lane, cfg.entry),
+        points_charged: charged, balance, lane: laneLabel(lane, cfg.entry),
       });
     }
 
@@ -1531,6 +1564,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
           promptCacheMissTokens: lastUsage?.prompt_cache_miss_tokens,
         }, userId);
         charged = s.charged;
+        balance = typeof s.balance === 'number' ? s.balance : null;
         settled = true;
       } catch (err) {
         console.error('[polish] settle 失败（hold 将被 cron 过期释放）:', err instanceof Error ? err.message : err);
@@ -1543,7 +1577,7 @@ api.post('/essays/:id/polish', userMiddleware, aiRateLimit, async (c) => {
     ).bind(essayId, contextDraftId, userId, JSON.stringify(parsedResult)).run();
     return c.json({
       polish_id: insert.meta.last_row_id as number, mode: 'full', result: parsedResult,
-      points_charged: charged, lane: laneLabel(lane, cfg.entry),
+      points_charged: charged, balance, lane: laneLabel(lane, cfg.entry),
     });
   } catch (err: any) {
     if (holdInfo.mode === 'hold' && !settled) {

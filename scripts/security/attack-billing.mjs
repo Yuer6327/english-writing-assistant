@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // ============================================================
 // scripts/security/attack-billing.mjs — billing 资金逻辑红队套件
-// 直接打本地 billing (127.0.0.1:8789) 的 /internal /admin /webhooks，
+// 直接打本地 billing（默认 127.0.0.1:8789，可用 BASE 覆盖）的 /internal /admin /webhooks，
 // 验证钱包账本在恶意/并发输入下不出现「凭空加钱 / 双重退款 / 账实不符」。
 // PASS=防御成立 FAIL=发现漏洞 INFO=观察
 // 用法：node scripts/security/attack-billing.mjs
+//   环境变量：BASE、WRITING_INTERNAL_TOKEN、AUTH_INTERNAL_TOKEN（见下方令牌说明）
 // ============================================================
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8789';
@@ -14,17 +15,29 @@ function record(id, verdict, detail) {
   console.log(`[${{ PASS: '✓ PASS', FAIL: '✗ FAIL', INFO: '· INFO' }[verdict]}] ${id} — ${detail}`);
 }
 
-// fail-closed 后本地也要带口令（与两项目 .dev.vars 的 INTERNAL_TOKEN 一致）
-const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || 'local-dev-internal-token';
-async function req(method, path, body, headers = {}) {
+// per-caller 双令牌（2026-11-07 起，旧共享 INTERNAL_TOKEN 已退役）：
+//   /internal/* 认 WRITING_INTERNAL_TOKEN 或 AUTH_INTERNAL_TOKEN 任一；
+//   /admin/*（充值/送分等铸币面）只认 AUTH_INTERNAL_TOKEN。
+// 本地值取自 billing 仓 .dev.vars（占位说明，勿提交真实值）：
+//   WRITING_INTERNAL_TOKEN=dev-writing-token-*（writing 端持有）
+//   AUTH_INTERNAL_TOKEN=dev-auth-token-*（auth 端持有）
+// 生产各端各持各的 secret，值互不相同——泄露不串联。
+const WRITING_TOKEN = process.env.WRITING_INTERNAL_TOKEN || 'dev-writing-token-placeholder';
+const AUTH_TOKEN = process.env.AUTH_INTERNAL_TOKEN || 'dev-auth-token-placeholder';
+
+async function req(method, path, body, headers = {}, token = WRITING_TOKEN) {
   const resp = await fetch(BASE + path, {
     method,
-    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': INTERNAL_TOKEN, ...headers },
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': token, ...headers },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const ct = resp.headers.get('content-type') || '';
   const json = ct.includes('json') ? await resp.json().catch(() => null) : (await resp.text()).slice(0, 200);
   return { status: resp.status, json };
+}
+/** /admin/* 铸币面统一走 AUTH 令牌；用 req（WRITING 令牌）打 /admin/* 应得 401（见 6g） */
+function adminReq(method, path, body, headers = {}) {
+  return req(method, path, body, headers, AUTH_TOKEN);
 }
 
 const U = 'u-bill-attack-1';   // 受击用户
@@ -38,9 +51,9 @@ async function ledgerSum(u) {
 }
 
 async function setup() {
-  // 余额设定为确定值（幂等）：重复跑套件不叠加充值
-  await req('POST', '/admin/balance/set', { userId: U, target: 100000, note: 'attack-suite reset' });
-  await req('POST', '/admin/balance/set', { userId: V, target: 100000, note: 'attack-suite reset' });
+  // 余额设定为确定值（幂等）：重复跑套件不叠加充值（/admin/* 走 AUTH 令牌）
+  await adminReq('POST', '/admin/balance/set', { userId: U, target: 100000, note: 'attack-suite reset' });
+  await adminReq('POST', '/admin/balance/set', { userId: V, target: 100000, note: 'attack-suite reset' });
 }
 
 // ────────────────────────────────────────────────────────────
@@ -53,15 +66,15 @@ async function attackLifecycle() {
   if (h1?.mode !== 'hold') { record('1a hold 冻结', 'FAIL', JSON.stringify(h1)); return; }
   const afterHold = await walletOf(U);
   const frozenOk = afterHold === b0 - h1.frozen;
-  const s1 = await req('POST', `/internal/holds/${h1.holdId}/settle`, { promptTokens: 1000, completionTokens: 1000 });
-  const s2 = await req('POST', `/internal/holds/${h1.holdId}/settle`, { promptTokens: 1000, completionTokens: 1000 });
+  const s1 = await req('POST', `/internal/holds/${h1.holdId}/settle`, { promptTokens: 1000, completionTokens: 1000, userId: U });
+  const s2 = await req('POST', `/internal/holds/${h1.holdId}/settle`, { promptTokens: 1000, completionTokens: 1000, userId: U });
   const after1 = (await walletOf(U));
   const idem = s1.json?.charged === s2.json?.charged && s2.json?.refunded === (h1.frozen - s2.json?.charged);
   record('1a settle 幂等（重复结算不重复退差）', frozenOk && idem ? 'PASS' : 'FAIL',
     `frozen=${h1.frozen}, charged=${s1.json?.charged}/${s2.json?.charged}, refunded=${s1.json?.refunded}/${s2.json?.refunded}`);
 
   // 1b settle 后 release → 不得再退款
-  const r1 = await req('POST', `/internal/holds/${h1.holdId}/release`);
+  const r1 = await req('POST', `/internal/holds/${h1.holdId}/release`, { userId: U });
   const afterRelease = await walletOf(U);
   record('1b settle 后 release 零退款', r1.json?.refunded === 0 && afterRelease === after1 ? 'PASS' : 'FAIL',
     `release.refunded=${r1.json?.refunded}, 余额 ${after1}→${afterRelease}`);
@@ -81,10 +94,10 @@ async function attackRace() {
   // 每笔 hold 同时打 settle×2 + release×2 —— 竞态下允许 settle 或 release 任一方赢，
   // 但每笔 hold 的账本净额必须 ≤0：released → 0，settled → -实扣。净额 > 0 = 双重退款（白嫖）。
   await Promise.all(holds.flatMap(id => [
-    req('POST', `/internal/holds/${id}/settle`, { promptTokens: 1500, completionTokens: 800 }),
-    req('POST', `/internal/holds/${id}/release`),
-    req('POST', `/internal/holds/${id}/release`),
-    req('POST', `/internal/holds/${id}/settle`, { promptTokens: 1500, completionTokens: 800 }),
+    req('POST', `/internal/holds/${id}/settle`, { promptTokens: 1500, completionTokens: 800, userId: U }),
+    req('POST', `/internal/holds/${id}/release`, { userId: U }),
+    req('POST', `/internal/holds/${id}/release`, { userId: U }),
+    req('POST', `/internal/holds/${id}/settle`, { promptTokens: 1500, completionTokens: 800, userId: U }),
   ]));
   const b1 = await walletOf(U);
   const rows = (await req('GET', `/internal/usage/${U}?limit=1000`)).json?.ledger || [];
@@ -133,8 +146,8 @@ async function attackExpired() {
   const statusAfter = d1(`SELECT status FROM holds WHERE id = '${h.holdId}'`);
   const expired = statusAfter.includes('expired');
   const afterCron = await walletOf(U);
-  const s = await req('POST', `/internal/holds/${h.holdId}/settle`, { promptTokens: 100, completionTokens: 100 });
-  const r = await req('POST', `/internal/holds/${h.holdId}/release`);
+  const s = await req('POST', `/internal/holds/${h.holdId}/settle`, { promptTokens: 100, completionTokens: 100, userId: U });
+  const r = await req('POST', `/internal/holds/${h.holdId}/release`, { userId: U });
   const final = await walletOf(U);
   // b0 = 预扣后余额；cron 退款恰好一次 → afterCron = b0 + frozen；此后 settle/release 不得再动钱
   const ok = expired && afterCron === b0 + h.frozen && final === afterCron;
@@ -146,7 +159,7 @@ async function attackGarbage() {
   console.log('\n═══ 4. 垃圾/恶意数值 ═══');
   const createdHolds = [];
   const cases = [
-    ['4a settle NaN usage', ['POST', `/internal/holds/x-settle-nan/settle`, { promptTokens: NaN, completionTokens: NaN }], [404]],
+    ['4a settle NaN usage', ['POST', `/internal/holds/x-settle-nan/settle`, { promptTokens: NaN, completionTokens: NaN, userId: U }], [404]],
     ['4b hold 负 tokens（接口边界 400）', ['POST', '/internal/hold', { userId: U, project: 'writing', service: 'llm:deepseek-flash', estInputTokens: -1e9, maxOutputTokens: -1e9 }], [400]],
     ['4c hold 超大 tokens（钳制后大额冻结或拒绝）', ['POST', '/internal/hold', { userId: U, project: 'writing', service: 'llm:deepseek-flash', estInputTokens: 1e15, maxOutputTokens: 1e15 }], [200, 402]],
     ['4d hold 1e308 tokens（钳制后余额不足 402）', ['POST', '/internal/hold', { userId: U, project: 'writing', service: 'llm:deepseek-flash', estInputTokens: 1e308, maxOutputTokens: 1e308 }], [402]],
@@ -160,7 +173,8 @@ async function attackGarbage() {
   const b0 = await walletOf(U);
   let frozenCapOk = true;
   for (const [name, [m, p, body], okStatuses] of cases) {
-    const r = await req(m, p, body);
+    // /admin/* 铸币面用例（4e-4i）必须带 AUTH 令牌，否则 401 而测不到入参校验
+    const r = p.startsWith('/admin/') ? await adminReq(m, p, body) : await req(m, p, body);
     const statusOk = okStatuses.includes(r.status);
     // 4c 特殊：200 允许，但冻结额必须被钳在「1e6 tokens × 最高价」内（=200000 微积分）
     if (name.startsWith('4c') && r.status === 200) {
@@ -169,8 +183,8 @@ async function attackGarbage() {
     }
     record(name, statusOk && frozenCapOk ? 'PASS' : 'FAIL', `status=${r.status} ${JSON.stringify(r.json).slice(0, 100)}`);
   }
-  // 清理本组创建的 hold，避免污染 4k 的余额断言
-  for (const id of createdHolds) await req('POST', `/internal/holds/${id}/release`);
+  // 清理本组创建的 hold，避免污染 4k 的余额断言（settle/release 已要求带 userId，B2）
+  for (const id of createdHolds) await req('POST', `/internal/holds/${id}/release`, { userId: U });
   const b1 = await walletOf(U);
   record('4k 垃圾输入不造成资金损失（hold 已清理）', b1 === b0 ? 'PASS' : 'FAIL', `${b0}→${b1}（差 ${b1 - b0}）`);
 }
@@ -178,7 +192,7 @@ async function attackGarbage() {
 async function attackRedeem() {
   console.log('\n═══ 5. 兑换码 ═══');
   // 2026-11-06 起 /admin/codes 强制 operator（资金操作溯源）；批次总额上限 1000 credit
-  const gen = await req('POST', '/admin/codes', { points: 5000, count: 1, operator: 'suite:audit' });
+  const gen = await adminReq('POST', '/admin/codes', { points: 5000, count: 1, operator: 'suite:audit' });
   const code = gen.json?.codes?.[0];
   if (!code) { record('5 生成兑换码', 'FAIL', JSON.stringify(gen.json)); return; }
 
@@ -203,7 +217,7 @@ async function attackBoundary() {
   console.log('\n═══ 6. 边界与信任边界 ═══');
   // 模拟外部攻击者：伪造（而非复用套件默认的）内部令牌
   const r1 = await req('POST', '/webhooks/recharge', { userId: U, points: 999, externalRef: 'evil-' + Date.now() }, { 'X-Internal-Token': 'forged-attacker-token' });
-  // 单一信任路径后：webhook 回退 INTERNAL_TOKEN（已配置）→ 无令牌请求应为 401；未配置时为 503
+  // webhook 口令 = RECHARGE_TOKEN，无回退（不回退 INTERNAL_TOKEN）；未配置时整条路由 503
   record('6a webhook 无效口令被拒（401/503）', r1.status === 401 || r1.status === 503 ? 'PASS' : 'FAIL', `status=${r1.status}`);
 
   const r2 = await req('POST', '/internal/hold', { userId: U, project: 'nope', service: 'llm:deepseek-flash' });
@@ -222,6 +236,47 @@ async function attackBoundary() {
   const bal = await walletOf(U);
   const led = await ledgerSum(U);
   record('6f 全程账实相符（余额=账本净额）', bal === led ? 'PASS' : 'FAIL', `balance=${bal}, ledgerSum=${led}`);
+
+  // per-caller 令牌拆分（2026-11-07）：WRITING 令牌只放行 /internal/*，
+  // 打 /admin/*（铸币面）必须 401——writing 仓被攻破也不得给任意用户充值/铸币。
+  // 用例刻意带齐 operator 等合法参数：除了令牌守卫不应有任何东西挡在 200 前面。
+  const r7 = await req('POST', '/admin/recharge', { userId: U, points: 100, operator: 'suite:audit' });
+  record('6g WRITING 令牌打 /admin/* 必须被拒（401）', r7.status === 401 ? 'PASS' : 'FAIL', `status=${r7.status}`);
+}
+
+async function attackByok() {
+  console.log('\n═══ 7. BYOK 自助端点（/internal/byok/set，原 /admin/byok/set 迁移）═══');
+  const BU = 'u-bill-attack-byok';   // 独立用户，不碰钱包守恒断言
+  // 7a 自助保存：WRITING 令牌 + 环回 http（本地放行）+ 假 key（非真实上游）
+  const s1 = await req('POST', '/internal/byok/set', {
+    userId: BU, key: 'sk-test-fake-byok-key', baseUrl: 'http://127.0.0.1:9/v1', model: 'test-model',
+  });
+  record('7a WRITING 令牌自助保存 BYOK（200 {ok:true}）', s1.status === 200 && s1.json?.ok === true ? 'PASS' : 'FAIL',
+    `status=${s1.status} ${JSON.stringify(s1.json)}`);
+  // 7b 保存后 byok 立即生效：config 明文回读逐字段一致（AES-GCM 解密正确）
+  const cfg = await req('GET', `/internal/config/${BU}/byok`);
+  const okCfg = cfg.status === 200 && cfg.json?.provider === 'byok'
+    && cfg.json?.key === 'sk-test-fake-byok-key'
+    && cfg.json?.baseUrl === 'http://127.0.0.1:9/v1' && cfg.json?.model === 'test-model';
+  record('7b byok 生效（config 回读 key/baseUrl/model 一致）', okCfg ? 'PASS' : 'FAIL',
+    `status=${cfg.status} ${JSON.stringify(cfg.json).slice(0, 140)}`);
+  // 7c key 省略 = 保留旧值，baseUrl/model 可单独更新
+  const s2 = await req('POST', '/internal/byok/set', { userId: BU, baseUrl: 'http://127.0.0.1:9/v2', model: 'test-model-2' });
+  const cfg2 = await req('GET', `/internal/config/${BU}/byok`);
+  const kept = s2.status === 200 && cfg2.json?.key === 'sk-test-fake-byok-key' && cfg2.json?.model === 'test-model-2';
+  record('7c key 省略保留旧值（baseUrl/model 更新）', kept ? 'PASS' : 'FAIL',
+    `set=${s2.status}, key=${cfg2.json?.key?.slice(0, 10)}…, model=${cfg2.json?.model}`);
+  // 7d 非环回 http 拒绝（仅 https，回环除外）
+  const s3 = await req('POST', '/internal/byok/set', { userId: BU, key: 'sk-x', baseUrl: 'http://evil.example.com/v1', model: 'm' });
+  record('7d 非环回 http baseUrl 拒绝（400）', s3.status === 400 ? 'PASS' : 'FAIL', `status=${s3.status} ${JSON.stringify(s3.json)}`);
+  // 7e 非 clear 缺 baseUrl/model 拒绝
+  const s4 = await req('POST', '/internal/byok/set', { userId: BU, key: 'sk-x' });
+  record('7e 非 clear 缺 baseUrl/model 拒绝（400）', s4.status === 400 ? 'PASS' : 'FAIL', `status=${s4.status} ${JSON.stringify(s4.json)}`);
+  // 7f clear=true 删除记录 → config 回 404（切回免费通道语义）
+  const s5 = await req('POST', '/internal/byok/set', { userId: BU, baseUrl: '', model: '', clear: true });
+  const cfg3 = await req('GET', `/internal/config/${BU}/byok`);
+  record('7f clear 清除记录（config 回 404）', s5.status === 200 && cfg3.status === 404 ? 'PASS' : 'FAIL',
+    `set=${s5.status}, config=${cfg3.status}`);
 }
 
 await setup();
@@ -231,6 +286,7 @@ await attackExpired();
 await attackGarbage();
 await attackRedeem();
 await attackBoundary();
+await attackByok();
 
 console.log('\n──────── 汇总 ────────');
 const fail = results.filter(r => r.verdict === 'FAIL');

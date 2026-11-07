@@ -1,7 +1,10 @@
 // ============================================================
 // billing.ts — 计费平台（yuer-billing）Service Binding 客户端
-// 方法与 billing Worker 的 /internal/* 与 /admin/* 端点一一对应；
+// 方法与 billing Worker 的 /internal/* 端点一一对应；
 // 非 2xx 抛 BillingError（挂 code，路由层据此透传 402/409 等）。
+// 2026-11-07 per-caller 令牌拆分（审查 §2 S2）：本仓只持有并发送
+// WRITING_INTERNAL_TOKEN；billing /admin/* 只收 auth 侧令牌，本仓无权调用——
+// 原管理代理方法（gift/tags/codes/orders/...）已删除，管理入口迁统一认证后台。
 // ============================================================
 
 import type { Env } from '../types';
@@ -18,9 +21,27 @@ export class BillingError extends Error {
   }
 }
 
-async function call<T>(env: Env, path: string, init?: { method?: string; body?: unknown }): Promise<T> {
+/** 计费调用时间预算（W2，与 auth validate 的 3s 同风格）：billing hang 不能拖住业务请求。
+ *  · 快调用（settle/config/wallet/catalog/...）5s：超时按 billing_unreachable 降级
+ *    （settle/release 失败由 billing cron 过期释放兜底，不阻塞结果交付）。
+ *  · hold 15s：hold 是付费车道的准入门禁，预算必须覆盖正常计费慢查（红队 hold_slow
+ *    10s 量级的慢账务也在正常范围内）；超时同样 fail-closed 503，孤儿 hold 由 billing
+ *    cron 过期释放。免费车道 hold 本就 fire-and-forget，不受此预算影响。 */
+const CALL_TIMEOUT_MS = 5000;
+const HOLD_TIMEOUT_MS = 15_000;
+
+// 缺失口令的一次性告警（P3 审计，与 middleware/auth.ts 的 AUTH_VALIDATE_TOKEN 同款）：
+// WRITING_INTERNAL_TOKEN 运行时缺失 = 每笔 /internal/* 调用都被 billing 401 拒（fail-closed），
+// 此前无任何日志可查。首次实际使用时 console.error 一次，模块级标志防刷屏。
+let writingInternalTokenWarned = false;
+
+async function call<T>(env: Env, path: string, init?: { method?: string; body?: unknown }, timeoutMs = CALL_TIMEOUT_MS): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (env.INTERNAL_TOKEN) headers['X-Internal-Token'] = env.INTERNAL_TOKEN;
+  if (env.WRITING_INTERNAL_TOKEN) headers['X-Internal-Token'] = env.WRITING_INTERNAL_TOKEN;
+  else if (!writingInternalTokenWarned) {
+    writingInternalTokenWarned = true;
+    console.error('[billing] WRITING_INTERNAL_TOKEN missing — all /internal/* calls will 401');
+  }
   const body = init?.body !== undefined ? JSON.stringify(init.body) : undefined;
   let resp: Response;
   try {
@@ -29,8 +50,8 @@ async function call<T>(env: Env, path: string, init?: { method?: string; body?: 
   // 恒走 Service Binding；误配单一变量的半开状态直接被门禁挡掉（否则计费流量+内部令牌会发往任意主机）。
   const devDirect = (env.ENABLE_DEV_SESSION || '') === '1' && !!env.DEV_BILLING_URL;
   resp = devDirect
-    ? await fetch((env.DEV_BILLING_URL as string).replace(/\/$/, '') + path, { method: init?.method ?? 'GET', headers, body })
-    : await env.BILLING.fetch(`https://yuer-billing${path}`, { method: init?.method ?? 'GET', headers, body });
+    ? await fetch((env.DEV_BILLING_URL as string).replace(/\/$/, '') + path, { method: init?.method ?? 'GET', headers, body, signal: AbortSignal.timeout(timeoutMs) })
+    : await env.BILLING.fetch(`https://yuer-billing${path}`, { method: init?.method ?? 'GET', headers, body, signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     console.error('[billing] BILLING.fetch 异常:', err instanceof Error ? err.message : err);
     throw new BillingError('计费服务暂不可用，请稍后重试', 503, 'billing_unreachable');
@@ -58,7 +79,7 @@ export function hold(
   env: Env, userId: string, project: string, service: string,
   opts: { estInputTokens?: number; maxOutputTokens?: number; calls?: number; skipQuota?: boolean } = {},
 ): Promise<HoldInfo> {
-  return call(env, '/internal/hold', { method: 'POST', body: { userId, project, service, ...opts } });
+  return call(env, '/internal/hold', { method: 'POST', body: { userId, project, service, ...opts } }, HOLD_TIMEOUT_MS);
 }
 
 export function settle(
@@ -148,6 +169,18 @@ export function byokStatus(env: Env, userId: string): Promise<ByokStatus> {
   return call(env, `/internal/byok/${userId}`);
 }
 
+/** 用户自助保存 BYOK（settings 页）：走 /internal/byok/set（原 /admin/byok/set 已随
+ *  per-caller 令牌拆分对本仓关闭，审查 §4.3 #8）。 */
+export function byokSet(
+  env: Env, userId: string,
+  payload: {
+    key?: string; baseUrl: string; model: string;
+    visionKey?: string; visionBaseUrl?: string; visionModel?: string; clear?: boolean;
+  },
+): Promise<{ ok: boolean }> {
+  return call(env, '/internal/byok/set', { method: 'POST', body: { userId, ...payload } });
+}
+
 export interface BillingOverview {
   balance: number;
   paid_enabled: boolean;
@@ -175,57 +208,6 @@ export function redeem(
   return call(env, '/internal/redeem', { method: 'POST', body: { userId, code } });
 }
 
-// ── 管理代理（/admin/*，仅 admin 角色路由可达）──
-
-export function adminGift(
-  env: Env, userId: string, points: number, note?: string, operator?: string,
-): Promise<{ balance: number }> {
-  // operator：资金操作不可抵赖审计锚点（essay 代理层从管理员会话注入，billing 不信任任何客户端自报身份）
-  return call(env, '/admin/gift', { method: 'POST', body: { userId, points, note, operator } });
-}
-
-export function adminByokSet(
-  env: Env, userId: string,
-  payload: {
-    key?: string; baseUrl: string; model: string;
-    visionKey?: string; visionBaseUrl?: string; visionModel?: string; clear?: boolean;
-  },
-): Promise<{ ok: boolean }> {
-  return call(env, '/admin/byok/set', { method: 'POST', body: { userId, ...payload } });
-}
-
-export function adminCodes(
-  env: Env, points: number, count: number, batch?: string, operator?: string,
-): Promise<{ codes: string[]; batch: string }> {
-  return call(env, '/admin/codes', { method: 'POST', body: { points, count, batch, operator } });
-}
-
-export function adminManualOrder(
-  env: Env, userId: string, points: number, note?: string, operator?: string,
-): Promise<{ orderId: string }> {
-  return call(env, '/admin/orders/manual', { method: 'POST', body: { userId, points, note, operator } });
-}
-
-export function adminUser(
-  env: Env, userId: string,
-): Promise<{ balance: number; tags: string[]; recent_ledger: any[]; recent_usage: any[] }> {
-  return call(env, `/admin/user/${userId}`);
-}
-
-export function adminTags(
-  env: Env, userId: string, add: string[] = [], remove: string[] = [],
-): Promise<{ tags: string[] }> {
-  return call(env, '/admin/tags', { method: 'POST', body: { userId, add, remove } });
-}
-
-export function adminOrders(
-  env: Env, limit = 50,
-): Promise<{ orders: any[] }> {
-  return call(env, `/admin/orders?limit=${limit}`);
-}
-
-export function adminUsage(
-  env: Env, userId?: string, limit = 50,
-): Promise<{ usage: any[] }> {
-  return call(env, `/admin/usage?limit=${limit}${userId ? `&userId=${encodeURIComponent(userId)}` : ''}`);
-}
+// ── 管理代理已整体删除（2026-11-07）：/admin/* 只收 auth 侧令牌，本仓无权调用。
+// 送分/标签/兑换码/订单等管理入口迁统一认证后台 https://auth.yuer6327.top/admin
+// （链接待 auth 子代理产物核对）；用量查询走上方 usageView（/internal/usage，只读）。

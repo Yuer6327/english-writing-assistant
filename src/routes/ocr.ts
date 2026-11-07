@@ -169,18 +169,31 @@ ocr.post('/', userMiddleware, aiRateLimit, async (c) => {
     ? Math.max(4096 * cfg.entry.maxOutputFactor, cfg.entry.maxOutputMin ?? 0)
     : 4096;
 
+  // 免费车道与批改同口径（W5）：hold 改 fire-and-forget——0 元车道 hold 唯一作用是
+  // billing 记一笔 0 元用量（报表），本地立即按 mode:'free' 继续、hold 丢 waitUntil
+  // 后台执行，billing 宕机不影响识别；付费/BYOK 车道 fail-closed 不动。
+  const holdOpts = {
+    estInputTokens: estimateTextTokens(OCR_VLM_PROMPT) + estimateImageTokens(images, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate),
+    maxOutputTokens: maxOutput,
+    skipQuota: vlmLane === 'free',
+  };
   let holdInfo: billing.HoldInfo;
-  try {
-    holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, {
-      estInputTokens: estimateTextTokens(OCR_VLM_PROMPT) + estimateImageTokens(images, cfg.provider, cfg.model, cfg.entry?.imageTokenEstimate),
-      maxOutputTokens: maxOutput,
-      skipQuota: vlmLane === 'free',
-    });
-  } catch (err) {
-    if (err instanceof billing.BillingError) {
-      return c.json({ error: err.message, code: err.code }, err.status as 402);
+  if (vlmLane === 'free') {
+    holdInfo = { mode: 'free' };
+    c.executionCtx.waitUntil(
+      billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts)
+        .catch((err) => console.error('[ocr:vlm] 免费车道 hold（0 元用量统计）失败（不影响识别）:',
+          err instanceof Error ? err.message : err)),
+    );
+  } else {
+    try {
+      holdInfo = await billing.hold(c.env, userId, 'writing', cfg.serviceId, holdOpts);
+    } catch (err) {
+      if (err instanceof billing.BillingError) {
+        return c.json({ error: err.message, code: err.code }, err.status as 402);
+      }
+      return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
     }
-    return c.json({ error: '计费服务暂不可用，请稍后重试' }, 503);
   }
 
   const lockToken = holdInfo.mode !== 'byok' ? tryAcquire(userId) : null;

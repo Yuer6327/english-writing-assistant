@@ -105,6 +105,7 @@ async function attackAuth() {
     ['POST', '/api/settings/api-keys', { provider: 'byok', api_key: 'sk-x' }],
     ['GET', '/api/billing/me'],
     ['POST', '/api/billing/redeem', { code: 'WRT-AAAA' }],
+    // 2026-11-07 起 admin 代理已删除，此路径恒 404（仍在列表里验证"游客不可达"不回归）
     ['GET', '/api/billing/admin/user/whatever'],
   ];
   let ok = true;
@@ -160,11 +161,12 @@ async function attackAuth() {
   const ok5 = f1.json?.logged_in === false && f2.status === 200; // 游客态，不是 500/登录态
   record('auth', 'A5 伪造会话 cookie', ok5 ? 'PASS' : 'FAIL', `me.logged_in=${f1.json?.logged_in}, essays=${f2.status}`);
 
-  // A6 admin 路由非管理员
+  // A6 admin 路由已删除（2026-11-07 管理代理迁统一认证后台）：任何身份访问都应 404
+  // （路由不存在）。攻击面收敛比 403 更强——本仓不再持有 billing /admin/* 的调用权。
   const a6 = await req('POST', '/api/billing/admin/gift', { cookie: C1, body: { username: 'victim1', points_yuan: 100 } });
   const a6b = await req('GET', '/api/billing/admin/user/victim1', { cookie: C1 });
-  record('auth', 'A6 普通用户访问 admin 接口', a6.status === 403 && a6b.status === 403 ? 'PASS' : 'FAIL',
-    `gift=${a6.status}, user=${a6b.status}`);
+  record('auth', 'A6 admin 代理已删除（任何身份不可达）', a6.status === 404 && a6b.status === 404 ? 'PASS' : 'FAIL',
+    `gift=${a6.status}, user=${a6b.status}（预期 404：路由已迁统一认证后台）`);
 
   // A7 错误请求体（畸形 JSON / 超大 body）
   const r = await fetch(BASE + '/api/essays', { method: 'POST', headers: { 'Cookie': C1, 'Content-Type': 'application/json' }, body: '{invalid json' });

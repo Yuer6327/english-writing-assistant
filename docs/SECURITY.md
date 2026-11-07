@@ -1,5 +1,7 @@
 # SECURITY.md — 攻防对抗审计报告（2026-10-30/31）
 
+> **2026-11-07 更新**：内部令牌已拆分为 per-caller（`WRITING_INTERNAL_TOKEN` / `AUTH_INTERNAL_TOKEN` / `AUTH_VALIDATE_TOKEN`，旧共享 `INTERNAL_TOKEN` 退役），本文以下涉及共享 `INTERNAL_TOKEN` 的段落为历史记录，现行口径以各仓源码与 `docs/billing-handoff.md` §3.7 为准。
+
 > 本轮以攻击者视角对 **english-writing-assistant** 与 **Yuer6327-billing** 做了全面攻防演练：
 > 全程在本地 wrangler dev + 本地 D1 + 本地 mock AI 上进行，**零真实上游调用**
 > （Agnes / DeepSeek / 百度 OCR 的密钥全部替换为占位符，演练后已还原）。

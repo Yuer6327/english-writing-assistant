@@ -52,22 +52,19 @@ auth.get('/me', userMiddleware, async (c) => {
 });
 
 // ── dev-only：本地浏览器 UI 联调用测试会话 ──
-// 双重门禁（缺一则 404）：
-//   1. 必须显式开启 ENABLE_DEV_SESSION=1（只写在 gitignored 的 .dev.vars 里，
-//      生产 Worker 永不配置该变量）；不用 Host 判断——wrangler dev 会把
-//      请求 URL/Host 重写成 routes 里的生产域名，按 Host 反而会误杀本地联调；
-//   2. AUTH_DB 里必须真的存在这条测试会话（sha256('test-cookie-1')，
-//      只由本地种入脚本写入本地 auth-db 副本）。
+// 门禁：必须显式开启 ENABLE_DEV_SESSION=1（只写在 gitignored 的 .dev.vars 里，
+// 生产 Worker 永不配置该变量）；不用 Host 判断——wrangler dev 会把
+// 请求 URL/Host 重写成 routes 里的生产域名，按 Host 反而会误杀本地联调。
+// 2026-11-07 起 AUTH_DB 直查已收回：无法再本地验"会话行存在"，改为直接发固定
+// 测试 cookie `s=test-cookie-1`——该值是否有效由会话校验端（auth dev 或本地
+// stub 的 /internal/validate）决定，stub 侧应放行 test-cookie-1 / test-cookie-2。
 auth.get('/dev-session', async (c) => {
   if ((c.env.ENABLE_DEV_SESSION || '') !== '1') return c.json({ error: 'not found' }, 404);
-
-  const enc = new TextEncoder();
-  const d = await crypto.subtle.digest('SHA-256', enc.encode('test-cookie-1'));
-  const hash = [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
-  const row = await c.env.AUTH_DB.prepare('SELECT 1 AS x FROM sessions WHERE token_hash = ?').bind(hash).first();
-  if (!row) return c.json({ error: 'not found' }, 404);
+  // Secure 属性照加：浏览器把 localhost/127.0.0.1 视为可信源，http 下也收 Secure cookie
+  // （Chrome 89+ / Firefox 84+；wrangler dev 默认即 localhost）。唯一代价是经局域网 IP
+  // 的 http 访问会拒收——本地 UI 联调不走该路径，属预期收紧而非回归。
   return c.json({ ok: true }, 200, {
-    'Set-Cookie': 's=test-cookie-1; Path=/; HttpOnly; SameSite=Lax',
+    'Set-Cookie': 's=test-cookie-1; Path=/; HttpOnly; SameSite=Lax; Secure',
   });
 });
 

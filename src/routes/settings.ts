@@ -2,14 +2,15 @@
 // routes/settings.ts — AI 服务配置（免费通道 / BYOK 主模型 + 可选视觉模型）
 // BYOK 凭证已上收计费平台（yuer-billing）加密存储、跨项目复用；
 // 本路由只做表单校验与 Service Binding 代理，不再读写本地 api_keys 表
-// （原表保留作历史备份，一次性迁移见 /api/billing/admin/migrate-byok）。
+// （原表保留作历史备份）。保存走 billing /internal/byok/set（2026-11-07 起
+// /admin/* 对本仓关闭，审查 §4.3 #8）。
 // ============================================================
 
 import { Hono } from 'hono';
 import type { Env, Vars } from '../types';
 import { authMiddleware } from '../middleware/auth';
 import { memberWriteLimitHit } from '../utils/rate-limit';
-import { AGNES_BASE_URLS, AGNES_MODEL } from '../utils/api-config';
+import { AGNES_BASE_URLS, AGNES_MODEL, invalidateUserConfig } from '../utils/api-config';
 import * as billing from '../utils/billing';
 
 const settings = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -66,7 +67,9 @@ settings.post('/api-keys', authMiddleware, async (c) => {
   try {
     if (p === 'agnes') {
       // 公用免费 API：清除 billing 侧 BYOK 记录即切回免费通道
-      await billing.adminByokSet(c.env, userId, { baseUrl: '', model: '', clear: true });
+      await billing.byokSet(c.env, userId, { baseUrl: '', model: '', clear: true });
+      // byok 状态翻转 → 立即失效本 isolate 的 config/默认车道缓存（跨 isolate 最多滞后 60s）
+      invalidateUserConfig(userId);
       return c.json({ ok: true, message: '已启用 Agnes 公用免费 API' });
     }
 
@@ -78,7 +81,7 @@ settings.post('/api-keys', authMiddleware, async (c) => {
 
     const baseUrl = (typeof body.api_base_url === 'string' ? body.api_base_url.trim() : '') || st.baseUrl || 'https://api.openai.com/v1';
     const model = (typeof body.model_name === 'string' ? body.model_name.trim() : '') || st.model || 'gpt-4o-mini';
-    await billing.adminByokSet(c.env, userId, {
+    await billing.byokSet(c.env, userId, {
       key,
       baseUrl,
       model,
@@ -88,6 +91,8 @@ settings.post('/api-keys', authMiddleware, async (c) => {
       visionBaseUrl: typeof body.vision_api_base_url === 'string' ? body.vision_api_base_url.trim() : undefined,
       visionModel: typeof body.vision_model_name === 'string' ? body.vision_model_name.trim() : undefined,
     });
+    // 新 Key 立即生效：失效本 isolate 的 byok config 缓存（跨 isolate 最多滞后 60s）
+    invalidateUserConfig(userId);
     return c.json({ ok: true, message: 'API Key 已保存' });
   } catch (err) {
     if (err instanceof billing.BillingError) {

@@ -735,8 +735,9 @@ async function runReview(e) {
     } else {
       toast('批改完成', 'success');
     }
-    // 付费批改已结算：同步导航栏余额（游客无 pill，函数自会跳过）
-    refreshBalancePill();
+    // 付费批改已结算：同步导航栏余额（游客无 pill，函数自会跳过）；
+    // 优先用响应里 settle 回传的余额，免整轮 /api/auth/me 重拉
+    refreshBalancePill(res.balance);
     const reviewEl = document.getElementById('wb-review');
     if (reviewEl) reviewEl.scrollIntoView({ behavior: reducedMotion.matches ? 'auto' : 'smooth' });
   } catch (err) {
@@ -1184,7 +1185,7 @@ function openPolishModal(fragment) {
       renderPolishResult(modal.querySelector('#polish-result'), res.result, fragment, chargeNote);
       idleButton(btn);
       btn.textContent = '重新精修';
-      refreshBalancePill();
+      refreshBalancePill(res.balance);
     } catch (err) {
       if (gen === generation && modal === wbModalEl && !handleBillingError(err)) toast(err.message, 'error');
     } finally {
@@ -1296,7 +1297,7 @@ async function runFullRewrite(e) {
   const r = res.result;
   const chargeNote = res.points_charged > 0
     ? ` · 本次消耗 ${(res.points_charged / 10000).toFixed(2)} credit` : '';
-  refreshBalancePill();
+  refreshBalancePill(res.balance);
   const modal = wbModal(`
     <div class="form-group">
       <div style="font-size:13px;color:var(--text-soft);line-height:1.8">${escapeHtml(r.summary || '')}${chargeNote ? `<span class="muted" style="font-size:12px">${chargeNote}</span>` : ''}</div>

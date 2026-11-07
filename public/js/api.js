@@ -133,28 +133,13 @@ export const api = {
   polish: (essayId, payload) => request(`/essays/${essayId}/polish`, { method: 'POST', body: JSON.stringify(payload) }),
   ocr: (images, mode) => request('/ocr', { method: 'POST', body: JSON.stringify({ images, mode }) }),
 
-  // --- 计费（余额 / 兑换码 / 用量 / 管理）---
+  // --- 计费（余额 / 兑换码 / 用量）---
+  // 管理代理（/api/billing/admin/*）已下线：计费管理迁统一认证后台
+  // https://auth.yuer6327.top/admin（见 admin.js）。
   billing: {
     me: () => request('/billing/me'),
     redeem: (code) => request('/billing/redeem', { method: 'POST', body: JSON.stringify({ code }) }),
     usage: (limit = 50) => request(`/billing/usage?limit=${limit}`),
-    admin: {
-      gift: (username, pointsYuan, note) => request('/billing/admin/gift', {
-        method: 'POST', body: JSON.stringify({ username, points_yuan: pointsYuan, note }),
-      }),
-      user: (username) => request(`/billing/admin/user/${encodeURIComponent(username)}`),
-      tags: (username, add = [], remove = []) => request('/billing/admin/tags', {
-        method: 'POST', body: JSON.stringify({ username, add, remove }),
-      }),
-      codes: (pointsYuan, count) => request('/billing/admin/codes', {
-        method: 'POST', body: JSON.stringify({ points_yuan: pointsYuan, count }),
-      }),
-      orders: (limit = 50) => request(`/billing/admin/orders?limit=${limit}`),
-      manualOrder: (username, pointsYuan, note) => request('/billing/admin/orders/manual', {
-        method: 'POST', body: JSON.stringify({ username, points_yuan: pointsYuan, note }),
-      }),
-      migrateByok: () => request('/billing/admin/migrate-byok', { method: 'POST', body: '{}' }),
-    },
   },
 };
 
@@ -248,12 +233,19 @@ export async function requireAuth() {
 
 /**
  * 扣费操作成功后刷新导航栏余额 pill（批改/精修/润色结算完成后调用）。
- * 服务端先结算再返回响应，此时重新拉会话拿到的就是结算后的余额；
- * 顺带刷新 sessionCache，页面后续逻辑读到的也是新余额。静默失败不打扰用户。
+ * 优先用批改/润色响应里 settle 回传的余额（balanceMicro，微积分）直接刷新——
+ * 免掉每次扣费后整轮 /api/auth/me 重拉（2026-11-07 审查 #6）；
+ * 未带余额（免费车道/旧响应）时回退 getSession(true) 全量刷新。
+ * 顺带同步 sessionCache，页面后续逻辑读到的也是新余额。静默失败不打扰用户。
  */
-export async function refreshBalancePill() {
+export async function refreshBalancePill(balanceMicro) {
   const pill = document.getElementById('nav-balance-pill');
   if (!pill) return;
+  if (typeof balanceMicro === 'number') {
+    pill.textContent = `${(balanceMicro / 10000).toFixed(2)} credit`;
+    if (sessionCache?.wallet) sessionCache.wallet.balance = balanceMicro;
+    return;
+  }
   try {
     const session = await getSession(true);
     if (typeof session?.wallet?.balance === 'number') {

@@ -6,8 +6,9 @@
 export interface Env {
   /** 业务库（作文/稿件/批改） */
   DB: D1Database;
-  /** 统一认证平台库（auth.yuer6327.top 的 auth-db，只读直查 sessions） */
-  AUTH_DB: D1Database;
+  /** 统一认证平台（auth）Service Binding：会话校验走 POST /internal/validate（2026-11-07 起
+   *  收回 AUTH_DB 直查绑定——消费方不再持身份库整库读写权，见 docs/multi-system-integration-review §2 S1） */
+  AUTH: Fetcher;
   /** 计费平台（yuer-billing）Service Binding，内网调用钱包/额度/BYOK */
   BILLING: Fetcher;
   ASSETS: Fetcher;
@@ -15,8 +16,13 @@ export interface Env {
   FRONTEND_ORIGIN: string;
   /** 公用免费 API（Agnes）密钥——deprecated：已上收 billing 持有，迁移完成后删除 */
   AGNES_API_KEY?: string;
-  /** 可选：与 billing 共享的内部调用口令（X-Internal-Token） */
-  INTERNAL_TOKEN?: string;
+  /** 与 billing /internal/* 通信的本仓专用口令（X-Internal-Token；per-caller 拆分后
+   *  writing 只持自己这一把，生产必配 wrangler secret put WRITING_INTERNAL_TOKEN）。
+   *  运行时缺失：billing fail-closed 全 401；首次使用会 console.error 一次性告警 */
+  WRITING_INTERNAL_TOKEN: string;
+  /** 调 auth /internal/validate 的口令（X-Internal-Token；生产必配 wrangler secret put AUTH_VALIDATE_TOKEN）。
+   *  运行时缺失：validate 全 401 → 登录路由 503 / 游客路由降级；首次使用会 console.error 一次性告警 */
+  AUTH_VALIDATE_TOKEN: string;
   /** 百度云 OCR 应用密钥（AK/SK），wrangler secret put BAIDU_OCR_AK / BAIDU_OCR_SK */
   BAIDU_OCR_AK?: string;
   BAIDU_OCR_SK?: string;
@@ -26,6 +32,8 @@ export interface Env {
   DEV_AGNES_BASE_URL?: string;
   /** 仅本地开发：billing 走 HTTP 直连（dev registry 不可用时的回退；生产绝不配置） */
   DEV_BILLING_URL?: string;
+  /** 仅本地开发：auth 会话校验走 HTTP 直连本地 stub（须同时 ENABLE_DEV_SESSION=1；生产绝不配置） */
+  DEV_AUTH_URL?: string;
 }
 
 /** Hono 上下文变量（userId 为统一认证平台的用户 id，UUID 字符串；
