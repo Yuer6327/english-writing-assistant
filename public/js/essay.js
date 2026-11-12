@@ -764,10 +764,12 @@ function renderReview() {
   const sub = r.subscores || {};
   const basis = r.basis || {};
 
+  // 展示口径与导出报告一致：标准 10+10+5 = 25 分制。
+  // 模型侧仍按 9/9/4 封顶（压分纪律，见 docs/AUDIT.md P0-5），这里只改分母，不改分数值。
   const bars = [
-    { name: '内容', val: num(sub.content), max: 9, basis: basis.content },
-    { name: '语言', val: num(sub.language), max: 9, basis: basis.language },
-    { name: '结构', val: num(sub.organization), max: 4, basis: basis.organization },
+    { name: '内容', val: num(sub.content), max: 10, basis: basis.content },
+    { name: '语言', val: num(sub.language), max: 10, basis: basis.language },
+    { name: '结构', val: num(sub.organization), max: 5, basis: basis.organization },
   ];
   const gradeInfo = gradeFor(r.score);
   // 本次批改的 credit 消耗（仅最新一次响应有值；0 = 免费/自备 Key）
@@ -788,8 +790,8 @@ function renderReview() {
         <div class="label">等第 · ${gradeInfo.label}</div>
       </div>` : ''}
       <div class="score-main">
-        <div class="score-num">${num(r.score)}<small>/22</small></div>
-        <div class="label">${num(r.score) >= 21 ? '系统内满分' : '总分'}</div>
+        <div class="score-num">${num(r.score)}<small>/25</small></div>
+        <div class="label" title="本系统采用保守阅卷口径，评分上限低于卷面满分">${num(r.score) >= 21 ? '系统内满分' : '总分'}</div>
       </div>
       <div class="score-bars">
         ${bars.map(b => `
