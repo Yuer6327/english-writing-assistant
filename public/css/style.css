@@ -538,7 +538,11 @@ input[type="file"]::file-selector-button:hover {
   border-top: 1px solid var(--border);
   background: var(--bg-soft);
   text-align: center;
-  font-size: 12px;
+  /* Palatino Italic：Windows 走 Palatino Linotype，macOS 走 Palatino，二者均系统自带；
+     Book Antiqua / Georgia 为同族兜底（都带真斜体，不做合成倾斜） */
+  font-family: "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  font-style: italic;
+  font-size: 13px;
   color: var(--text-light);
 }
 .site-footer a { color: var(--text-soft); font-weight: 500; }

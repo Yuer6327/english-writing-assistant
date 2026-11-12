@@ -791,7 +791,7 @@ function renderReview() {
       </div>` : ''}
       <div class="score-main">
         <div class="score-num">${num(r.score)}<small>/25</small></div>
-        <div class="label" title="本系统采用保守阅卷口径，评分上限低于卷面满分">${num(r.score) >= 21 ? '系统内满分' : '总分'}</div>
+        <div class="label">${num(r.score) >= 21 ? '系统内满分' : '总分'}</div>
       </div>
       <div class="score-bars">
         ${bars.map(b => `
