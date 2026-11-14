@@ -41,8 +41,8 @@ const hardened = sanitizeReview(hijacked, ESSAY, false, { harden: true });
 const sumOf = (r) => r.subscores.content + r.subscores.language + r.subscores.organization;
 
 // 该文本 <100 词 → 总分再扣 5（服务端硬扣），断言同时覆盖分项与总分
-check('常态分项上限 9/9/4 = 22', sumOf(clean) === 22, `sum=${sumOf(clean)} score=${clean.score}`);
-check('注入命中：分项硬顶 ≤8/≤8/≤3 → ≤19', sumOf(hardened) === 19,
+check('常态分项上限 8/8/4 = 20（2026-11-13 压分 22→20）', sumOf(clean) === 20, `sum=${sumOf(clean)} score=${clean.score}`);
+check('注入命中：分项硬顶 ≤7/≤7/≤3 → ≤17', sumOf(hardened) === 17,
   `sum=${sumOf(hardened)} (${hardened.subscores.content}/${hardened.subscores.language}/${hardened.subscores.organization})`);
 check('伪造专家共识被剥离', hardened.integrity.claims_scrubbed >= 1 && !hardened.basis.content.includes('专家'),
   `→ ${hardened.basis.content}`);
@@ -72,7 +72,7 @@ const goodEvidence = {
   issues: [], highlight: '', priority: '',
 };
 const withGood = sanitizeReview(goodEvidence, EVIDENCE_ESSAY, false, { injSpans });
-check('有效证据：9/9/4 保留', withGood.subscores.content === 9 && withGood.subscores.language === 9,
+check('有效证据：顶格钳到 8/8/4 保留', withGood.subscores.content === 8 && withGood.subscores.language === 8,
   `→ ${withGood.subscores.content}/${withGood.subscores.language}/${withGood.subscores.organization}`);
 check('有效证据无降档审计', withGood.integrity.evidence_voided === 0 && withGood.integrity.evidence_unproven === 0);
 
@@ -85,8 +85,8 @@ const injectedEvidence = {
   },
 };
 const withInjected = sanitizeReview(injectedEvidence, EVIDENCE_ESSAY, false, { injSpans });
-check('证据落在注入段：内容/语言各降一档（9→7、9→7）',
-  withInjected.subscores.content === 7 && withInjected.subscores.language === 7,
+check('证据落在注入段：内容/语言各降一档（8→6、8→6）',
+  withInjected.subscores.content === 6 && withInjected.subscores.language === 6,
   `→ ${withInjected.subscores.content}/${withInjected.subscores.language} voided=${withInjected.integrity.evidence_voided}`);
 check('注入段证据计入审计', withInjected.integrity.evidence_voided === 2);
 
@@ -98,12 +98,12 @@ check('无证据且 ≥8：内容/语言压 7，结构 4 不动',
 check('无证据计入审计', withNone.integrity.evidence_unproven === 2);
 
 // ── 盲评裁决纯函数（红队 P1-1：比较必须用 B 的封顶前原始分）──
-check('shouldDeliverShadowB：A=20 vs B_raw=19 → 不交付（delta=1 逃逸带必须堵死）',
-  shouldDeliverShadowB(20, 19) === false);
-check('shouldDeliverShadowB：A=21 vs B_raw=19 → 交付（真注入）',
-  shouldDeliverShadowB(21, 19) === true);
-check('shouldDeliverShadowB：A=20 vs B_raw=15 → 交付（payload 被摘出后 B 露出真实水平）',
-  shouldDeliverShadowB(20, 15) === true);
+check('shouldDeliverShadowB：A=18 vs B_raw=17 → 不交付（delta=1 逃逸带必须堵死）',
+  shouldDeliverShadowB(18, 17) === false);
+check('shouldDeliverShadowB：A=19 vs B_raw=17 → 交付（真注入）',
+  shouldDeliverShadowB(19, 17) === true);
+check('shouldDeliverShadowB：A=18 vs B_raw=13 → 交付（payload 被摘出后 B 露出真实水平）',
+  shouldDeliverShadowB(18, 13) === true);
 check('shouldDeliverShadowB：A=16 vs B_raw=17 → 不交付（B 更高）',
   shouldDeliverShadowB(16, 17) === false);
 check('shouldDeliverShadowB：A=17 vs B_raw=16 → 不交付（1 分抖动不触发）',
@@ -125,7 +125,7 @@ check('shouldDeliverShadowB：A=17 vs B_raw=16 → 不交付（1 分抖动不触
     issues: [], highlight: '', priority: '',
   }, essayPunct, false, {});
   check('证据标点折叠：弯引号/撇号变体仍命中（不误压 7）',
-    rFold.subscores.content === 9 && rFold.subscores.language === 8,
+    rFold.subscores.content === 8 && rFold.subscores.language === 8,
     `→ ${rFold.subscores.content}/${rFold.subscores.language}/${rFold.subscores.organization} unproven=${rFold.integrity.evidence_unproven}`);
 }
 

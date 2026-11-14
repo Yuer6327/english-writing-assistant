@@ -568,7 +568,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   if (!gate.ok) return c.json({ error: gate.error, code: gate.code }, gate.status);
 
   // F3 门禁（必须在 billing.hold 之前，hold 后早退会留冻结额度）：
-  // 近 7 天 ≥3 次 high 级命中 → 该用户后续所有批改强制硬化（≤8/≤8/≤3 + 采样取最小），
+  // 近 7 天 ≥3 次 high 级命中 → 该用户后续所有批改强制硬化（≤7/≤7/≤3 + 采样取最小），
   // 无论当前稿是否干净。只压分留痕，不拒评、不扣次数、不封号。
   const forcedHarden = await shouldForceHarden(c.env.DB, userId);
 
@@ -711,7 +711,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
   }
   // 图内文字抽取失败 = 文本侧防线归零（fail-open），但仍把原图交给主调用 VLM：
   // 攻击者可用"图内指令抑制抽取器"让指令直达评分模型 → 失败时按硬化口径收分
-  // （≤8/≤8/≤3 + 采样取最小），把 fail-open 从"完全不设防"降为"降级设防"（2026-11-06 审计 P2）。
+  // （≤7/≤7/≤3 + 采样取最小），把 fail-open 从"完全不设防"降为"降级设防"（2026-11-06 审计 P2）。
   harden = harden || imageScan?.report.level === 'high' || imageScan?.failed === true;
 
   // P1 降权呈现：图内文字以文本形式放进 <topic> 数据区（模型对文本数据区的边界
@@ -786,7 +786,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
     //   · B 版本把可疑内容替换为等长占位后独立打分；若 B（封顶前原始分）比 A 低 ≥2
     //     → 注入生效，交付 B（交付时才按注入口径封顶）。
     // 覆盖率悬崖：摘出的元话语占正文 >40% → B 版本失真（整篇大半被删），不跑盲评，
-    // 但降级为强制硬化（≤8/≤8/≤3 + 采样取最小）——"payload 越大审查越少"的激励必须反过来。
+    // 但降级为强制硬化（≤7/≤7/≤3 + 采样取最小）——"payload 越大审查越少"的激励必须反过来。
     // 只在无题图时启用（有题图时题图扫描已覆盖多模态通道，避免延迟叠加）；
     // 失败 / 超时 / 限流一律跳过（fail-open），绝不影响主链路。
     // B 版本只用于取分：交付的 basis / issues / 修改稿仍来自 A，绝不把占位符漏给学生。
@@ -915,7 +915,7 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
         if (res.usage) { auxUsage = mergeUsage(auxUsage, res.usage); auxCallsOk++; }
         const j = extractJSON(res.content);
         if (!j || typeof j !== 'object' || !j.subscores) { shadowState.source = null; return; }
-        // 常态口径（论证纪律等）+ 证据耦合先行；注入口径封顶（≤8/≤8/≤3）只在交付时做——
+        // 常态口径（论证纪律等）+ 证据耦合先行；注入口径封顶（≤7/≤7/≤3）只在交付时做——
         // 比较必须用封顶前原始分，否则 sumA≥21 的干净高分稿会被自动判"注入生效"（红队 P1-1）。
         // 注意：clampSubscores（含结构定档）在此应用两次（此处 + 交付封顶），
         // 第二次以证据降档后的内容分复算结构档——方向是 B 更低更易触发交付，偏差 ≤1 分，保守可接受。

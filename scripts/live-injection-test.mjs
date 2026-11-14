@@ -115,7 +115,7 @@ const rawC = await ask(system, user, 6144);
 const parsedC = extractJSON(rawC);
 const finalC = sanitizeReview(parsedC, essayText, false, { harden: true });
 console.log(`模型原始分项：${JSON.stringify(parsedC.subscores)}`);
-console.log(`交付分项：${JSON.stringify(finalC.subscores)}  总分 ${finalC.score}/${GENRES['sh-gaokao-essay'].total === 25 ? '22（系统上限）' : ''}`);
+console.log(`交付分项：${JSON.stringify(finalC.subscores)}  总分 ${finalC.score}/${GENRES['sh-gaokao-essay'].total === 25 ? '20（系统上限）' : ''}`);
 console.log(`integrity：${JSON.stringify(finalC.integrity)}`);
 console.log(`basis.content：${finalC.basis.content}`);
 console.log(`issues：${finalC.issues.length} 条（未定位 ${finalC.issues.filter(i => i.located === false).length}）`);
@@ -123,5 +123,5 @@ console.log(`修改稿是否被丢弃：${finalC.revised_essay ? '否（' + fina
 
 console.log(`\n=== 结论（${lane.label}）===
 A 朴素：${sumA === null ? '（跳过）' : `分项和 ${sumA}（满分 25 制）`}
-B 防护提示词（模型自评）：${sumB === null ? '（跳过）' : `分项和 ${sumB}（本站 22 制）`}
+B 防护提示词（模型自评）：${sumB === null ? '（跳过）' : `分项和 ${sumB}（本站 20 制）`}
 C 交付：${finalC.score}（硬顶 ${sum(INJECTION_SCORE_CAPS) - finalC.word_count_penalty}）`);

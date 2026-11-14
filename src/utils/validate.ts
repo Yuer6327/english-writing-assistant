@@ -42,7 +42,15 @@ const ISSUE_SEVERITIES = ['critical', 'minor', 'polish'] as const;
 // 防止模型口头遵守、打分放水。字段缺失视为未知 → 不钳制（老记录 / 模型漏填）。
 const CONTENT_CAP_NO_EXAMPLES = 6;   // 无实例：内容 ≤6（刚过及格线，仍不给高分）
 const CONTENT_CAP_NO_SOLUTION = 7;   // 只摆问题不谈对策：内容 ≤7
-const LANGUAGE_CAP_NO_SOLUTION = 7;  // 同上：语言上限由 9 降到 7（不再扣结构，改用语言分体现差距）
+const LANGUAGE_CAP_NO_SOLUTION = 7;  // 同上：语言上限由 8 降到 7（不再扣结构，改用语言分体现差距）
+
+// ── 分项常态上限（2026-11-13 压分：22 → 20）──
+// 提示词口径与这里的硬顶必须同步改：采样中位数定档后还要过这里的钳制，
+// 口径不一致会让提示词里的 20 变成纸上谈兵（或反向把干净稿压穿）。
+export const SUBSCORE_CAPS = { content: 8, language: 8, organization: 4 } as const;
+const CONTENT_MAX = SUBSCORE_CAPS.content;
+const LANGUAGE_MAX = SUBSCORE_CAPS.language;
+const ORGANIZATION_MAX = SUBSCORE_CAPS.organization;
 
 // ── 词数硬扣分（纯服务端判定，不看模型自评）──
 // 阈值与扣分固定写死：<100 词 → −5；>500 词 → −3。总分扣完不低于 0。
@@ -78,25 +86,25 @@ export function clampSubscores(
   const hasExamples = boolFlag(arg?.has_examples);
   const hasSolution = boolFlag(arg?.has_solution);
 
-  let content = safeScore(sub?.content, 0, 9);
+  let content = safeScore(sub?.content, 0, CONTENT_MAX);
   if (hasExamples === false) content = reconcileScore(content, CONTENT_CAP_NO_EXAMPLES);
   if (hasSolution === false) content = reconcileScore(content, CONTENT_CAP_NO_SOLUTION);
   if (caps?.content !== undefined) content = reconcileScore(content, caps.content);
 
-  let language = safeScore(sub?.language, 0, 9);
+  let language = safeScore(sub?.language, 0, LANGUAGE_MAX);
   if (hasSolution === false) language = reconcileScore(language, LANGUAGE_CAP_NO_SOLUTION);
   if (caps?.language !== undefined) language = reconcileScore(language, caps.language);
 
   // 结构定档用钳制前的内容分 + 钳制前的语言分（语义同 sanitizeReview：追加惩罚不二次连锁）
-  let organization = safeScore(sub?.organization, 0, 4);
+  let organization = safeScore(sub?.organization, 0, ORGANIZATION_MAX);
   if (content + safeScore(sub?.language, 0, 9) < 15) organization = Math.min(organization, 3);
   if (caps?.organization !== undefined) organization = reconcileScore(organization, caps.organization);
 
   return { content, language, organization };
 }
 
-/** 注入命中时的分项硬顶：内容 ≤8、语言 ≤8、结构 ≤3 → 总分 ≤19（常态上限 22） */
-export const INJECTION_SCORE_CAPS = { content: 8, language: 8, organization: 3 } as const;
+/** 注入命中时的分项硬顶：内容 ≤7、语言 ≤7、结构 ≤3 → 总分 ≤17（常态上限 20） */
+export const INJECTION_SCORE_CAPS = { content: 7, language: 7, organization: 3 } as const;
 
 // ── 证据耦合（F1-P0）──
 // 分项分必须有原文逐字证据支撑，掐住"靠注入段自我论证拿高分"的路径：
@@ -163,7 +171,7 @@ function spanHitsInjection(text: string, needle: string, injSpans: InjectionSpan
 
 /**
  * 盲评裁决（纯函数，进 CI）：B 版本用【封顶前】的原始分参与比较（红队 P1-1：
- * B 恒封顶 ≤19 会让 sumA≥21 的稿子自动满足 delta≥2，把干净高分稿误降），
+ * B 恒封顶 ≤17 会让 sumA≥19 的稿子自动满足 delta≥2，把干净高分稿误降），
  * 交付时才按注入口径封顶。
  */
 export function shouldDeliverShadowB(sumA: number, sumBRaw: number): boolean {
@@ -234,13 +242,13 @@ export function sanitizeReview(
   const harden = !!opts?.harden;
   const basis = parsed.basis ?? {};
 
-  // 评分纪律封顶（与提示词一致）：分项 ≤9/≤9/≤4 → 总分 ≤22；结构另受定档规则约束
-  // 注入命中时再叠一层硬顶（≤8/≤8/≤3 → ≤19）：可疑稿从严，掐掉"刷到上限"的收益
+  // 评分纪律封顶（与提示词一致）：分项 ≤8/≤8/≤4 → 总分 ≤20；结构另受定档规则约束
+  // 注入命中时再叠一层硬顶（≤7/≤7/≤3 → ≤17）：可疑稿从严，掐掉"刷到上限"的收益
   const arg = parsed.argumentation ?? {};
   const hasExamples = boolFlag(arg.has_examples);
   const hasSolution = boolFlag(arg.has_solution);
-  const modelContent = safeScore(parsed.subscores?.content, 0, 9);
-  const modelLanguage = safeScore(parsed.subscores?.language, 0, 9);
+  const modelContent = safeScore(parsed.subscores?.content, 0, CONTENT_MAX);
+  const modelLanguage = safeScore(parsed.subscores?.language, 0, LANGUAGE_MAX);
   const clamped = clampSubscores(
     arg, parsed.subscores, harden ? INJECTION_SCORE_CAPS : undefined);
   // 证据耦合（F1-P0）：分项分必须有原文逐字证据；证据落在注入段内 → 降档，

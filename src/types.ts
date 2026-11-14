@@ -69,7 +69,7 @@ export interface ReviewImprovement {
 export interface ReviewResult {
   basis: { content: string; language: string; organization: string };  // 各维度给分依据（= 诊断 + 举证）
   subscores: { content: number; language: number; organization: number };
-  score: number;                        // 0-22，= 三维度之和 − 词数扣分（服务端硬扣）
+  score: number;                        // 0-20，= 三维度之和 − 词数扣分（服务端硬扣）
   highlight: string;                    // 一个具体亮点（一句，引用原文表达）
   priority: string;                     // 最优先改进点（一句）
   word_count: number;                   // 服务端统计的词数（空白分词）

@@ -306,8 +306,8 @@ async function attackXss() {
       const html = JSON.stringify(res).includes('onerror') || JSON.stringify(res).includes('<script');
       record('xss', 'C2 AI 输出中的 HTML 原样落库（前端转义责任）', html ? 'INFO' : 'INFO',
         html ? '含 HTML 载荷（渲染层必须转义）' : '载荷被清洗');
-      const bad = res.subscores.content > 9 || res.subscores.language > 9 || res.subscores.organization > 4 || res.score > 22;
-      record('xss', 'C2a 分数钳制（9/9/4、总分≤22）', !bad ? 'PASS' : 'FAIL', JSON.stringify(res.subscores) + ' score=' + res.score);
+      const bad = res.subscores.content > 8 || res.subscores.language > 8 || res.subscores.organization > 4 || res.score > 20;
+      record('xss', 'C2a 分数钳制（8/8/4、总分≤20）', !bad ? 'PASS' : 'FAIL', JSON.stringify(res.subscores) + ' score=' + res.score);
     } else {
       record('xss', 'C2 AI XSS 结果处理', 'INFO', `review status=${r.status}（未成功）`);
     }
@@ -323,7 +323,7 @@ async function attackXss() {
       const res = r.json.result;
       const size = JSON.stringify(res).length;
       // issues 不设 10 条上限（只求准确，essays.ts 6144 注释），异常安全阀 50；总大小 ≤400KB
-      const bad = res.subscores.content > 9 || res.subscores.language < 0 || res.subscores.organization > 4
+      const bad = res.subscores.content > 8 || res.subscores.language < 0 || res.subscores.organization > 4
         || res.issues.length > 50 || size > 400000;
       record('xss', 'C3 越界/超长输出被钳制', !bad ? 'PASS' : 'FAIL',
         `issues=${res.issues.length}, body=${size}B, subscores=${JSON.stringify(res.subscores)}`);

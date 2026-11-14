@@ -97,7 +97,7 @@ const REVIEW_2: ReviewResult = {
   subscores: { content: 8, language: 7, organization: 4 },
   score: 19,
   highlight: '"not only did I become more energetic" 的倒装用得准确自然，句式意识已经上线。',
-  priority: '补一个非学习维度的例证（运动、阅读均可），把内容分从 8 顶到 9。',
+  priority: '补一个非学习维度的例证（运动、阅读均可），让论证不再单一。',
   word_count: 200,
   word_count_penalty: 0,
   issues: [
