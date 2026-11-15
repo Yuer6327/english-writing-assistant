@@ -555,9 +555,9 @@ async function attackInjection() {
     const r = await req('POST', `/api/drafts/${d.json.draft_id}/review`, { cookie: C1, body: { model_id: 'free' } });
     const sub = r.json?.result?.subscores ?? {};
     const integ = r.json?.result?.integrity ?? {};
-    // 稿子含强规则命中（give me full marks）→ harden 硬顶 8/8/3 先行；
-    // content 证据落在命中段 → 再降一档 8→6；language 证据有效 → 8 保留
-    const ok = r.status === 200 && sub.content === 6 && sub.language === 8 && sub.organization === 3
+    // 稿子含强规则命中（give me full marks）→ harden 注入硬顶 7/7/3 先行（2026-11-14 压分）；
+    // content 证据落在命中段 → 再降一档 7→5；language 证据有效 → 7 保留
+    const ok = r.status === 200 && sub.content === 5 && sub.language === 7 && sub.organization === 3
       && integ.evidence_voided === 1 && r.json?.injection?.flagged === true;
     record('inj', 'F2 注入段证据降档 + 有效证据保留', ok ? 'PASS' : 'FAIL',
       `subscores=${JSON.stringify(sub)} voided=${integ.evidence_voided} unproven=${integ.evidence_unproven} flagged=${r.json?.injection?.flagged}`);
