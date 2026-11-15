@@ -807,8 +807,10 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       const chainStart = Date.now();
       try {
         // 语义检测（clean 必跑——自适应攻击在规则下全漏；suspicious 也跑——防"诱饵占位
-        // 躲进 suspicious"的免检门；high 已硬化不跑省延迟）。正文与题目并行检测：
-        // 题目是学生可控文本且进入全部评分通道，此前只有规则层（2026-11-06 审计 P1）。
+        // 躲进 suspicious"的免检门；high 已硬化不跑省延迟）。正文与题目分两波串行检测
+        // （题目是学生可控文本且进入全部评分通道，此前只有规则层——2026-11-06 审计 P1）：
+        // 两路提示词仅数据区不同，essay 通道先行填上游前缀缓存（system + 指令段静态），
+        // topic 通道随即命中同前缀——串行只改发起时机，不改检测语义与门禁。
         const essayDetGate = !harden && !topicImages.length
           && (injection.level === 'clean' || injection.level === 'suspicious');
         const topicDetGate = !harden && topicInjection.level !== 'high';
@@ -822,34 +824,39 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
               return validateVerbatimSpans(essayText, extractJSON(det.content)?.spans);
             })
           : Promise.resolve(null as InjectionSpan[] | null);
-        const topicDetP = topicDetGate
-          ? callAI(cfg.key, cfg.baseUrl, cfg.model,
-              SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(topicClean.text),
-              true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
-              Math.min(chainStart + 15_000, aiDeadline), liveOpts(aiCallOpts(cfg.entry)))
-            .then((det) => {
-              if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
-              return validateVerbatimSpans(topicClean.text, extractJSON(det.content)?.spans);
-            })
-          : Promise.resolve([] as InjectionSpan[]);
         // 第二意见预清洗（第9轮）：同一套门禁，agnes 按另一套措辞再检一遍。
         // preCleanChannel 绝不 reject（失败返回 ok:false，fail-open），allSettled 只防意外。
+        // 与语义检测并行发起：前缀互不相同（提示词不同、非 free 车道时上游也不同），无缓存竞争。
         const essayPreP = essayDetGate && precleanCfg
           ? preCleanChannel(precleanCfg, essayText, {
               deadline: Math.min(chainStart + 15_000, aiDeadline),
               aiOpts: liveOpts(aiCallOpts(precleanCfg.entry)),
             })
           : Promise.resolve(null as PreCleanOutcome | null);
+        // 第一波：essay 通道（语义 + 预清洗）。allSettled（R1 验证）：任一检测拒绝时
+        // 另一路的 auxUsage 记账 .then 仍要跑完，否则窗口内 settle 的 calls/用量会少计一路。
+        const [essayR, essayPreR] = await Promise.allSettled([essayDetP, essayPreP] as const);
+
+        // 第二波：topic 通道（essay 通道已完成 → 命中同前缀的 system+指令段）；
+        // deadline 以第二波起点单独计 15s，总量仍受 aiDeadline 兜底。
+        const wave2Start = Date.now();
+        const topicDetP = topicDetGate
+          ? callAI(cfg.key, cfg.baseUrl, cfg.model,
+              SEMANTIC_DETECT_SYSTEM_PROMPT, buildSemanticDetectUser(topicClean.text),
+              true, undefined, maxOutputFor(cfg.entry, 400), 0.1,
+              Math.min(wave2Start + 15_000, aiDeadline), liveOpts(aiCallOpts(cfg.entry)))
+            .then((det) => {
+              if (det.usage) { auxUsage = mergeUsage(auxUsage, det.usage); auxCallsOk++; }
+              return validateVerbatimSpans(topicClean.text, extractJSON(det.content)?.spans);
+            })
+          : Promise.resolve([] as InjectionSpan[]);
         const topicPreP = topicDetGate && precleanCfg
           ? preCleanChannel(precleanCfg, topicClean.text, {
-              deadline: Math.min(chainStart + 15_000, aiDeadline),
+              deadline: Math.min(wave2Start + 15_000, aiDeadline),
               aiOpts: liveOpts(aiCallOpts(precleanCfg.entry)),
             })
           : Promise.resolve(null as PreCleanOutcome | null);
-        // allSettled（R1 验证）：任一检测拒绝时另一路的 auxUsage 记账 .then 仍要跑完，
-        // 否则窗口内 settle 的 calls/用量会少计一路
-        const [essayR, topicR, essayPreR, topicPreR] = await Promise.allSettled(
-          [essayDetP, topicDetP, essayPreP, topicPreP] as const);
+        const [topicR, topicPreR] = await Promise.allSettled([topicDetP, topicPreP] as const);
         const essayFound = essayR.status === 'fulfilled' ? essayR.value : null;
         const topicFound = topicR.status === 'fulfilled' ? topicR.value : [];
         const essayPre = essayPreR.status === 'fulfilled' ? essayPreR.value : null;
@@ -938,11 +945,16 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
 
     if (scoreDeadline - Date.now() > 5_000) {
       const scoreUser = buildScoreOnlyUser(topic, essayForPrompt, countWords(essayText), harden);
-      const rescores = await Promise.allSettled([
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
-        callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry))),
-      ]);
+      // 缓存串联：三样提示词逐字节一致（样本多样性只由温度 0.6 提供，与发起时机无关），
+      // 首样先行填上游前缀缓存（system + user 全量），其余两样并行复用同一前缀——
+      // 同篇内 2/3 采样全量命中，跨篇命中 system 静态段。首样异常（限流等）时后续
+      // 照常发起：allSettled fail-open，与旧并发行为一致。
+      const sampleCall = () => callAI(cfg.key, cfg.baseUrl, cfg.model, SCORE_ONLY_SYSTEM_PROMPT, scoreUser, true, undefined, maxOutputFor(cfg.entry, 900), 0.6, scoreDeadline, liveOpts(aiCallOpts(cfg.entry)));
+      const first = await Promise.allSettled([sampleCall()]);
+      // 第二波守卫：首样耗掉预算就放弃后续采样（<3 有效样本 → 走主调用独立打分的老口径）
+      const rescores = scoreDeadline - Date.now() > 3_000
+        ? [...first, ...await Promise.allSettled([sampleCall(), sampleCall()])]
+        : first;
       for (const r of rescores) {
         if (r.status !== 'fulfilled') {
           console.error(`[review] 打分采样失败（不计入）: ${r.reason?.message ?? r.reason}`);
@@ -1203,6 +1215,9 @@ async function runReview(c: Context<{ Bindings: Env; Variables: Vars }>): Promis
       attempts: attemptsUsed,
       prompt_tokens: lastUsage?.prompt_tokens ?? null,
       completion_tokens: lastUsage?.completion_tokens ?? null,
+      // 上游前缀缓存拆分（观测：命中率 = hit / prompt_tokens，验证缓存优化效果）
+      cache_hit_tokens: lastUsage?.prompt_cache_hit_tokens ?? null,
+      cache_miss_tokens: lastUsage?.prompt_cache_miss_tokens ?? null,
       sample_prompt_tokens: sampleUsage?.prompt_tokens ?? null,
       sample_completion_tokens: sampleUsage?.completion_tokens ?? null,
       sample_calls_ok: sampleCallsOk,

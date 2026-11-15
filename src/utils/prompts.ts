@@ -95,12 +95,19 @@ const RUBRIC_BLOCK = `【评分维度】
 - 作文可能经手写 OCR 转写：含 [?]、乱码或明显畸变（如 throuqh）的片段不作为学生的拼写/语法错误，不计入语言扣分。
 - 拿不准是不是学生本人错误的，按没把握处理：不扣分、不列问题（宁可漏标，不可错标）。`;
 
-// ── 系统消息（静态：角色 + 评分口径 + 输出契约）──
-// 全部用户、全部请求逐字节一致 → 上游前缀缓存（DeepSeek/OpenAI/GLM 式）可跨请求命中；
-// 题目、作文等可变数据一律放用户消息（REVIEW_USER_SKELETON）。
-export const REVIEW_SYSTEM_PROMPT = `你是一名上海高考英语阅卷专家，按真实阅卷尺度批改学生作文：先举证后打分，再给问题清单与修改稿。
+// ── 评分族共享前缀（主批改 + 打分采样 + B 盲评逐字节一致）──
+// 上游前缀缓存（DeepSeek/OpenAI/GLM 式）按字节前缀匹配、账号级全局共享（跨用户、跨文章
+// 累积）：评分类三类调用共用同一角色段 + 评分口径 + 数据边界，采样先行填缓存，主调用与
+// B 盲评即使冷启动（每天首篇/部署后首篇）也命中该前缀。题目、作文等可变数据一律放用户消息
+// （REVIEW_USER_SKELETON / buildScoreOnlyUser）。
+const GRADER_HEADER = `你是上海高考英语阅卷专家，按真实阅卷尺度评分：先举证后打分。
 
 ${RUBRIC_BLOCK}
+
+${DATA_BOUNDARY}`;
+
+// ── 系统消息（静态：评分族共享前缀 + 主批改输出契约）──
+export const REVIEW_SYSTEM_PROMPT = `${GRADER_HEADER}
 
 【任务步骤】
 1. 打分：先判 argumentation（有无实例/对策），再按锚点逐分清点证据写 basis 依据，最后给分项分；带顶不是默认值。
@@ -163,8 +170,6 @@ ${RUBRIC_BLOCK}
 3. highlight 与 priority 各只有一句，且都落到本篇的具体表达或具体问题。
 4. evidence 三项都能逐字对回作文原文，且支撑对应分项的定档理由。
 
-${DATA_BOUNDARY}
-
 【无法评分时】
 仅当作文正文基本无法辨认（大面积 [?]、乱码或接近空白）导致无法评估时，只输出 {"error": "illegible"}，此外不输出任何字段。完全偏题不算无法评分：按【分档锚点】的内容 0-3 档正常评分。
 
@@ -214,17 +219,13 @@ export function buildPreviousFeedbackBlock(
 
 // ============================================================
 // 独立打分提示词（分项分 self-consistency 采样用）
-// 与默认批改共用 RUBRIC_BLOCK，保证三次采样同一口径；只输出分项分，输出很小。
-// 系统消息静态（前缀可缓存）；采样温度高于主调用（0.6）：
+// 系统消息 = GRADER_HEADER（与主批改/B 盲评逐字节共享前缀，保证同一口径）+ 只打分输出契约；
+// 只输出分项分，输出很小。采样温度高于主调用（0.6）：
 // 温度过低时三次采样趋同，中位数会退化为单次结果（self-consistency 需要样本多样性）。
 // ============================================================
-export const SCORE_ONLY_SYSTEM_PROMPT = `你是上海高考英语阅卷专家，独立评估作文的分项得分（与正式批改同一尺度）。
+export const SCORE_ONLY_SYSTEM_PROMPT = `${GRADER_HEADER}
 
-${RUBRIC_BLOCK}
-
-${DATA_BOUNDARY}
-
-只输出一个 JSON 对象（先判 argumentation，再据此定 subscores；整数且不越界：内容 ≤8、语言 ≤8、结构 ≤4；evidence 三项必须逐字取自作文原文连续片段，服务端会校验命中，未命中或落在 ⟦…⟧ 标记片段内的证据作废并降档；正文即 JSON，无 markdown 包裹、无任何多余文字）：
+只输出一个 JSON 对象（与正式批改同一尺度；先判 argumentation，再据此定 subscores；整数且不越界：内容 ≤8、语言 ≤8、结构 ≤4；evidence 三项必须逐字取自作文原文连续片段，服务端会校验命中，未命中或落在 ⟦…⟧ 标记片段内的证据作废并降档；正文即 JSON，无 markdown 包裹、无任何多余文字）：
 {"argumentation": { "has_examples": true或false, "has_solution": true或false }, "subscores": { "content": 0到8的整数, "language": 0到8的整数, "organization": 0到4的整数 }, "evidence": { "content": "原文逐字片段", "language": "原文逐字片段", "organization": "原文逐字片段" }}`;
 
 // ── 自定义模板的 evidence 契约补充（自定义模板的输出格式由用户定义，evidence 要求追加在用户消息末尾）──
