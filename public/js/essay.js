@@ -8,7 +8,7 @@ import {
   api, toast, getSession, loginHref, escapeHtml, renderBold, formatBeijingTime, countWords,
   compressImageFile, gradeFor, refreshBalancePill,
 } from './api.js?v=20261101g';
-import { openExportModal, closeExportModal } from './export.js?v=20261101f';
+import { exportReportPdf } from './export.js?v=20261116a';
 
 let generation = 0;
 let state = null;            // { essay, drafts, polishes }
@@ -218,7 +218,6 @@ export function cleanup() {
   generation++;
   removeSelBtn();
   closeWbModal(null, true);
-  closeExportModal();
   if (delegatedBound) {
     document.removeEventListener('mouseup', onMouseUp);
     document.removeEventListener('touchend', onMouseUp);
@@ -380,8 +379,9 @@ function renderHeader() {
     if (isGuest) { showLoginPrompt('登录后可用', '提示词按模式单独配置。游客先用默认模板批改，登录后可自定义。'); return; }
     openPromptModal();
   });
-  document.getElementById('btn-export').addEventListener('click', () => {
-    openExportModal({ mode: 'report', getData: () => buildReportPayload() });
+  document.getElementById('btn-export').addEventListener('click', (ev) => {
+    // 仅 PDF：点击即直接生成下载（含全部稿件）
+    exportReportPdf(() => buildReportPayload(), ev.currentTarget);
   });
   document.getElementById('btn-delete-essay').addEventListener('click', async (ev) => {
     if (!confirm(`确定删除作文「${state.essay.title}」及其全部稿件、批改记录？`)) return;

@@ -7,69 +7,56 @@
 //     亮点/最该改、原文、问题清单三列表、修改稿、提升建议、较上一稿）
 //   - 页眉页脚：每页页脚（页码 X/Y + AI 免责声明），第 2 页起页眉重复作文标题
 //   - 表格支持跨页且表头自动重复；**粗体**改动点以蓝色呈现（打印比加粗更醒目）
-// 双字体排印：中文（含 CJK 标点/全角）用 Noto Sans SC（与苹方/雅黑同源的思源黑体系，
-// 跨平台渲染完全一致）；拉丁字母/数字/西文标点用 Tinos（Times New Roman 度量兼容开源版），
-// 混排按字符脚本自动切换。PDF 规范要求字形内嵌且浏览器读不到系统字体文件，
-// 故不能直接引用「微软雅黑/苹方/Times New Roman」，用上对应的开源等价物。
+// 字体排印（2026-11-16 起「非内嵌系统字体」方案，零下载）：
+//   - 西文/数字 = standard-14「Times-Roman」（Type1 + WinAnsiEncoding，pdf-lib 内建
+//     AFM 度量）：查看器按标准 14 字体名映射到真 Times New Roman（Windows/macOS
+//     皆自带），度量与布局一致，不重叠。**勿改成 Type0/GB1 包装西文**——查看器会
+//     按「中文字体」做 CJK 替换，数字/字母变全角、整段重叠乱码（实测复现）。
+//   - 中文宋体（批改文字）与楷体（题目/原文/修改稿）= Type0/UniGB-UCS2-H 命名字体
+//     （2 字节大端 Unicode 即 CID；全角宽恰为 1000/1000 em，估算=实际，布局精确）。
+//   - CJK 字体名按平台定制（buildPdfBlob 检测 UA）：Windows 用 SimSun/KaiTi（系统
+//     自带，pdfium 实测直接解析）；macOS/iOS 用 Songti SC/Kaiti SC（宋体-简/楷体-简）；
+//     其余平台由查看器 CJK 兜底。
+//   - 副产品：PDF 体积从数百 KB 降到数十 KB，导出不再需要 fontkit CDN 与字体 fetch。
 // 无 Bold 字重：标题层级用字号+颜色，关键小标题用同文本微小偏移重画模拟加粗（伪粗）。
-// 字体必须是静态 TrueType：pdf-lib subset 对 CID-CFF(.otf)/可变 TTF 会产出损坏子集
-// （缺字/错字形），对纯静态 TTF 正常——见 public/fonts/README.md，勿换回 OTF。
 //
-// 分层：renderReport(data, deps) 为纯函数（deps 注入 PDFLib/fontkit/字体字节），
-// 可在 Node 侧直接驱动做视觉回归；buildPdfBlob(data) 为浏览器壳（CDN + SRI 加载）。
+// 分层：renderReport(data, deps) 为纯函数（deps 注入 PDFLib），
+// 可在 Node 侧直接驱动做视觉回归；buildPdfBlob(data) 为浏览器壳（CDN 加载）。
 // 由 export.js 调用 buildPdfBlob。
 
 import { loadScript, gradeFor } from './api.js?v=20261101g';
 
 // ── CDN 资源（带 SRI：镜像被投毒时浏览器拒绝执行）──
 const PDFLIB_CDN = 'https://cdn.jsdmirror.com/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js';
-const FONTKIT_CDN = 'https://cdn.jsdmirror.com/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js';
 /** SRI 与上面的固定版本 URL 一一对应；升级版本号必须同步重算（下载文件算 sha384） */
 const SRI = {
   [PDFLIB_CDN]: 'sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI',
-  [FONTKIT_CDN]: 'sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn',
 };
-const NOTO_FONT_URL = '/fonts/NotoSansSC-Regular.ttf';
-const SERIF_FONT_URL = '/fonts/Tinos-Regular.ttf'; // Times New Roman 度量兼容（拉丁/数字）
 
-const _libs = { PDFLib: null, fontkit: null, notoFont: null, serifFont: null };
+const _libs = { PDFLib: null };
 
 async function ensurePdfLib() {
-  if (_libs.PDFLib && _libs.fontkit) return { PDFLib: _libs.PDFLib, fontkit: _libs.fontkit };
-  if (window.PDFLib && window.fontkit) {
-    _libs.PDFLib = window.PDFLib; _libs.fontkit = window.fontkit;
-    return { PDFLib: _libs.PDFLib, fontkit: _libs.fontkit };
+  if (_libs.PDFLib) return { PDFLib: _libs.PDFLib };
+  if (window.PDFLib) {
+    _libs.PDFLib = window.PDFLib;
+    return { PDFLib: window.PDFLib };
   }
-  await Promise.all([loadScript(PDFLIB_CDN, SRI[PDFLIB_CDN]), loadScript(FONTKIT_CDN, SRI[FONTKIT_CDN])]);
-  _libs.PDFLib = window.PDFLib; _libs.fontkit = window.fontkit;
-  if (!_libs.PDFLib || !_libs.fontkit) throw new Error('PDF 生成组件加载失败，请检查网络后重试');
-  return { PDFLib: _libs.PDFLib, fontkit: _libs.fontkit };
+  await loadScript(PDFLIB_CDN, SRI[PDFLIB_CDN]);
+  _libs.PDFLib = window.PDFLib;
+  if (!_libs.PDFLib) throw new Error('PDF 生成组件加载失败，请检查网络后重试');
+  return { PDFLib: _libs.PDFLib };
 }
 
-/** 按需抓取两枚字体字节（浏览器缓存后二次导出零流量） */
-function ensureFonts() {
-  const grab = (key, url, label) => {
-    if (_libs[key]) return _libs[key];
-    _libs[key] = fetch(url).then(r => {
-      if (!r.ok) throw new Error(label + '载入失败（HTTP ' + r.status + '），请检查网络后重试');
-      return r.arrayBuffer();
-    }).catch(err => { _libs[key] = null; throw err; });
-    return _libs[key];
-  };
-  return Promise.all([
-    grab('notoFont', NOTO_FONT_URL, '中文字体'),
-    grab('serifFont', SERIF_FONT_URL, '西文字体'),
-  ]).then(([sans, serif]) => ({ sans, serif }));
-}
-
-/** 浏览器入口：按需加载 pdf-lib/fontkit/双字体后渲染。export.js 消费。 */
+/** 浏览器入口：按需加载 pdf-lib 后渲染。export.js 消费。 */
 export async function buildPdfBlob(data) {
-  const { PDFLib, fontkit } = await ensurePdfLib();
-  const { sans, serif } = await ensureFonts();
+  const { PDFLib } = await ensurePdfLib();
+  // CJK 字体名按平台定制（见文件头说明）：Apple 系用 Songti SC/Kaiti SC，其余用 SimSun/KaiTi
+  const isApple = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const cjkFonts = isApple ? { song: 'Songti SC', kai: 'Kaiti SC' } : { song: 'SimSun', kai: 'KaiTi' };
   // 题目配图归一：PNG/JPEG 直接用；webp/gif/bmp 等经 canvas 转成 PNG；失败的置 null 渲染端跳过
   const images = Array.isArray(data.topic_images) ? data.topic_images : [];
   const topicImages = await Promise.all(images.map(ensureEmbeddableImage));
-  return renderReport(data, { PDFLib, fontkit, sansBytes: sans, serifBytes: serif, topicImages });
+  return renderReport(data, { PDFLib, topicImages, cjkFonts });
 }
 
 /** data URL → { bytes, kind: 'png'|'jpg' }；其他格式经 canvas 解码转 PNG；失败返回 null */
@@ -122,15 +109,91 @@ function splitMarked(text, baseColor, markColor, markBold = false) {
   return segs.length ? segs : [{ text: '', color: baseColor }];
 }
 
-export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifBytes, topicImages = [] }) {
+/** 非内嵌 Type0 命名字体（SimSun/KaiTi 或 Songti SC/Kaiti SC）：零下载，查看器用系统字体渲染。
+ *  中文走 UniGB-UCS2-H（2 字节大端 Unicode 即 CID）；宋体/楷体全角恰为 1000/1000 em。
+ *  继承 CustomFontEmbedder 仅为通过 PDFFont 的 instanceof 校验，行为均为本类自有。 */
+function makeNonEmbeddedFont(PDFLib, { baseFont }) {
+  const { CustomFontEmbedder, PDFName, PDFString } = PDFLib;
+  class NonEmbeddedFont extends CustomFontEmbedder {
+    constructor() {
+      // 基类构造只读取 unitsPerEm/postscriptName/layout 等元数据；置空集即可
+      super({
+        unitsPerEm: 1000,
+        postscriptName: baseFont,
+        characterSet: [],
+        layout: () => ({ glyphs: [] }),
+        ascent: 880, descent: -120, bbox: { minY: -120, maxY: 880 },
+      }, new Uint8Array(0));
+      this.fontName = baseFont;
+    }
+    /** 2 字节大端 Unicode（无 BOM）：UniGB-UCS2-H 下 CID 与 UCS-2 码位一一对应 */
+    encodeText(text) {
+      let hex = '';
+      for (const ch of String(text)) hex += ch.codePointAt(0).toString(16).padStart(4, '0');
+      return PDFLib.PDFHexString.of(hex);
+    }
+    widthOfTextAtSize(text, size) {
+      // 宋体/楷体的 CJK（含全角标点）字形宽恰为 1000/1000 em；此字体只接收 CJK 段
+      return String(text).length * size;
+    }
+    heightOfFontAtSize(size) { return size; }
+    sizeOfFontAtHeight(h) { return h; }
+    async embedIntoContext(context, ref) {
+      const desc = context.obj({
+        Type: 'Font',
+        Subtype: 'CIDFontType2',
+        BaseFont: PDFName.of(baseFont),
+        // Registry/Ordering 按 PDF 规范须为字符串；写成 Name 会被 pdf.js stringToPDFString 清空
+        CIDSystemInfo: context.obj({
+          Registry: PDFString.of('Adobe'), Ordering: PDFString.of('GB1'), Supplement: 5,
+        }),
+        FontDescriptor: context.obj({
+          Type: 'FontDescriptor',
+          FontName: PDFName.of(baseFont),
+          Flags: 4,
+          FontBBox: context.obj([-120, -120, 1000, 880]),
+          ItalicAngle: 0, Ascent: 880, Descent: -120, CapHeight: 700, StemV: 80,
+        }),
+        DW: 1000,
+      });
+      const descRef = context.register(desc);
+      const dict = context.obj({
+        Type: 'Font',
+        Subtype: 'Type0',
+        BaseFont: PDFName.of(baseFont),
+        Encoding: PDFName.of('UniGB-UCS2-H'),
+        DescendantFonts: context.obj([descRef]),
+      });
+      if (ref) { context.assign(ref, dict); return ref; }
+      return context.register(dict);
+    }
+  }
+  return new NonEmbeddedFont();
+}
+
+/** 挂一个非内嵌字体到文档（绕过 PDFFont.of 的 embedder instanceof 严检） */
+function attachFont(PDFLib, doc, embedder) {
+  const PDFFont = PDFLib.PDFFont;
+  const pf = Object.create(PDFFont.prototype);
+  pf.ref = doc.context.nextRef();
+  pf.doc = doc;
+  pf.embedder = embedder;
+  pf.modified = true;
+  pf.name = embedder.fontName;
+  doc.fonts.push(pf);
+  return pf;
+}
+
+export async function renderReport(data, { PDFLib, topicImages = [], cjkFonts = { song: 'SimSun', kai: 'KaiTi' } }) {
   const pdfDoc = await PDFLib.PDFDocument.create();
-  pdfDoc.registerFontkit(fontkit);
-  // F_SANS：中文/CJK 标点/全角；F_SERIF：拉丁字母、数字、西文标点（Times 风格）
-  const F_SANS = await pdfDoc.embedFont(sansBytes, { subset: true });
-  const F_SERIF = await pdfDoc.embedFont(serifBytes, { subset: true });
+  // 三字体（非内嵌零下载）：F_SERIF=standard-14 Times-Roman（真 TNR 映射 + AFM 精确度量）；
+  // F_SONG 宋体=批改文字默认中文；F_KAI 楷体=作文正文（Type0 命名字体，名随平台）
+  const F_SERIF = pdfDoc.embedStandardFont(PDFLib.StandardFonts.TimesRoman);
+  const F_SONG = attachFont(PDFLib, pdfDoc, makeNonEmbeddedFont(PDFLib, { baseFont: cjkFonts.song }));
+  const F_KAI = attachFont(PDFLib, pdfDoc, makeNonEmbeddedFont(PDFLib, { baseFont: cjkFonts.kai }));
   const { rgb } = PDFLib;
   const hasCJK = (s) => /[\u1100-\u11FF\u2E80-\uD7FF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/.test(s);
-  const charFont = (s) => (hasCJK(s) ? F_SANS : F_SERIF);
+  const charFont = (s, cjk) => (hasCJK(s) ? (cjk || F_SONG) : F_SERIF);
 
   // ── 调色板：黑白为主 + 少数强调色（与站点 --primary/--success/sev-* 对应）──
   const C = {
@@ -168,21 +231,21 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
   /** 确认剩余空间，不足则换页 */
   const ensure = (h) => { if (cursor - h < P.marginB) newPage(); };
 
-  // ── 文本测量/折行（双字体：按字符脚本选字体度量） ──
-  /** 把字符串按 CJK/西文连续段分组 → [{text, font}] */
-  function splitRuns(text) {
+  // ── 文本测量/折行（三字体：按字符脚本选字体度量，cjk 段默认宋体、作文正文可传楷体） ──
+  /** 把字符串按 CJK/西文连续段分组 → [{text, font}]；cjk 指定 CJK 段所用字体 */
+  function splitRuns(text, cjk = F_SONG) {
     const runs = [];
-    let cur = '', curSans = null;
+    let cur = '', curCJK = null;
     for (const ch of String(text)) {
-      const sans = hasCJK(ch);
-      if (curSans === null || sans === curSans) { cur += ch; curSans = sans; }
-      else { runs.push({ text: cur, font: curSans ? F_SANS : F_SERIF }); cur = ch; curSans = sans; }
+      const isCJK = hasCJK(ch);
+      if (curCJK === null || isCJK === curCJK) { cur += ch; curCJK = isCJK; }
+      else { runs.push({ text: cur, font: curCJK ? cjk : F_SERIF }); cur = ch; curCJK = isCJK; }
     }
-    if (cur) runs.push({ text: cur, font: curSans ? F_SANS : F_SERIF });
+    if (cur) runs.push({ text: cur, font: curCJK ? cjk : F_SERIF });
     return runs;
   }
   /** 混排宽度：逐段用所属字体度量后求和 */
-  const width = (text, size) => splitRuns(text).reduce((s, r) => s + r.font.widthOfTextAtSize(r.text, size), 0);
+  const width = (text, size, cjk = F_SONG) => splitRuns(text, cjk).reduce((s, r) => s + r.font.widthOfTextAtSize(r.text, size), 0);
 
   /** 把文本切成最小断行单元：拉丁词（含 ' . - [ ] 等粘连符，[n] 引注不拆分）整词断，其余逐字符 */
   function tokenize(text) {
@@ -205,22 +268,22 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
    * 富文本贪心折行。segs: [{text, color}]，返回行数组，每行是 [{text, color, w}]。
    * 行首空格丢弃；行首标点禁则（标点挂行尾，允许轻微溢出）；超宽单词独立成行。
    */
-  function wrapRuns(segs, size, maxW) {
+  function wrapRuns(segs, size, maxW, cjk = F_SONG) {
     const lines = [];
     let line = [];
     let w = 0;
     for (const seg of segs) {
       for (const tok of tokenize(seg.text)) {
         if (tok === ' ' && line.length === 0) continue;
-        const tw = width(tok, size);
+        const tw = width(tok, size, cjk);
         // 连续禁排字符：新空行以禁排字符开头时并入上一行行尾（否则会产出单标点孤行）
         if (line.length === 0 && lines.length && tok.length === 1 && BANNED_HEAD.test(tok)) {
-          lines[lines.length - 1].push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
+          lines[lines.length - 1].push({ text: tok, color: seg.color, w: tw, font: charFont(tok, cjk), bold: seg.bold });
           continue;
         }
         if (w + tw > maxW && line.length) {
           if (tok.length === 1 && BANNED_HEAD.test(tok)) {
-            line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
+            line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok, cjk), bold: seg.bold });
             lines.push(line);
             line = []; w = 0;
             continue;
@@ -236,7 +299,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
           }
           if (tok === ' ') continue;
         }
-        line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok), bold: seg.bold });
+        line.push({ text: tok, color: seg.color, w: tw, font: charFont(tok, cjk), bold: seg.bold });
         w += tw;
       }
     }
@@ -256,24 +319,24 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     }
   }
 
-  /** 整串绘制（混排自动按脚本选字体）；on 可指定目标页（页眉页脚补画用） */
-  function drawString(text, x, y, size, color, on = null) {
+  /** 整串绘制（混排自动按脚本选字体）；on 可指定目标页（页眉页脚补画用），cjk 选 CJK 字体 */
+  function drawString(text, x, y, size, color, on = null, cjk = F_SONG) {
     const target = on || page;
     let cx = x;
-    for (const r of splitRuns(text)) {
+    for (const r of splitRuns(text, cjk)) {
       target.drawText(r.text, { x: cx, y, size, font: r.font, color });
-      cx += width(r.text, size);
+      cx += width(r.text, size, cjk);
     }
   }
 
-  /** 伪粗：同文本横向微移重画一次（仅用于短标题/表头/大数字，正文不用） */
-  function drawBoldText(text, x, y, size, color, off) {
+  /** 伪粗：同文本横向微移重画一次（仅用于短标题/表头/大数字，正文不用）；cjk 选 CJK 字体 */
+  function drawBoldText(text, x, y, size, color, off, cjk = F_SONG) {
     const o = off ?? (size >= 12 ? 0.4 : 0.3);
     let cx = x;
-    for (const r of splitRuns(text)) {
+    for (const r of splitRuns(text, cjk)) {
       page.drawText(r.text, { x: cx, y, size, font: r.font, color });
       page.drawText(r.text, { x: cx + o, y, size, font: r.font, color });
-      cx += width(r.text, size);
+      cx += width(r.text, size, cjk);
     }
   }
 
@@ -298,11 +361,12 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
    * markedColor(**标记**段颜色), gap(块后额外间距)
    */
   function drawParas(text, opts = {}) {
-    const { size = 10.5, color = C.ink, paraGap = 7, lh = size * 1.55, markedColor = null, gap = 0 } = opts;
+    const { size = 10.5, color = C.ink, paraGap = 7, lh = size * 1.55, markedColor = null, gap = 0, kai = false } = opts;
+    const cjk = kai ? F_KAI : F_SONG;
     const paras = String(text ?? '').split(/\n+/).map(cleanText).filter(Boolean);
     for (const para of paras) {
       const segs = markedColor ? splitMarked(para, color, markedColor) : [{ text: para, color }];
-      const lines = wrapRuns(segs, size, P.contentW);
+      const lines = wrapRuns(segs, size, P.contentW, cjk);
       for (const ln of lines) {
         ensure(lh);
         drawRunLine(ln, P.marginL, cursor - size, size);
@@ -565,7 +629,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
 
   if (topicText || embeddedImgs.length) {
     const paras = topicText ? topicText.split(/\n+/).map(cleanText).filter(Boolean) : [];
-    const allLines = paras.map(p => wrapRuns([{ text: p, color: C.ink }], topicSize, P.contentW - topicPad * 2));
+    const allLines = paras.map(p => wrapRuns([{ text: p, color: C.ink }], topicSize, P.contentW - topicPad * 2, F_KAI));
     const totalLines = allLines.reduce((s, l) => s + l.length, 0);
     const textBlockH = totalLines * topicLh + Math.max(paras.length - 1, 0) * topicParaGap;
     const imgGap = 8, imgBetween = 10;
@@ -600,7 +664,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
       cursor = top - boxH - 14;
     } else {
       // 极端多图放不下同一个框：退化为文字盒 + 配图各自带框排在框外（仍缩半居中）
-      if (topicText) drawParas(topicText, { size: topicSize, gap: 6 });
+      if (topicText) drawParas(topicText, { size: topicSize, gap: 6, kai: true });
       for (const im of embeddedImgs) {
         ensure(im.h + 14);
         const ix = P.marginL + (P.contentW - im.w) / 2;
@@ -678,7 +742,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     const metaBits = [`${d.word_count ?? 0} 词`];
     if (d.handwriting_score != null) metaBits.push(`书写质量 ${Math.round(d.handwriting_score * 100)}%`);
     drawSubHead('原文', metaBits.join(' · '), 22);
-    drawParas(d.text, { size: 10.5, paraGap: 8, lh: 16.5 });
+    drawParas(d.text, { size: 10.5, paraGap: 8, lh: 16.5, kai: true });
 
     if (!r) {
       drawFootnote('本稿尚未批改，本节仅收录原文。');
@@ -750,7 +814,7 @@ export async function renderReport(data, { PDFLib, fontkit, sansBytes, serifByte
     // 修改稿（**标记** → 蓝色）
     if (r.revised_essay) {
       drawSubHead('修改稿', '蓝色字为修改内容', 22);
-      drawParas(r.revised_essay, { size: 10.5, paraGap: 8, lh: 16.5, markedColor: C.blue });
+      drawParas(r.revised_essay, { size: 10.5, paraGap: 8, lh: 16.5, markedColor: C.blue, kai: true });
     }
 
     // 提升建议

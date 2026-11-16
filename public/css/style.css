@@ -35,6 +35,12 @@
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Helvetica Neue", sans-serif;
   --font-mono: "SF Mono", "Fira Code", "DejaVu Sans Mono", monospace;
   --font-serif: "Iowan Old Style", "Apple Garamond", "Palatino Linotype", "Times New Roman", Georgia, serif;
+  /* 作文正文（用户输入的英文作文展示）：西文衬线 TNR 系 + 中文楷体系，双系统自带。
+     macOS: "Kaiti SC"（楷体-简）；Windows: KaiTi（楷体）；英文段落自然走 TNR。 */
+  --font-essay: "Times New Roman", "Kaiti SC", "Kaiti TC", KaiTi, STKaiti, serif;
+  /* 批改文字（AI 产出评语展示）：中文宋体系 + 西文 TNR。
+     macOS: "Songti SC"（宋体-简）；Windows: SimSun/宋体。 */
+  --font-review: "Times New Roman", "Songti SC", SimSun, NSimSun, serif;
 }
 
 /* ===== 暗色主题 ===== */
@@ -513,24 +519,6 @@ input[type="file"]::file-selector-button:hover {
 .modal-close:hover { color: var(--text); background: var(--bg-hover); }
 .modal-body { padding: 20px; max-height: 72vh; overflow-y: auto; overflow-x: hidden; }
 
-/* ===== 导出配置项 ===== */
-.export-options { display: flex; flex-direction: column; gap: 8px; }
-.export-option {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: border-color .15s, background .15s;
-}
-.export-option:hover { border-color: var(--primary); background: var(--bg-hover); }
-.export-option:has(input:checked) { border-color: var(--primary); background: var(--primary-soft); }
-.export-option input[type="radio"] { accent-color: var(--primary); margin: 0; flex-shrink: 0; }
-.export-option .opt-name { font-size: 14px; font-weight: 600; white-space: nowrap; }
-.export-option .opt-desc { font-size: 12px; color: var(--text-light); margin-left: auto; text-align: right; }
-
 /* ===== 页脚 ===== */
 .site-footer {
   margin-top: auto;    /* 内容不足一屏时吸底 */
@@ -595,11 +583,12 @@ input[type="file"]::file-selector-button:hover {
 .g-D { background: var(--danger-soft); color: #b93b3b; border: 1px solid rgba(214,69,69,.35); }
 [data-theme="dark"] .g-D { color: #e08585; }
 
-/* ── 结论横幅（最该改 / 亮点）── */
+/* ── 结论横幅（最该改 / 亮点；AI 评语走宋体系批改字体）── */
 .verdict-banner {
   display: flex; gap: 10px; align-items: baseline;
   border-radius: var(--radius); padding: 10px 14px; margin-top: 10px;
   font-size: 14px; line-height: 1.7;
+  font-family: var(--font-review);
 }
 .verdict-banner b { flex-shrink: 0; font-size: 12px; letter-spacing: .5px; }
 .verdict-banner.focus { border: 1px solid rgba(214,69,69,.35); background: var(--danger-soft); }
@@ -610,9 +599,9 @@ input[type="file"]::file-selector-button:hover {
 [data-theme="dark"] .verdict-banner.good b { color: #8fc79a; }
 [data-theme="dark"] .verdict-banner.warn b { color: #d8c48a; }
 
-/* ── 分项依据（跟在分数条下方）── */
+/* ── 分项依据（跟在分数条下方；AI 评语走宋体系批改字体）── */
 .score-bar-group { display: flex; flex-direction: column; gap: 3px; }
-.basis-line { font-size: 12px; color: var(--text-light); line-height: 1.6; padding-left: 54px; }
+.basis-line { font-size: 12px; color: var(--text-light); line-height: 1.6; padding-left: 54px; font-family: var(--font-review); }
 
 /* ── 严重度视觉分级 ── */
 .sev-chip {
@@ -645,7 +634,7 @@ input[type="file"]::file-selector-button:hover {
 .draft-tab-add { border-style: dashed; }
 
 /* ── 原文错误高亮标注 ── */
-.essay-annotated { line-height: 2; font-size: 16px; white-space: pre-wrap; }
+.essay-annotated { line-height: 2; font-size: 16px; white-space: pre-wrap; font-family: var(--font-essay); }
 .issue-mark {
   background: var(--danger-soft);
   border-bottom: 2px solid #d64545;
